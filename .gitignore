@@ -12,3 +12,6 @@ Thumbs.db
 .vscode/
 .idea/
 videos/
+
+# Local backup files
+youtube-server/server.js.backup-*

@@ -21,6 +21,7 @@
 // =============================================================================
 
 const http = require("node:http");
+const https = require("node:https");
 const fs = require("node:fs");
 const path = require("node:path");
 const { URL } = require("node:url");
@@ -153,49 +154,108 @@ function normalizeError(err, fallback){
 }
 
 // Fetch from the YouTube Data API with a key, honoring cache.
+function httpsGetJSON(fullUrl, timeoutMs = 15000){
+  return new Promise((resolve, reject) => {
+    const req = https.get(fullUrl, {
+      family: 4,
+      minVersion: "TLSv1.2",
+      maxVersion: "TLSv1.2",
+      headers: {
+        "User-Agent": "MyTube/1.0",
+        "Accept": "application/json"
+      }
+    }, (res) => {
+      let body = "";
+
+      res.setEncoding("utf8");
+
+      res.on("data", chunk => {
+        body += chunk;
+      });
+
+      res.on("end", () => {
+        let data = null;
+
+        try {
+          data = body ? JSON.parse(body) : null;
+        } catch {
+          data = null;
+        }
+
+        resolve({
+          status: res.statusCode || 0,
+          ok: (res.statusCode || 0) >= 200 && (res.statusCode || 0) < 300,
+          data,
+          body
+        });
+      });
+    });
+
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(Object.assign(new Error("YouTube API request timed out."), {
+        code: "ETIMEDOUT"
+      }));
+    });
+
+    req.on("error", reject);
+  });
+}
+
+// Fetch from the YouTube Data API with a key, honoring cache.
 async function ytFetch(cacheKey, url){
   const cached = cacheGet(cacheKey);
   if(cached){
     return cached;
   }
+
   const fullUrl = url + "&key=" + encodeURIComponent(API_KEY);
+
   let res;
+
   try{
-    res = await fetch(fullUrl, { signal: AbortSignal.timeout(15000) });
+    res = await httpsGetJSON(fullUrl, 15000);
   }
   catch(e){
-    // A low-level fetch failure (connection dropped / timeout) is transient and
-    // worth one retry. HTTP error responses (403 quota, 400 key, 404, etc.) are
-    // NOT retried here — they are surfaced as real API problems below.
-    res = await fetch(fullUrl, { signal: AbortSignal.timeout(15000) });
+    // A low-level HTTPS failure is transient and worth one retry.
+    // HTTP error responses are handled below and are not retried.
+    res = await httpsGetJSON(fullUrl, 15000);
   }
+
   if(!res.ok){
     let detail = "YouTube API request failed with status " + res.status;
     let ytReason = "";
     let ytStatus = "";
     let ytMessage = "";
-    try{
-      const j = await res.json();
-      const ytErr = j && j.error;
-      if(ytErr){
-        detail = ytErr.message || detail;
-        const firstErr = Array.isArray(ytErr.errors) && ytErr.errors[0];
-        if(firstErr){
-          ytReason = firstErr.reason || "";
-          ytStatus = firstErr.status || "";
-          ytMessage = firstErr.message || "";
-        }
+
+    const ytErr = res.data && res.data.error;
+
+    if(ytErr){
+      detail = ytErr.message || detail;
+
+      const firstErr = Array.isArray(ytErr.errors) && ytErr.errors[0];
+
+      if(firstErr){
+        ytReason = firstErr.reason || "";
+        ytStatus = firstErr.status || "";
+        ytMessage = firstErr.message || "";
       }
     }
-    catch(e){ /* keep default detail */ }
+
     const err = new Error(detail);
     err.status = res.status;
     err.youtubeReason = ytReason;
     err.youtubeStatus = ytStatus;
     err.youtubeMessage = ytMessage;
+
     throw err;
   }
-  const data = await res.json();
+
+  const data = res.data;
+
+  if(!data){
+    throw new Error("YouTube API returned an empty response.");
+  }
+
   cacheSet(cacheKey, data);
   return data;
 }

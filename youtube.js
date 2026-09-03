@@ -36,10 +36,18 @@ async function resolveBackendBase(){
   if(BACKEND_BASE){
     return BACKEND_BASE;
   }
-  const tryUrls = [
-    "/api/ping", // served by the same-origin backend
-    "http://localhost:3456/api/ping"
-  ];
+  const isLocalDevelopment =
+    location.hostname === "localhost" ||
+    location.hostname === "127.0.0.1";
+
+  const tryUrls = isLocalDevelopment
+    ? [
+        "/api/ping",
+        "http://localhost:3456/api/ping"
+      ]
+    : [
+        "/api/ping"
+      ];
   for(const url of tryUrls){
     try{
       const res = await fetch(url, { signal: AbortSignal.timeout(2500) });
@@ -49,8 +57,16 @@ async function resolveBackendBase(){
           payload = await res.json();
         }
         catch(e){ /* not JSON */ }
-        // Only accept the exact expected marker: { ok:true, service:"mytube-api" }.
-        if(payload && payload.ok === true && payload.service === "mytube-api"){
+        // Accept both the local Node backend marker and the production
+        // Cloudflare Worker marker.
+        if(
+          payload &&
+          payload.ok === true &&
+          (
+            payload.service === "mytube-api" ||
+            payload.service === "mytube-youtube-api"
+          )
+        ){
           BACKEND_BASE = url.replace(/\/ping$/, "");
           return BACKEND_BASE;
         }
