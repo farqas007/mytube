@@ -1,0 +1,14 @@
+# Secrets — never commit or serve these
+.env
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+videos/

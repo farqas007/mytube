@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>MyTube</title>
+<link rel="icon" type="image/png" href="youtube.png">
+
+<link rel="stylesheet" href="style.css">
+
+<!-- Shared video dataset (single source of truth) -->
+<script src="videos.js"></script>
+
+</head>
+
+
+<body>
+
+
+<header>
+
+
+<div class="logo">
+MyTube 🔴
+</div>
+
+
+
+<input 
+id="search"
+placeholder="Search videos..."
+aria-label="Search videos"
+role="searchbox"
+>
+
+
+
+<button onclick="searchVideo()" aria-label="Search">
+Search
+</button>
+
+
+
+<button id="loginBtn">
+Login
+</button>
+
+
+
+<button id="logoutBtn" style="display:none;">
+Logout
+</button>
+
+
+</header>
+
+
+
+
+
+<div class="container">
+
+
+
+<aside class="sidebar">
+
+<p id="sideHome">🏠 Home</p>
+
+<p id="sideTrending">🔥 Trending</p>
+
+<p id="sideSubs">📺 Subscriptions</p>
+
+<p id="sideLibrary">📚 Library</p>
+
+</aside>
+
+
+
+
+
+<div class="home-content">
+
+
+<div id="categoryFilter" class="category-filter" role="group" aria-label="Filter by category"></div>
+
+
+<main id="videoList">
+
+</main>
+
+
+<div id="noResults" class="no-results" style="display:none;">
+No videos found 😕
+</div>
+
+
+<div id="dynamicStatus" class="no-results" style="display:none;" role="status" aria-live="polite"></div>
+
+
+</div>
+
+
+</div>
+
+
+
+
+
+<script>
+
+const videos = window.MyTubeVideos || [];
+const categories = window.MyTubeCategories || [];
+
+const box = document.getElementById("videoList");
+const noResultsEl = document.getElementById("noResults");
+const searchInput = document.getElementById("search");
+const filterBar = document.getElementById("categoryFilter");
+
+
+// ================= STATE =================
+
+// currentQuery / currentCategory / trendingMode together define the visible set.
+let currentQuery = "";
+let currentCategory = "All";
+let trendingMode = false;
+
+
+function openVideo(id){
+    window.location.href = "watch.html?id=" + id;
+}
+
+
+// ================= FILTERING =================
+
+function videoMatches(v){
+    if(!v) return false;
+
+    if(currentCategory !== "All" && v.category !== currentCategory){
+        return false;
+    }
+
+    if(currentQuery){
+        const haystack = [v.title, v.channel, v.category, v.description]
+            .filter(Boolean)
+            .join(" ")
+            .toLowerCase();
+        if(!haystack.includes(currentQuery)){
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+function visibleVideos(){
+    let list = videos.filter(videoMatches);
+
+    if(trendingMode){
+        // Local/demo trending: sort by numeric viewCount descending.
+        list = list.slice().sort((a, b) => (b.viewCount || 0) - (a.viewCount || 0));
+    }
+
+    return list;
+}
+
+
+// ================= RENDER =================
+
+function buildCard(v){
+    const card = document.createElement("div");
+    card.className = "card";
+    card.setAttribute("role", "link");
+    card.setAttribute("tabindex", "0");
+    card.setAttribute("aria-label", "Watch " + v.title);
+
+    const open = () => openVideo(v.id);
+    card.addEventListener("click", open);
+
+    // Keyboard activation: Enter or Space opens the video.
+    card.addEventListener("keydown", (e) => {
+        if(e.key === "Enter" || e.key === " "){
+            e.preventDefault();
+            open();
+        }
+    });
+
+    const thumb = document.createElement("div");
+    thumb.className = "thumb";
+
+    const img = document.createElement("img");
+    img.src = v.thumb;
+    img.alt = v.title;
+
+    const badge = document.createElement("span");
+    badge.textContent = v.time;
+
+    thumb.appendChild(img);
+    thumb.appendChild(badge);
+
+    const title = document.createElement("h3");
+    title.textContent = v.title;
+
+    const meta = document.createElement("p");
+    meta.textContent = cardMeta(v);
+
+    card.appendChild(thumb);
+    card.appendChild(title);
+    card.appendChild(meta);
+
+    return card;
+}
+
+
+function renderVideos(){
+    const list = visibleVideos();
+
+    box.replaceChildren();
+
+    list.forEach(v => {
+        box.appendChild(buildCard(v));
+    });
+
+    // No results: only show when there is an active query or a non-All category.
+    const activeFilter = Boolean(currentQuery) || currentCategory !== "All";
+    if(noResultsEl){
+        noResultsEl.style.display = (activeFilter && list.length === 0) ? "block" : "none";
+    }
+}
+
+
+// ================= CATEGORY FILTER =================
+
+function buildCategoryFilter(){
+    if(!filterBar){
+        return;
+    }
+
+    const options = ["All"].concat(categories);
+
+    options.forEach(cat => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "category-chip" + (cat === currentCategory ? " active" : "");
+        btn.textContent = cat;
+        btn.setAttribute("aria-pressed", cat === currentCategory ? "true" : "false");
+        btn.addEventListener("click", () => {
+            currentCategory = cat;
+            renderCategoryFilter();
+            renderVideos();
+        });
+        filterBar.appendChild(btn);
+    });
+}
+
+
+function renderCategoryFilter(){
+    if(!filterBar){
+        return;
+    }
+    [...filterBar.children].forEach(child => {
+        const active = child.textContent === currentCategory;
+        child.classList.toggle("active", active);
+        child.setAttribute("aria-pressed", active ? "true" : "false");
+    });
+}
+
+
+// ================= SEARCH =================
+
+function searchVideo(){
+    // Preserve the existing contract: empty query shows all videos.
+    currentQuery = (searchInput ? searchInput.value : "").trim().toLowerCase();
+    renderMain();
+}
+
+
+// Lightweight debounce so typing doesn't re-render on every keystroke,
+// while keeping Enter/submit immediate and reliable.
+let searchTimer = null;
+function scheduleSearch(){
+    if(searchTimer){
+        clearTimeout(searchTimer);
+    }
+    searchTimer = setTimeout(searchVideo, 800);
+}
+
+
+if(searchInput){
+    searchInput.addEventListener("input", scheduleSearch);
+    searchInput.addEventListener("keydown", (e) => {
+        if(e.key === "Enter"){
+            e.preventDefault();
+            searchVideo();
+        }
+    });
+}
+
+
+// ================= DYNAMIC DISCOVERY (Phase 7) =================
+// YouTube results are requested through the backend proxy (youtube.js). If the
+// backend is unreachable / the API key is missing / quota is exceeded, we fall
+// back to the existing local videos. Dynamic results are marked type "youtube"
+// and their id is "yt:<videoId>" so the watch page knows to use the embed.
+
+const dynamicStatus = document.getElementById("dynamicStatus");
+
+function ytClient(){
+    // Exposed by the youtube.js module loaded at the end of this page.
+    return window.MyTubeYouTube || null;
+}
+
+// Run fn immediately if the YouTube module is ready, otherwise once the
+// deferred module script reports readiness. The module is loaded with
+// type="module" (always deferred), so the initial render below may run
+// before window.MyTubeYouTube exists — this lets us retry transparently
+// instead of silently falling back to local-only results.
+function whenYTReady(fn){
+    if(ytClient()){
+        fn();
+        return;
+    }
+    window.addEventListener("mytube-yt-ready", fn, { once: true });
+}
+
+function showStatus(text){
+    if(dynamicStatus){
+        dynamicStatus.style.display = text ? "block" : "none";
+        dynamicStatus.textContent = text || "";
+        dynamicStatus.setAttribute("aria-busy", text ? "true" : "false");
+    }
+}
+
+// Render a list of videos (local and/or youtube) into the grid.
+function renderVideoList(list){
+    box.replaceChildren();
+    list.forEach(v => {
+        box.appendChild(buildCard(v));
+    });
+    const activeFilter = Boolean(currentQuery) || currentCategory !== "All";
+    if(noResultsEl){
+        noResultsEl.style.display = (activeFilter && list.length === 0) ? "block" : "none";
+    }
+}
+
+// Build the card's meta text once (works for local and youtube cards).
+function cardMeta(v){
+    const parts = [v.channel];
+    if(v.views){
+        parts.push(v.views);
+    }
+    return parts.join(" • ");
+}
+
+// Determine which render path to use:
+//  - if a category is active (and no query) we keep the local category browse.
+//  - otherwise a query triggers dynamic search; no query triggers home browse.
+function renderMain(){
+    if(currentQuery){
+        doDynamicSearch();
+        return;
+    }
+    // Home / category browse: local render + a dynamic discovery strip.
+    renderVideos();
+    maybeLoadRemoteHome();
+}
+
+
+// Homepage: when browsing the default view (no query, All category, not
+// trending), prepend dynamically discovered videos on top of the local grid.
+// The page NEVER depends on this — failure leaves the local videos alone.
+// Discovery uses the official YouTube Data API "most popular" feed rather than
+// a fixed search term, so the homepage reflects really-watched videos instead
+// of pretending a keyword query is YouTube's real recommendation algorithm.
+let homeDiscoveryDone = false;
+async function maybeLoadRemoteHome(){
+    if(homeDiscoveryDone || trendingMode || currentQuery || currentCategory !== "All"){
+        return;
+    }
+    const client = ytClient();
+    if(!client){
+        // Module not loaded yet (deferred <script type="module"> runs after
+        // this inline script). Retry once the YouTube module is ready.
+        whenYTReady(maybeLoadRemoteHome);
+        return;
+    }
+    homeDiscoveryDone = true;
+    try{
+        const feed = await client.trending(12);
+        const remote = (feed.videos || []).slice(0, 8);
+        if(!remote.length){
+            return;
+        }
+        // Prepend remote cards above the locally-rendered grid.
+        const localCards = Array.from(box.children);
+        box.replaceChildren();
+        remote.forEach(v => { box.appendChild(buildCard(v)); });
+        localCards.forEach(c => { box.appendChild(c); });
+        showStatus("");
+    }
+    catch(e){
+        logHome("warn", "Home discovery failed, using local videos.", e);
+    }
+}
+
+
+// Perform a dynamic YouTube search for the current query, then render results
+// with YouTube results first and matching local videos below as a fallback.
+let searchSeq = 0;
+let activeSearchController = null;
+async function doDynamicSearch(){
+    const client = ytClient();
+    const q = currentQuery;
+    const seq = ++searchSeq;
+
+    // Cancel any in-flight YouTube API request from a previous keystroke.
+    if(activeSearchController){
+        activeSearchController.abort();
+        activeSearchController = null;
+    }
+
+    // Always show local matches immediately (instant, no network latency).
+    const localMatches = videos.filter(videoMatches);
+    if(!client){
+        // Deferred module not loaded yet (e.g. initial ?q= restore runs before
+        // the <script type="module"> executes). Show local matches now, then
+        // re-run once the YouTube module reports ready so remote results appear.
+        renderVideoList(localMatches);
+        whenYTReady(() => {
+            if(seq === searchSeq && currentQuery && currentQuery === q){
+                doDynamicSearch();
+            }
+        });
+        return;
+    }
+
+    // Require at least 2 characters before hitting the YouTube API.
+    if(q.length < 2){
+        renderVideoList(localMatches);
+        showStatus("");
+        return;
+    }
+
+    const controller = new AbortController();
+    activeSearchController = controller;
+
+    showStatus("Searching YouTube...");
+    let remote = [];
+    let apiError = "";
+    try{
+        const result = await client.search(q, 20, controller.signal);
+        remote = result.videos || [];
+        apiError = result.error || "";
+    }
+    catch(e){
+        if(e && e.name === "AbortError"){
+            return; // superseded by a newer search — do not render
+        }
+        apiError = "Search failed.";
+        logHome("warn", "Dynamic search failed:", e);
+    }
+
+    if(seq !== searchSeq){
+        return; // a newer search superseded this one
+    }
+
+    // Compose: remote YouTube results + local matches (dedupe is inherent since
+    // ids are namespaced yt:... vs local ids).
+    let combined = remote.slice(0, 30);
+    combined = combined.concat(localMatches);
+
+    if(!remote.length && !localMatches.length){
+        showStatus(apiError ? ("Could not search YouTube: " + apiError) : "No videos found for this search.");
+        renderVideoList(combined);
+        return;
+    }
+
+    if(!remote.length && localMatches.length){
+        // API unavailable/file failed — show local fallback with a gentle note.
+        showStatus(apiError ? ("YouTube search unavailable (" + apiError + ") — showing local results.") : "");
+    }
+    else{
+        showStatus("");
+    }
+    renderVideoList(combined);
+}
+
+function logHome(level, msg, err){
+    if(window.console && typeof window.console[level] === "function"){
+        window.console[level](msg, err || "");
+    }
+}
+
+
+// Restore ?q= from the URL on load (watch page search uses index.html?q=...).
+(function initSearchFromUrl(){
+    const params = new URLSearchParams(window.location.search);
+    const q = (params.get("q") || "").trim();
+    currentQuery = q.toLowerCase();
+    if(searchInput){
+        searchInput.value = q;
+    }
+})();
+
+
+// ================= SIDEBAR =================
+
+// Make a sidebar item keyboard accessible (Enter/Space activate).
+function makeSideItemInteractive(el, onClick){
+    if(!el){
+        return;
+    }
+    el.setAttribute("role", "button");
+    el.setAttribute("tabindex", "0");
+    el.addEventListener("click", onClick);
+    el.addEventListener("keydown", (e) => {
+        if(e.key === "Enter" || e.key === " "){
+            e.preventDefault();
+            onClick();
+        }
+    });
+}
+
+
+function clearSidebarActive(){
+    ["sideHome", "sideTrending", "sideSubs", "sideLibrary"].forEach(id => {
+        const el = document.getElementById(id);
+        if(el){
+            el.classList.remove("active");
+            el.setAttribute("aria-current", "false");
+        }
+    });
+}
+
+
+function setSidebarActive(id){
+    clearSidebarActive();
+    const el = document.getElementById(id);
+    if(el){
+        el.classList.add("active");
+        el.setAttribute("aria-current", "true");
+    }
+}
+
+
+function showSidebarMsg(text){
+    let msgBox = document.getElementById("sidebarMsg");
+    if(!msgBox){
+        msgBox = document.createElement("div");
+        msgBox.id = "sidebarMsg";
+        msgBox.textContent = "";
+        document.body.appendChild(msgBox);
+    }
+    msgBox.textContent = text;
+    setTimeout(() => {
+        msgBox.textContent = "";
+    }, 2500);
+}
+
+
+const sideHome = document.getElementById("sideHome");
+const sideTrending = document.getElementById("sideTrending");
+const sideSubs = document.getElementById("sideSubs");
+const sideLibrary = document.getElementById("sideLibrary");
+
+
+makeSideItemInteractive(sideHome, () => {
+    window.location.href = "index.html";
+});
+
+
+makeSideItemInteractive(sideTrending, () => {
+    trendingMode = !trendingMode;
+    currentCategory = "All";
+    currentQuery = "";
+    if(searchInput){ searchInput.value = ""; }
+    searchSeq++;
+    renderCategoryFilter();
+    if(trendingMode){
+        setSidebarActive("sideTrending");
+        renderVideos();
+        loadTrendingYouTube();
+    }
+    else{
+        setSidebarActive("sideHome");
+        renderVideos();
+    }
+});
+
+// Trending sidebar: merge the local top-viewed videos with the real YouTube
+// most-popular feed (loaded once per entry into trending mode). Local content
+// always remains — YouTube items are prepended when the API is reachable.
+let trendingFetchSeq = 0;
+async function loadTrendingYouTube(){
+    const client = ytClient();
+    if(!client){
+        whenYTReady(loadTrendingYouTube);
+        return;
+    }
+    const seq = ++trendingFetchSeq;
+    try{
+        const feed = await client.trending(12, true);
+        if(seq !== trendingFetchSeq || !trendingMode){
+            return; // a click left trending mode (or a newer request) — drop stale results
+        }
+        const remote = (feed.videos || []).slice(0, 8);
+        const localCards = Array.from(box.children);
+        box.replaceChildren();
+        remote.forEach(v => { box.appendChild(buildCard(v)); });
+        localCards.forEach(c => { box.appendChild(c); });
+        showStatus("");
+    }
+    catch(e){
+        logHome("warn", "YouTube trending failed, using local ranked videos.", e);
+    }
+}
+
+
+makeSideItemInteractive(sideSubs, () => {
+    showSidebarMsg("Subscriptions page coming soon");
+});
+
+
+makeSideItemInteractive(sideLibrary, () => {
+    showSidebarMsg("Library page coming soon");
+});
+
+
+// ================= INIT =================
+
+(function init(){
+    buildCategoryFilter();
+    setSidebarActive("sideHome");
+    renderMain();
+})();
+
+
+</script>
+
+
+
+
+<!-- Firebase Auth -->
+
+<script type="module" src="auth.js"></script>
+
+
+<!-- Phase 7: YouTube dynamic discovery (backend proxy client) -->
+<script type="module">
+import { search, trending } from "./youtube.js";
+// Expose the client on window so the inline homepage script can call it.
+window.MyTubeYouTube = { search: search, trending: trending };
+// Signal readiness. This module is deferred, so the inline homepage script may
+// have already run its initial render before this executes; it listens for this
+// event to retry dynamic loading (search + home discovery) with the client set.
+window.dispatchEvent(new Event("mytube-yt-ready"));
+</script>
+
+
+
+</body>
+
+</html>

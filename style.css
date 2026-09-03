@@ -1,0 +1,895 @@
+/* ================= GLOBAL ================= */
+
+*{
+    box-sizing:border-box;
+}
+
+body{
+
+    margin:0;
+    background:#0f0f0f;
+    color:white;
+    font-family:Arial, Helvetica, sans-serif;
+
+}
+
+
+/* ================= HEADER ================= */
+
+header{
+
+    height:60px;
+
+    background:#202020;
+
+    display:flex;
+    align-items:center;
+    gap:20px;
+
+    padding:0 20px;
+
+    position:sticky;
+    top:0;
+    z-index:1000;
+
+}
+
+
+.logo{
+
+    color:red;
+    font-size:26px;
+    font-weight:bold;
+
+}
+
+
+
+header input{
+
+    width:45%;
+
+    padding:12px 20px;
+
+    background:#121212;
+
+    color:white;
+
+    border:1px solid #333;
+
+    border-radius:25px;
+
+    outline:none;
+
+}
+
+
+
+button{
+
+    background:red;
+
+    color:white;
+
+    border:none;
+
+    padding:10px 18px;
+
+    border-radius:20px;
+
+    cursor:pointer;
+
+}
+
+
+
+button:hover{
+
+    background:#b00000;
+
+}
+
+
+
+/* ================= HOME PAGE ================= */
+
+
+.container{
+
+    display:flex;
+
+}
+
+
+
+.sidebar{
+
+    width:200px;
+
+    background:#181818;
+
+    min-height:100vh;
+
+    padding:20px;
+
+}
+
+
+.sidebar p{
+
+    padding:10px;
+
+    cursor:pointer;
+
+}
+
+
+.sidebar p:hover{
+
+    background:#333;
+
+}
+
+
+#sidebarMsg{
+
+    position:fixed;
+
+    bottom:20px;
+
+    left:50%;
+
+    transform:translateX(-50%);
+
+    background:#333;
+
+    color:white;
+
+    padding:12px 20px;
+
+    border-radius:25px;
+
+    z-index:2000;
+
+    font-size:14px;
+
+}
+
+
+
+/* VIDEO GRID */
+
+
+#videoList{
+
+    flex:1;
+
+    display:grid;
+
+    grid-template-columns:
+    repeat(auto-fill,minmax(260px,1fr));
+
+    gap:20px;
+
+    padding:20px;
+
+}
+
+
+.no-results{
+
+    flex:1;
+
+    padding:40px 20px;
+
+    text-align:center;
+
+    color:#999;
+
+    font-size:18px;
+
+}
+
+
+
+/* VIDEO CARD */
+
+
+.card{
+
+    background:#222;
+
+    padding:10px;
+
+    border-radius:10px;
+
+    cursor:pointer;
+
+    transition:.3s;
+
+}
+
+
+.card:hover{
+
+    transform:scale(1.03);
+
+}
+
+
+.thumb{
+
+    position:relative;
+
+}
+
+
+
+.thumb img{
+
+    width:100%;
+
+    height:150px;
+
+    object-fit:cover;
+
+    border-radius:10px;
+
+}
+
+
+
+.thumb span{
+
+    position:absolute;
+
+    right:8px;
+
+    bottom:8px;
+
+    background:black;
+
+    padding:5px;
+
+    border-radius:5px;
+
+    font-size:12px;
+
+}
+
+
+
+
+
+/* ================= WATCH PAGE ================= */
+
+
+.watch-container{
+
+    display:flex;
+
+    gap:25px;
+
+    padding:20px;
+
+}
+
+
+
+.main-video{
+
+    width:70%;
+
+}
+
+
+
+.video-box{
+
+    background:black;
+
+    border-radius:12px;
+
+    overflow:hidden;
+
+}
+
+
+
+.video-box video{
+
+    width:100%;
+
+    aspect-ratio:16/9;
+
+    object-fit:contain;
+
+}
+
+
+
+
+
+/* CONTROLS */
+
+
+.controls{
+
+    display:flex;
+
+    align-items:center;
+
+    gap:10px;
+
+    padding:10px;
+
+    background:#181818;
+
+}
+
+
+
+.controls button{
+
+    background:none;
+
+    font-size:20px;
+
+}
+
+
+
+#progress{
+
+    flex:1;
+
+    accent-color:red;
+
+}
+
+
+#volume{
+
+    width:100px;
+
+}
+
+
+
+#speed{
+
+    background:#222;
+
+    color:white;
+
+    padding:6px;
+
+}
+
+
+
+
+
+/* ACTIONS */
+
+
+.actions{
+
+    display:flex;
+
+    gap:10px;
+
+    margin:15px 0;
+
+}
+
+
+
+.actions button{
+
+    background:#272727;
+
+}
+
+
+
+
+/* CHANNEL */
+
+
+.channel{
+
+    display:flex;
+
+    align-items:center;
+
+    gap:15px;
+
+    border-top:1px solid #333;
+
+    border-bottom:1px solid #333;
+
+    padding:15px 0;
+
+}
+
+
+.channel img{
+
+    width:50px;
+
+    height:50px;
+
+    border-radius:50%;
+
+}
+
+
+.channel button{
+
+    margin-left:auto;
+
+}
+
+
+
+
+/* DESCRIPTION */
+
+
+#description{
+
+    background:#222;
+
+    padding:15px;
+
+    border-radius:10px;
+
+}
+
+
+
+
+
+/* SUGGESTED */
+
+
+.suggested{
+
+    width:30%;
+
+}
+
+
+.suggest-video{
+
+    display:flex;
+
+    gap:10px;
+
+    margin-bottom:15px;
+
+    cursor:pointer;
+
+}
+
+
+.suggest-video img{
+
+    width:170px;
+
+    height:95px;
+
+    object-fit:cover;
+
+    border-radius:8px;
+
+}
+
+
+
+
+
+
+/* ================= LOGIN SIGNUP ================= */
+
+
+.login-box{
+
+    width:350px;
+
+    max-width:90%;
+
+    margin:100px auto;
+
+    background:#181818;
+
+    padding:30px;
+
+    border-radius:15px;
+
+    text-align:center;
+
+}
+
+
+
+.login-box h1{
+
+    color:red;
+
+    font-size:35px;
+
+}
+
+
+
+.login-box input{
+
+    width:90%;
+
+    padding:12px;
+
+    margin:10px;
+
+    background:#222;
+
+    border:none;
+
+    border-radius:8px;
+
+    color:white;
+
+}
+
+
+
+.login-box button{
+
+    width:95%;
+
+    margin-top:15px;
+
+}
+
+
+
+.login-box a{
+
+    color:red;
+
+    text-decoration:none;
+
+}
+
+
+
+
+
+
+/* ================= MOBILE ================= */
+
+
+@media(max-width:900px){
+
+
+.container{
+
+    flex-direction:column;
+
+    align-items:stretch;
+
+}
+
+
+/* Keep the sidebar navigation visible on mobile instead of hiding it:
+   turn it into a horizontal, swipeable strip above the content so Home,
+   Trending, Subscriptions and Library all stay reachable by touch. */
+.sidebar{
+
+    display:flex;
+
+    flex-wrap:nowrap;
+
+    overflow-x:auto;
+
+    -webkit-overflow-scrolling:touch;
+
+    width:100%;
+
+    min-height:0;
+
+    padding:8px 10px;
+
+    gap:8px;
+
+    flex-shrink:0;
+
+}
+
+
+.sidebar p{
+
+    white-space:nowrap;
+
+    margin:0;
+
+    padding:8px 14px;
+
+}
+
+
+
+.watch-container{
+
+    flex-direction:column;
+
+}
+
+
+
+.main-video,
+.suggested{
+
+    width:100%;
+
+}
+
+
+
+header input{
+
+    width:35%;
+
+}
+
+
+}
+
+
+
+@media(max-width:600px){
+
+
+header{
+
+    flex-wrap:wrap;
+
+    height:auto;
+
+    padding:10px;
+
+    gap:8px;
+
+}
+
+
+.logo{
+
+    font-size:20px;
+
+}
+
+
+/* Full-width, touch-friendly search box on its own row so it stays usable
+   on tiny screens (320px+) instead of being squeezed into a narrow column. */
+header input{
+
+    width:100%;
+
+    flex:1 1 100%;
+
+    order:5;
+
+}
+
+
+.actions{
+
+    flex-wrap:wrap;
+
+}
+
+
+}
+
+
+/* ================= PHASE 6 ================= */
+
+
+/* Home content column (holds category filter + grid) */
+
+.home-content{
+    flex:1;
+    min-width:0;
+}
+
+
+/* Category filter */
+
+.category-filter{
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px;
+    padding:14px 20px 0;
+}
+
+.category-chip{
+    background:#272727;
+    color:white;
+    border:none;
+    border-radius:25px;
+    padding:8px 16px;
+    cursor:pointer;
+}
+
+.category-chip:hover{
+    background:#444;
+}
+
+.category-chip.active{
+    background:red;
+    color:white;
+}
+
+.category-chip:focus-visible{
+    outline:2px solid red;
+    outline-offset:2px;
+}
+
+
+/* Sidebar active state (e.g. Trending) */
+
+.sidebar p.active{
+    background:red;
+    color:white;
+}
+
+
+/* Accessible focus states for cards + sidebar */
+
+.card:focus-visible{
+    outline:2px solid red;
+    outline-offset:2px;
+}
+
+.sidebar p:focus-visible{
+    outline:2px solid red;
+    outline-offset:2px;
+}
+
+
+/* ================= PROFILE ================= */
+
+.profile-container{
+    max-width:900px;
+    margin:0 auto;
+}
+
+.profile-content{
+    flex:1;
+    min-width:0;
+}
+
+.profile-card{
+    display:flex;
+    align-items:center;
+    gap:20px;
+    padding:25px;
+    background:#181818;
+    border-radius:15px;
+    margin-bottom:20px;
+}
+
+.profile-avatar{
+    width:64px;
+    height:64px;
+    border-radius:50%;
+    background:red;
+    color:white;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:26px;
+    font-weight:bold;
+    flex-shrink:0;
+    user-select:none;
+}
+
+.profile-section{
+    background:#181818;
+    padding:20px;
+    border-radius:15px;
+    margin-bottom:20px;
+}
+
+.profile-section h3{
+    margin-top:0;
+    margin-bottom:15px;
+}
+
+.profile-list{
+    display:flex;
+    flex-direction:column;
+    gap:12px;
+}
+
+.profile-video{
+    display:flex;
+    gap:12px;
+    align-items:center;
+    background:#202020;
+    padding:10px;
+    border-radius:10px;
+    text-decoration:none;
+    color:white;
+}
+
+.profile-video:hover{
+    background:#2a2a2a;
+}
+
+.profile-video:focus-visible{
+    outline:2px solid red;
+    outline-offset:2px;
+}
+
+.profile-video img{
+    width:120px;
+    height:68px;
+    object-fit:cover;
+    border-radius:8px;
+    flex-shrink:0;
+}
+
+.profile-video-info h4{
+    margin:0;
+    font-size:15px;
+}
+
+.profile-video-info p{
+    margin:4px 0 0;
+    font-size:13px;
+    color:#aaa;
+}
+
+.profile-channel{
+    display:flex;
+    align-items:center;
+    gap:14px;
+    background:#202020;
+    padding:12px;
+    border-radius:10px;
+}
+
+.profile-channel .channel-avatar{
+    width:44px;
+    height:44px;
+    font-size:18px;
+}
+
+.profile-empty{
+    color:#999;
+    font-size:14px;
+}
+
+
+@media(max-width:600px){
+
+.profile-card{
+    flex-direction:column;
+    text-align:center;
+}
+
+.profile-video{
+    flex-direction:column;
+    align-items:flex-start;
+}
+
+.profile-video img{
+    width:100%;
+    height:auto;
+    aspect-ratio:16/9;
+}
+
+}

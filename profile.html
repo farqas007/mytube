@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Profile - MyTube</title>
+
+<link rel="icon" type="image/png" href="youtube.png">
+
+<link rel="stylesheet" href="player.css">
+<link rel="stylesheet" href="style.css">
+
+<!-- Shared video dataset (single source of truth) -->
+<script src="videos.js"></script>
+
+</head>
+
+
+<body>
+
+
+<header>
+
+<div class="logo">
+MyTube 🔴
+</div>
+
+
+<button type="button" onclick="goHome()">
+Home
+</button>
+
+
+<button id="loginBtn" type="button">
+Login
+</button>
+
+
+<button id="logoutBtn" type="button" style="display:none;">
+Logout
+</button>
+
+</header>
+
+
+<div class="watch-container profile-container">
+
+
+<div id="profileLoggedOut" class="state-panel" style="display:none;">
+<h2>You are not logged in</h2>
+<p>Log in to see your profile, saved videos and subscriptions.</p>
+<button type="button" class="back-home" onclick="goLogin()">Log In</button>
+</div>
+
+
+<div id="profileContent" class="profile-content" style="display:none;">
+
+
+<section class="profile-card">
+
+<div class="profile-avatar" id="profileAvatar" aria-hidden="true"></div>
+
+<div>
+<h2 id="profileName">User</h2>
+<p id="profileEmail" class="video-meta"></p>
+</div>
+
+</section>
+
+
+<section class="profile-section">
+
+<h3>Saved Videos</h3>
+
+<div id="savedList" class="profile-list"></div>
+
+</section>
+
+
+<section class="profile-section">
+
+<h3>Subscribed Channels</h3>
+
+<div id="subsList" class="profile-list"></div>
+
+</section>
+
+
+</div>
+
+
+</div>
+
+
+<script>
+
+function goHome(){
+    window.location.href = "index.html";
+}
+
+function goLogin(){
+    window.location.href = "login.html";
+}
+
+</script>
+
+
+<script type="module" src="auth.js"></script>
+<script type="module" src="profile.js"></script>
+
+
+</body>
+
+</html>
