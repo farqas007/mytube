@@ -527,43 +527,144 @@ const CONTENT_TYPES = {
 
 const STATIC_EXTS = new Set(Object.keys(CONTENT_TYPES));
 
-function serveStatic(res, urlPath){
+function serveStatic(req, res, urlPath){
   // Resolve within root and prevent path traversal.
-  let filePath = urlPath === "/" ? "index.html" : decodeURIComponent(urlPath);
+  let filePath;
+  try {
+    filePath = urlPath === "/" ? "index.html" : decodeURIComponent(urlPath);
+  } catch {
+    res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+    return res.end("Bad Request");
+  }
 
   // Never serve sensitive files (env, git metadata).
   const SENSITIVE = [".env", ".env.example", ".git", ".gitignore", "package-lock.json"];
   for(const name of SENSITIVE){
     if(filePath === name || filePath.startsWith(name + "/")){
-      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
       return res.end("Not Found");
     }
   }
 
-  const safePath = path.normalize(filePath).replace(/^(\.\.[/\\])+/, "");
-  const fullPath = path.join(YT_ROOT, safePath);
+  const safePath = path.normalize(filePath).replace(/^[/\\]+/, "").replace(/^(\.\.[/\\])+/, "");
+  const fullPath = path.resolve(YT_ROOT, safePath);
 
-  if(!fullPath.startsWith(YT_ROOT)){
-    res.writeHead(403);
+  if(fullPath !== YT_ROOT && !fullPath.startsWith(YT_ROOT + path.sep)){
+    res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
     return res.end("Forbidden");
   }
 
   fs.stat(fullPath, (err, stat) => {
     if(err || !stat.isFile()){
-      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
       return res.end("Not Found");
     }
+
     const ext = path.extname(fullPath).toLowerCase();
     const type = CONTENT_TYPES[ext] || "application/octet-stream";
+
     if(!STATIC_EXTS.has(ext)){
-      res.writeHead(415, { "Content-Type": "text/plain" });
+      res.writeHead(415, { "Content-Type": "text/plain; charset=utf-8" });
       return res.end("Unsupported file type");
     }
-    res.writeHead(200, {
+
+    const isVideo = ext === ".mp4" || ext === ".webm";
+    const commonHeaders = {
       "Content-Type": type,
       "Cache-Control": ext === ".html" ? "no-cache" : "public, max-age=3600"
-    });
-    fs.createReadStream(fullPath).pipe(res);
+    };
+
+    // Browsers use HTTP Range requests for video seeking/buffering.
+    if(isVideo){
+      commonHeaders["Accept-Ranges"] = "bytes";
+    }
+
+    if(req.method === "HEAD"){
+      commonHeaders["Content-Length"] = stat.size;
+      res.writeHead(200, commonHeaders);
+      return res.end();
+    }
+
+    if(isVideo && req.headers.range){
+      const range = req.headers.range.trim();
+      const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+
+      if(!match){
+        res.writeHead(416, {
+          ...commonHeaders,
+          "Content-Range": `bytes */${stat.size}`
+        });
+        return res.end();
+      }
+
+      let startByte;
+      let endByte;
+
+      if(match[1] === ""){
+        // Suffix range: bytes=-500
+        const suffixLength = Number(match[2]);
+        if(!Number.isSafeInteger(suffixLength) || suffixLength <= 0){
+          res.writeHead(416, {
+            ...commonHeaders,
+            "Content-Range": `bytes */${stat.size}`
+          });
+          return res.end();
+        }
+        startByte = Math.max(stat.size - suffixLength, 0);
+        endByte = stat.size - 1;
+      } else {
+        startByte = Number(match[1]);
+        endByte = match[2] === "" ? stat.size - 1 : Number(match[2]);
+
+        if(
+          !Number.isSafeInteger(startByte) ||
+          !Number.isSafeInteger(endByte) ||
+          startByte < 0 ||
+          endByte < startByte ||
+          startByte >= stat.size
+        ){
+          res.writeHead(416, {
+            ...commonHeaders,
+            "Content-Range": `bytes */${stat.size}`
+          });
+          return res.end();
+        }
+
+        endByte = Math.min(endByte, stat.size - 1);
+      }
+
+      const chunkSize = endByte - startByte + 1;
+
+      res.writeHead(206, {
+        ...commonHeaders,
+        "Content-Length": chunkSize,
+        "Content-Range": `bytes ${startByte}-${endByte}/${stat.size}`
+      });
+
+      const stream = fs.createReadStream(fullPath, {
+        start: startByte,
+        end: endByte
+      });
+
+      stream.on("error", () => {
+        if(!res.headersSent){
+          res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+        }
+        res.destroy();
+      });
+
+      return stream.pipe(res);
+    }
+
+    commonHeaders["Content-Length"] = stat.size;
+    res.writeHead(200, commonHeaders);
+
+    fs.createReadStream(fullPath).on("error", () => {
+      if(!res.headersSent){
+        res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+      }
+      res.destroy();
+    }).pipe(res);
   });
 }
 
@@ -623,7 +724,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  return serveStatic(res, url.pathname);
+  return serveStatic(req, res, url.pathname);
 });
 
 server.listen(PORT, () => {
