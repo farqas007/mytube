@@ -453,6 +453,8 @@ header button:hover{
 
     flex-wrap:wrap;
 
+    position:relative;
+
 }
 
 
@@ -1345,4 +1347,128 @@ header{
     padding:12px;
 }
 
+}
+
+
+/* ================= PLAYLIST POPOVER ================= */
+
+
+.playlist-popover{
+    position:absolute;
+    top:100%;
+    right:0;
+    width:320px;
+    max-width:calc(100vw - 24px);
+    background:#202020;
+    border:1px solid #333;
+    border-radius:12px;
+    padding:14px;
+    margin-top:8px;
+    z-index:20;
+    box-shadow:0 8px 24px rgba(0,0,0,0.5);
+}
+
+.playlist-popover h4{
+    margin:0 0 10px;
+    color:white;
+    font-size:15px;
+}
+
+.playlist-choices{
+    display:flex;
+    flex-direction:column;
+    gap:6px;
+    max-height:240px;
+    overflow-y:auto;
+    margin-bottom:10px;
+}
+
+.playlist-choice{
+    display:block;
+    width:100%;
+    text-align:left;
+    background:#2a2a2a;
+    color:white;
+    border:none;
+    padding:10px 12px;
+    border-radius:8px;
+    cursor:pointer;
+    font-size:14px;
+    font-family:inherit;
+}
+
+.playlist-choice:hover{
+    background:#3a3a3a;
+}
+
+.playlist-choice:focus-visible{
+    outline:2px solid red;
+    outline-offset:2px;
+}
+
+.playlist-choice:disabled{
+    opacity:0.6;
+    cursor:default;
+}
+
+.playlist-choice[aria-pressed="true"]{
+    background:#111;
+}
+
+.playlist-new-row{
+    display:flex;
+    gap:8px;
+}
+
+.playlist-new-row input{
+    flex:1;
+    min-width:0;
+    background:#121212;
+    color:white;
+    border:1px solid #333;
+    border-radius:10px;
+    padding:10px;
+    outline:none;
+    font-family:inherit;
+}
+
+.playlist-new-row input:focus-visible{
+    border-color:red;
+    outline:2px solid red;
+    outline-offset:1px;
+}
+
+@media(max-width:600px){
+    .playlist-popover{
+        width:280px;
+    }
+}
+
+/* ================= LOAD MORE (comments) ================= */
+
+.comment-load-more{
+    margin:16px auto 4px;
+    background:transparent;
+    border:1px solid red;
+    color:#fff;
+    padding:8px 20px;
+    border-radius:999px;
+    font-size:13px;
+    font-weight:600;
+    cursor:pointer;
+    font-family:inherit;
+}
+
+.comment-load-more:hover{
+    background:rgba(255, 0, 0, 0.12);
+}
+
+.comment-load-more:focus-visible{
+    outline:2px solid white;
+    outline-offset:2px;
+}
+
+.comment-load-more:disabled{
+    opacity:0.6;
+    cursor:default;
 }

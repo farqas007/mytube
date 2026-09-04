@@ -92,7 +92,6 @@ Logout
 
 <video 
 id="videoPlayer"
-controls
 preload="metadata"
 playsinline
 aria-label="Video player">
@@ -147,9 +146,11 @@ aria-label="Previous video">
 
 
 <button 
+id="playBtn"
 type="button"
 onclick="playPause()"
-aria-label="Play or pause">
+aria-label="Play"
+aria-pressed="false">
 ▶
 </button>
 
@@ -297,14 +298,38 @@ aria-pressed="false">
 
 
 
+<button id="playlistBtn" type="button" aria-label="Add video to a playlist" aria-haspopup="dialog" aria-expanded="false">
+📁 Playlist
+</button>
+
 <span id="actionMsg" class="action-msg" role="status" aria-live="polite"></span>
 
+</div>
 
+<div id="playlistPopover" class="playlist-popover" style="display:none;" role="dialog" aria-label="Add to playlist">
 
+<h4 id="playlistPopoverTitle">Add to playlist</h4>
 
+<div id="playlistChoices" class="playlist-choices">
 
+<p class="comment-empty">Loading playlists...</p>
 
 </div>
+
+<div class="playlist-new-row">
+
+<input id="playlistNewName" type="text" placeholder="New playlist name" aria-label="New playlist name" maxlength="80">
+
+<button id="playlistCreateBtn" type="button" class="comment-submit">
+Create
+</button>
+
+</div>
+
+<p id="playlistMsg" class="action-msg" role="status" aria-live="polite"></p>
+
+</div>
+
 <div class="channel">
 
 
@@ -379,6 +404,7 @@ id="commentInput"
 rows="2"
 placeholder="Add a comment..."
 aria-label="Add a comment"
+maxlength="2000"
 ></textarea>
 
 <button type="submit" class="comment-submit">Comment</button>

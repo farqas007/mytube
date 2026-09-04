@@ -1,7 +1,35 @@
+// =============================================================================
+// MyTube — Shared YouTube Data API normalizer
+// -----------------------------------------------------------------------------
+// THE single source of truth for converting raw YouTube Data API v3 responses
+// into the clean, MyTube-compatible shape. Used by BOTH the Cloudflare Worker
+// (production) and the local Node server (development). Keeping one module here
+// guarantees identical JSON shapes across environments.
+//
+// Canonical video shape (mirrors the local videos in videos.js):
+//   {
+//     id: "yt:<videoId>",   // namespaced id for watch.html?id=yt:<id>
+//     sourceId: "<videoId>",// the raw YouTube video id (used for the embed)
+//     type: "youtube",
+//     title, channel, channelId, thumb, time, views, viewCount,
+//     likeCount, commentCount, date, description, embeddable
+//   }
+//
+// List endpoints always return { videos: [...], nextPageToken: "..." } (an empty
+// string when there is no next page). Comments return { comments, nextPageToken }
+// and channels return { channel }.
+// =============================================================================
+
 function formatPublishedDate(value) {
-  if (!value) return "";
+  if (!value) {
+    return "";
+  }
+
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "";
+
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
 
   const diff = Date.now() - date.getTime();
   const seconds = Math.max(0, Math.floor(diff / 1000));
@@ -20,13 +48,17 @@ function formatPublishedDate(value) {
 }
 
 function formatDuration(value) {
-  if (!value) return "";
+  if (!value) {
+    return "";
+  }
 
   const match = String(value).match(
     /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/
   );
 
-  if (!match) return "";
+  if (!match) {
+    return "";
+  }
 
   const hours = Number(match[1] || 0);
   const minutes = Number(match[2] || 0);
@@ -57,7 +89,9 @@ function formatCount(value) {
 }
 
 function pickThumbnail(thumbnails) {
-  if (!thumbnails) return "";
+  if (!thumbnails) {
+    return "";
+  }
 
   return (
     thumbnails.maxres?.url ||
@@ -69,10 +103,14 @@ function pickThumbnail(thumbnails) {
   );
 }
 
+// Normalize a single video (search items, videos.list items, etc.).
+// `details` (optional) is the matching videos.list item when the caller fetched
+// statistics/contentDetails/status separately (search results don't include them).
 function normalizeSearchItem(item, details = null) {
   const snippet = item?.snippet || {};
   const stats = details?.statistics || {};
   const contentDetails = details?.contentDetails || {};
+  const status = details?.status || {};
 
   const videoId =
     item?.id?.videoId ||
@@ -81,6 +119,10 @@ function normalizeSearchItem(item, details = null) {
     "";
 
   if (!videoId) return null;
+
+  const viewCount = Number(stats.viewCount || 0);
+  const likeCount = Number(stats.likeCount || 0);
+  const commentCount = Number(stats.commentCount || 0);
 
   return {
     id: `yt:${videoId}`,
@@ -91,18 +133,20 @@ function normalizeSearchItem(item, details = null) {
     channelId: snippet.channelId || "",
     thumb: pickThumbnail(snippet.thumbnails),
     time: formatDuration(contentDetails.duration),
-    views: formatCount(stats.viewCount),
-    viewCount: Number(stats.viewCount || 0),
-    likeCount: Number(stats.likeCount || 0),
-    commentCount: Number(stats.commentCount || 0),
+    views: formatCount(viewCount),
+    viewCount,
+    likeCount,
+    commentCount,
     date: formatPublishedDate(snippet.publishedAt),
     description: snippet.description || "",
-    embeddable: details?.status?.embeddable !== false
+    embeddable: status.embeddable !== false
   };
 }
 
 function normalizeVideoItem(item) {
-  if (!item) return null;
+  if (!item) {
+    return null;
+  }
 
   return normalizeSearchItem(
     {
@@ -164,6 +208,10 @@ function normalizeChannelResponse(data) {
 
   const snippet = item.snippet || {};
   const stats = item.statistics || {};
+  const countHidden = stats.hiddenSubscriberCount === true;
+  const subscriberCount = countHidden
+    ? null
+    : Number(stats.subscriberCount || 0);
 
   return {
     channel: {
@@ -171,12 +219,14 @@ function normalizeChannelResponse(data) {
       title: snippet.title || "",
       description: snippet.description || "",
       thumb: pickThumbnail(snippet.thumbnails),
-      subscriberCount:
-        stats.hiddenSubscriberCount
-          ? null
-          : Number(stats.subscriberCount || 0),
+      subscriberCount,
+      subscriberCountHidden: countHidden,
       viewCount: Number(stats.viewCount || 0),
-      videoCount: Number(stats.videoCount || 0)
+      videoCount: Number(stats.videoCount || 0),
+      subscribers:
+        subscriberCount == null
+          ? ""
+          : `${formatCount(subscriberCount)} subscribers`
     }
   };
 }
@@ -195,7 +245,7 @@ function normalizeCommentsResponse(data) {
         id: thread?.id || item?.id || "",
         author: snippet.authorDisplayName || "",
         authorChannelId: snippet.authorChannelId?.value || "",
-        authorPhoto: snippet.authorProfileImageUrl || "",
+        authorThumb: snippet.authorProfileImageUrl || "",
         text: snippet.textOriginal || "",
         likeCount: Number(snippet.likeCount || 0),
         publishedAt: snippet.publishedAt || "",

@@ -1,0 +1,35 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Any signed-in user may read and write only their OWN per-user data.
+    // All app data lives under users/{uid}/... (subscriptions, saved, liked,
+    // history, playlists, playlistItems), so this single rule covers the
+    // whole application while preventing cross-user access.
+    match /users/{uid}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // Shared comments collection — one doc per comment. Public reads (anyone may
+    // browse comments on any video), but only the authenticated owner may create
+    // a comment and only the owner may change or delete their own.
+    match /comments/{doc} {
+      allow create: if request.auth != null
+                    && request.resource.data.userId == request.auth.uid
+                    && request.resource.data.videoId is string
+                    && request.resource.data.videoId.size() > 0
+                    && request.resource.data.text is string
+                    && request.resource.data.text.size() > 0
+                    && request.resource.data.text.size() <= 2000;
+      allow read: if true;
+      allow update, delete: if request.auth != null
+                            && resource.data.userId == request.auth.uid;
+    }
+
+    // Defensive defaults: deny everything else.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -132,6 +132,7 @@ async function apiRequest(route, params, signal){
       video: (payload && payload.video) ? payload.video : null,
       channel: (payload && payload.channel) ? payload.channel : null,
       comments: (payload && Array.isArray(payload.comments)) ? payload.comments : [],
+      nextPageToken: (payload && payload.nextPageToken) ? String(payload.nextPageToken) : "",
       error: (payload && payload.error) ? payload.error : ""
     };
     if(res.ok){
@@ -152,12 +153,16 @@ async function apiRequest(route, params, signal){
 // Public API
 // =============================================================================
 
-// Search YouTube. Returns { videos, error, ok }.
+// Search YouTube. Returns { videos, nextPageToken, error, ok }.
 // Never resolves to null; on any failure it returns an empty array so the
 // caller can safely fall back to local videos.
-async function search(query, max, signal){
-  const { videos, error, ok } = await apiRequest("search", { q: query, max: String(max || 20) }, signal);
-  return { videos: videos || [], error: error || "", ok: ok };
+async function search(query, max, pageToken, signal){
+  const params = { q: query, max: String(max || 20) };
+  if(pageToken){
+    params.pageToken = String(pageToken);
+  }
+  const { videos, error, ok, nextPageToken } = await apiRequest("search", params, signal);
+  return { videos: videos || [], nextPageToken: nextPageToken || "", error: error || "", ok: ok };
 }
 
 // Official YouTube trending / "most popular" feed.
@@ -192,9 +197,23 @@ async function channel(id){
 }
 
 // Fetch real public top-level comments for a YouTube video.
-async function comments(id, max){
-  const res = await apiRequest("comments", { id: String(id), max: String(max || 20) });
-  return { comments: res.comments || [], error: res.error || "", ok: res.ok };
+async function comments(id, max, pageToken){
+  const params = { id: String(id), max: String(max || 20) };
+  if(pageToken){
+    params.pageToken = String(pageToken);
+  }
+  const res = await apiRequest("comments", params);
+  return { comments: res.comments || [], nextPageToken: res.nextPageToken || "", error: res.error || "", ok: res.ok };
+}
+
+// Fetch recent videos from a specific YouTube channel.
+async function channelVideos(channelId, max, pageToken){
+  const params = { channelId: String(channelId), max: String(max || 8) };
+  if(pageToken){
+    params.pageToken = String(pageToken);
+  }
+  const { videos, error, ok, nextPageToken } = await apiRequest("channelVideos", params);
+  return { videos: videos || [], nextPageToken: nextPageToken || "", error: error || "", ok: ok };
 }
 
 // Whether the dynamic source is considered available (backend reachable).
@@ -203,4 +222,4 @@ async function isAvailable(){
   return Boolean(base);
 }
 
-export { search, getVideo, related, channel, comments, trending, isAvailable };
+export { search, getVideo, related, channel, comments, trending, channelVideos, isAvailable };

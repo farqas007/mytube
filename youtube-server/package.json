@@ -2,7 +2,7 @@
   "name": "mytube-youtube-server",
   "version": "1.0.0",
   "description": "MyTube Phase 7: minimal dependency-free YouTube Data API proxy + static file server.",
-  "type": "commonjs",
+  "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node --env-file=.env server.js"

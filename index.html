@@ -219,6 +219,7 @@ function buildCard(v){
 function renderVideos(){
     const list = visibleVideos();
 
+    hideLoadMore();
     box.replaceChildren();
 
     list.forEach(v => {
@@ -412,10 +413,102 @@ async function maybeLoadRemoteHome(){
 // with YouTube results first and matching local videos below as a fallback.
 let searchSeq = 0;
 let activeSearchController = null;
+let searchNextToken = "";
+let searchRemoteVideos = [];
+let searchLoadMoreBtn = null;
+let searchLoadingMore = false;
+
+function hideLoadMore(){
+    if(searchLoadMoreBtn){
+        searchLoadMoreBtn.remove();
+        searchLoadMoreBtn = null;
+    }
+}
+
+function buildLoadMoreBtn(){
+    if(searchLoadMoreBtn && searchLoadMoreBtn.isConnected){
+        return searchLoadMoreBtn;
+    }
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "load-more";
+    btn.textContent = "Load more";
+    btn.setAttribute("aria-label", "Load more YouTube results");
+    btn.addEventListener("click", loadMoreResults);
+    searchLoadMoreBtn = btn;
+    return btn;
+}
+
+function updateLoadMore(){
+    const hasMore = Boolean(searchNextToken) && searchRemoteVideos.length > 0;
+    if(hasMore && !(searchLoadMoreBtn && searchLoadMoreBtn.isConnected)){
+        box.after(buildLoadMoreBtn());
+    }
+    else if(!hasMore && searchLoadMoreBtn && searchLoadMoreBtn.isConnected){
+        searchLoadMoreBtn.remove();
+        searchLoadMoreBtn = null;
+    }
+}
+
+async function loadMoreResults(){
+    if(searchLoadingMore || !searchNextToken || !currentQuery){
+        return;
+    }
+    const client = ytClient();
+    if(!client){
+        return;
+    }
+    const q = currentQuery;
+    const seq = searchSeq;
+    const btn = searchLoadMoreBtn;
+
+    searchLoadingMore = true;
+    if(btn){
+        btn.disabled = true;
+        btn.textContent = "Loading...";
+    }
+
+    try{
+        const result = await client.search(q, 20, searchNextToken);
+        // Bail if the user typed something new while the page loaded.
+        if(seq !== searchSeq || q !== currentQuery){
+            return;
+        }
+        const page = result.videos || [];
+        if(page.length){
+            searchRemoteVideos = searchRemoteVideos.concat(page);
+            searchNextToken = result.nextPageToken || "";
+            const localMatches = videos.filter(videoMatches);
+            renderVideoList(searchRemoteVideos.concat(localMatches));
+        }
+        else{
+            searchNextToken = "";
+        }
+        showStatus("");
+    }
+    catch(e){
+        logHome("warn", "Load more failed:", e);
+        showStatus("Could not load more results. Please try again.");
+    }
+    finally{
+        searchLoadingMore = false;
+        if(btn){
+            btn.disabled = false;
+            btn.textContent = "Load more";
+        }
+        updateLoadMore();
+    }
+}
+
 async function doDynamicSearch(){
     const client = ytClient();
     const q = currentQuery;
     const seq = ++searchSeq;
+
+    // Reset pagination state for this query.
+    searchNextToken = "";
+    searchRemoteVideos = [];
+    hideLoadMore();
 
     // Cancel any in-flight YouTube API request from a previous keystroke.
     if(activeSearchController){
@@ -452,8 +545,9 @@ async function doDynamicSearch(){
     let remote = [];
     let apiError = "";
     try{
-        const result = await client.search(q, 20, controller.signal);
+        const result = await client.search(q, 20, "", controller.signal);
         remote = result.videos || [];
+        searchNextToken = result.nextPageToken || "";
         apiError = result.error || "";
     }
     catch(e){
@@ -470,12 +564,13 @@ async function doDynamicSearch(){
 
     // Compose: remote YouTube results + local matches (dedupe is inherent since
     // ids are namespaced yt:... vs local ids).
-    let combined = remote.slice(0, 30);
-    combined = combined.concat(localMatches);
+    searchRemoteVideos = remote.slice(0, 30);
+    let combined = searchRemoteVideos.concat(localMatches);
 
     if(!remote.length && !localMatches.length){
         showStatus(apiError ? ("Could not search YouTube: " + apiError) : "No videos found for this search.");
         renderVideoList(combined);
+        updateLoadMore();
         return;
     }
 
@@ -487,6 +582,7 @@ async function doDynamicSearch(){
         showStatus("");
     }
     renderVideoList(combined);
+    updateLoadMore();
 }
 
 function logHome(level, msg, err){
@@ -621,12 +717,12 @@ async function loadTrendingYouTube(){
 
 
 makeSideItemInteractive(sideSubs, () => {
-    showSidebarMsg("Subscriptions page coming soon");
+    window.location.href = "subscriptions.html";
 });
 
 
 makeSideItemInteractive(sideLibrary, () => {
-    showSidebarMsg("Library page coming soon");
+    window.location.href = "library.html";
 });
 
 
