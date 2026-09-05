@@ -131,6 +131,20 @@ button:hover{
 }
 
 
+.sidebar-icon{
+    width:20px;
+    height:20px;
+    display:inline-block;
+    vertical-align:-5px;
+    margin-right:8px;
+    fill:none;
+    stroke:currentColor;
+    stroke-width:1.8;
+    stroke-linecap:round;
+    stroke-linejoin:round;
+}
+
+
 #sidebarMsg{
 
     position:fixed;

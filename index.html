@@ -68,13 +68,38 @@ Logout
 
 <aside class="sidebar">
 
-<p id="sideHome">🏠 Home</p>
+<p id="sideHome">
+    <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3 10.5 12 3l9 7.5"></path>
+        <path d="M5.5 9.5V21h13V9.5"></path>
+        <path d="M9.5 21v-6h5v6"></path>
+    </svg>
+    <span>Home</span>
+</p>
 
-<p id="sideTrending">🔥 Trending</p>
+<p id="sideTrending">
+    <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M13.5 2.5c.5 4-1.2 5.8-3.2 7.5-1.4 1.2-2.8 2.4-2.8 5.1A4.5 4.5 0 0 0 12 19.5a4.5 4.5 0 0 0 4.5-4.5c0-2.2-1.1-4-2.5-5.5.1 2-1 3.1-2 3.8.2-2.7 1.8-5.2 1.5-10.8Z"></path>
+        <path d="M8.5 19.5A7 7 0 0 1 5 13c0-2.6 1.2-4.5 3.2-6.4"></path>
+    </svg>
+    <span>Trending</span>
+</p>
 
-<p id="sideSubs">📺 Subscriptions</p>
+<p id="sideSubs">
+    <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="3" y="5" width="18" height="14" rx="2"></rect>
+        <path d="m10 9 5 3-5 3V9Z"></path>
+    </svg>
+    <span>Subscriptions</span>
+</p>
 
-<p id="sideLibrary">📚 Library</p>
+<p id="sideLibrary">
+    <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v17H6.5A2.5 2.5 0 0 0 4 22V5.5Z"></path>
+        <path d="M4 5.5V19a3 3 0 0 1 3-3h13"></path>
+    </svg>
+    <span>Library</span>
+</p>
 
 </aside>
 
@@ -351,9 +376,15 @@ function renderVideoList(list){
 // Build the card's meta text once (works for local and youtube cards).
 function cardMeta(v){
     const parts = [v.channel];
+
     if(v.views){
         parts.push(v.views);
     }
+
+    if(v.date){
+        parts.push(v.date);
+    }
+
     return parts.join(" • ");
 }
 

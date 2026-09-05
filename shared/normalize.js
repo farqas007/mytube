@@ -34,17 +34,32 @@ function formatPublishedDate(value) {
   const diff = Date.now() - date.getTime();
   const seconds = Math.max(0, Math.floor(diff / 1000));
 
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days < 30) return `${days}d ago`;
-  const months = Math.floor(days / 30);
-  if (months < 12) return `${months}mo ago`;
+  if (seconds < 60) {
+    return `${seconds} ${seconds === 1 ? "second" : "seconds"} ago`;
+  }
 
-  return `${Math.floor(months / 12)}y ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes} ${minutes === 1 ? "minute" : "minutes"} ago`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours} ${hours === 1 ? "hour" : "hours"} ago`;
+  }
+
+  const days = Math.floor(hours / 24);
+  if (days < 30) {
+    return `${days} ${days === 1 ? "day" : "days"} ago`;
+  }
+
+  const months = Math.floor(days / 30);
+  if (months < 12) {
+    return `${months} ${months === 1 ? "month" : "months"} ago`;
+  }
+
+  const years = Math.floor(months / 12);
+  return `${years} ${years === 1 ? "year" : "years"} ago`;
 }
 
 function formatDuration(value) {
@@ -75,14 +90,34 @@ function formatCount(value) {
   const number = Number(value || 0);
 
   if (!Number.isFinite(number)) return "0";
+
+  const compact = (amount, suffix, precision) => {
+    const formatted = amount.toFixed(precision).replace(/\.0+$/, "");
+    return `${formatted}${suffix}`;
+  };
+
   if (number >= 1_000_000_000) {
-    return `${(number / 1_000_000_000).toFixed(number >= 10_000_000_000 ? 0 : 1)}B`;
+    return compact(
+      number / 1_000_000_000,
+      "B",
+      number >= 10_000_000_000 ? 0 : 1
+    );
   }
+
   if (number >= 1_000_000) {
-    return `${(number / 1_000_000).toFixed(number >= 10_000_000 ? 0 : 1)}M`;
+    return compact(
+      number / 1_000_000,
+      "M",
+      number >= 10_000_000 ? 0 : 1
+    );
   }
+
   if (number >= 1_000) {
-    return `${(number / 1_000).toFixed(number >= 100_000 ? 0 : 1)}K`;
+    return compact(
+      number / 1_000,
+      "K",
+      number >= 100_000 ? 0 : 1
+    );
   }
 
   return String(number);
