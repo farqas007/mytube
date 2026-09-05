@@ -498,67 +498,111 @@ async function getRelated(videoId, max, apiKey) {
 }
 
 async function getChannelVideos(channelId, max, apiKey, pageToken) {
-  const params = {
-    part: "snippet",
-    type: "video",
-    channelId,
-    order: "date",
-    maxResults: Math.min(Math.max(Number(max) || 8, 1), 25)
-  };
+  const maxResults = Math.min(
+    Math.max(Number(max) || 8, 1),
+    25
+  );
 
-  if (pageToken) {
-    params.pageToken = pageToken;
-  }
-
-  const searchResult = await ytFetch(
-    "search",
-    params,
+  // Get the channel's uploads playlist.
+  // This avoids the expensive YouTube Search API.
+  const channelResult = await ytFetch(
+    "channels",
+    {
+      part: "contentDetails",
+      id: channelId
+    },
     apiKey
   );
 
-  const searchData = searchResult.data;
-  const ids = (searchData?.items || [])
-    .map(item => item?.id?.videoId)
+  const channelItem = channelResult.data?.items?.[0];
+  const uploadsPlaylistId =
+    channelItem?.contentDetails?.relatedPlaylists?.uploads || "";
+
+  if (!uploadsPlaylistId) {
+    return {
+      videos: [],
+      nextPageToken: ""
+    };
+  }
+
+  // Get the latest videos from the uploads playlist.
+  const playlistResult = await ytFetch(
+    "playlistItems",
+    {
+      part: "snippet,contentDetails",
+      playlistId: uploadsPlaylistId,
+      maxResults
+    ,
+      ...(pageToken ? { pageToken } : {})
+    },
+    apiKey
+  );
+
+  const playlistData = playlistResult.data;
+  const ids = (playlistData?.items || [])
+    .map(item => item?.contentDetails?.videoId)
     .filter(Boolean);
 
-  let detailsById = new Map();
+  if (!ids.length) {
+    return {
+      videos: [],
+      nextPageToken: playlistData?.nextPageToken || ""
+    };
+  }
 
-  if (ids.length) {
-    const detailsResult = await ytFetch(
-      "videos",
-      {
-        part: "snippet,contentDetails,statistics,status",
-        id: ids.join(",")
-      },
-      apiKey
-    );
+  // Fetch full video details so duration, views, likes, etc.
+  // remain identical to the existing MyTube video shape.
+  const detailsResult = await ytFetch(
+    "videos",
+    {
+      part: "snippet,contentDetails,statistics,status",
+      id: ids.join(",")
+    },
+    apiKey
+  );
 
-    for (const item of detailsResult.data?.items || []) {
-      if (item?.id) {
-        detailsById.set(item.id, item);
-      }
+  const detailsById = new Map();
+
+  for (const item of detailsResult.data?.items || []) {
+    if (item?.id) {
+      detailsById.set(item.id, item);
     }
   }
 
   const videos = [];
 
-  for (const item of searchData?.items || []) {
-    const id = item?.id?.videoId;
+  for (const item of playlistData?.items || []) {
+    const id = item?.contentDetails?.videoId;
+
     if (!id) continue;
 
-    const video = normalizeSearchItem(
-      item,
-      detailsById.get(id) || null
-    );
+    const detail = detailsById.get(id);
 
-    if (video) {
-      videos.push(video);
+    if (detail) {
+      const video = normalizeVideoItem(detail);
+
+      if (video) {
+        videos.push(video);
+      }
+    } else {
+      // Fallback to playlist snippet if the detailed video response
+      // does not contain this item.
+      const video = normalizeSearchItem({
+        id: {
+          videoId: id
+        },
+        snippet: item?.snippet || {}
+      });
+
+      if (video) {
+        videos.push(video);
+      }
     }
   }
 
   return {
     videos,
-    nextPageToken: searchData?.nextPageToken || ""
+    nextPageToken: playlistData?.nextPageToken || ""
   };
 }
 
