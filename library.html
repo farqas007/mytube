@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Library - MyTube</title>
+
+<link rel="icon" type="image/png" href="youtube.png">
+
+<link rel="stylesheet" href="style.css">
+
+<!-- Shared video dataset (single source of truth) -->
+<script src="videos.js"></script>
+
+</head>
+
+
+<body>
+
+
+<header>
+
+<div class="logo">
+MyTube 🔴
+</div>
+
+
+<input 
+id="search"
+placeholder="Search videos..."
+aria-label="Search videos"
+>
+
+<button type="button" onclick="goHome()">
+Home
+</button>
+
+<button id="loginBtn" type="button">
+Login
+</button>
+
+<button id="logoutBtn" type="button" style="display:none;">
+Logout
+</button>
+
+</header>
+
+
+<div class="watch-container profile-container">
+
+
+<!-- LOGGED OUT STATE -->
+<div id="libLoggedOut" class="state-panel" style="display:none;">
+<h2>Library</h2>
+<p>Log in to see your watch history, saved videos and liked videos.</p>
+<button type="button" class="back-home" onclick="goLogin()">Log In</button>
+</div>
+
+
+<!-- CONTENT -->
+<div id="libContent" class="profile-content" style="display:none;">
+
+
+<!-- Tab Navigation -->
+<div class="lib-tabs" role="tablist">
+<button class="lib-tab active" role="tab" aria-selected="true" data-tab="history">History</button>
+<button class="lib-tab" role="tab" aria-selected="false" data-tab="saved">Saved</button>
+<button class="lib-tab" role="tab" aria-selected="false" data-tab="liked">Liked</button>
+<button class="lib-tab" role="tab" aria-selected="false" data-tab="playlists">Playlists</button>
+</div>
+
+
+<!-- History Section -->
+<div class="lib-section" id="libHistory" role="tabpanel">
+<div class="lib-section-header">
+<h3>Watch History</h3>
+<button type="button" class="lib-clear-btn" id="clearHistoryBtn" style="display:none;">Clear all history</button>
+</div>
+<div id="historyList" class="profile-list"></div>
+</div>
+
+
+<!-- Saved Section -->
+<div class="lib-section" id="libSaved" role="tabpanel" style="display:none;">
+<h3>Saved / Watch Later</h3>
+<div id="savedList" class="profile-list"></div>
+</div>
+
+
+<!-- Liked Section -->
+<div class="lib-section" id="libLiked" role="tabpanel" style="display:none;">
+<h3>Liked Videos</h3>
+<div id="likedList" class="profile-list"></div>
+</div>
+
+
+<!-- Playlists Section -->
+<div class="lib-section" id="libPlaylists" role="tabpanel" style="display:none;">
+
+<div id="playlistsListView">
+
+<div class="lib-section-header">
+<h3>Playlists</h3>
+<button type="button" class="lib-clear-btn" style="display:none;" id="playlistsBackBtn">Back</button>
+</div>
+
+<div class="playlist-new-row">
+<input id="playlistLibraryName" type="text" placeholder="New playlist name" aria-label="New playlist name" maxlength="80">
+<button type="button" class="comment-submit" id="playlistLibraryCreateBtn">Create playlist</button>
+</div>
+
+<div id="playlistsListContainer" class="profile-list"></div>
+
+</div>
+
+<div id="playlistDetailView" style="display:none;">
+
+<div class="lib-section-header">
+<button type="button" class="lib-clear-btn" id="playlistDetailBackBtn">Back</button>
+<h3 id="playlistDetailTitle">Playlist</h3>
+</div>
+
+<div id="playlistDetailItems" class="profile-list"></div>
+
+</div>
+
+</div>
+
+
+</div>
+
+
+</div>
+
+
+<script>
+
+function goHome(){
+    window.location.href = "index.html";
+}
+
+function goLogin(){
+    window.location.href = "login.html";
+}
+
+function searchVideo(){
+    const raw = document.getElementById("search").value;
+    const query = raw.trim();
+    if(!query) return;
+    window.location.href = "index.html?q=" + encodeURIComponent(query);
+}
+
+document.getElementById("search")?.addEventListener("keydown",(e)=>{
+    if(e.key === "Enter"){
+        searchVideo();
+    }
+});
+
+</script>
+
+<script type="module" src="auth.js"></script>
+<script type="module" src="library.js"></script>
+
+
+</body>
+
+</html>

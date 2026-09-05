@@ -66,15 +66,107 @@ Logout
 
 
 
-<aside class="sidebar">
+<aside class="sidebar" aria-label="Main navigation">
 
-<p id="sideHome">🏠 Home</p>
+    <div class="sidebar-top">
+        <button class="sidebar-menu-btn" type="button" aria-label="Menu">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 6h16"></path>
+                <path d="M4 12h16"></path>
+                <path d="M4 18h16"></path>
+            </svg>
+        </button>
+        <div class="sidebar-brand">
+            <span class="sidebar-brand-icon">▶</span>
+            <span>MyTube</span>
+        </div>
+    </div>
 
-<p id="sideTrending">🔥 Trending</p>
+    <nav class="sidebar-nav">
 
-<p id="sideSubs">📺 Subscriptions</p>
+        <p id="sideHome" class="sidebar-item active">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3 10.5 12 3l9 7.5"></path>
+                <path d="M5.5 9.5V21h13V9.5"></path>
+                <path d="M9.5 21v-6h5v6"></path>
+            </svg>
+            <span>Home</span>
+        </p>
 
-<p id="sideLibrary">📚 Library</p>
+        <p id="sideTrending" class="sidebar-item">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M13.5 2.5c.5 4-1.2 5.8-3.2 7.5-1.4 1.2-2.8 2.4-2.8 5.1A4.5 4.5 0 0 0 12 19.5a4.5 4.5 0 0 0 4.5-4.5c0-2.2-1.1-4-2.5-5.5.1 2-1 3.1-2 3.8.2-2.7 1.8-5.2 1.5-10.8Z"></path>
+                <path d="M8.5 19.5A7 7 0 0 1 5 13c0-2.6 1.2-4.5 3.2-6.4"></path>
+            </svg>
+            <span>Trending</span>
+        </p>
+
+        <p id="sideSubs" class="sidebar-item sidebar-section-link">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="3" y="5" width="18" height="14" rx="2"></rect>
+                <path d="m10 9 5 3-5 3V9Z"></path>
+            </svg>
+            <span>Subscriptions</span>
+            <span class="sidebar-chevron">›</span>
+        </p>
+
+        <div id="sidebarSubscriptionsList" class="sidebar-subscriptions-list"></div>
+
+        <button id="sidebarShowMore" class="sidebar-show-more" type="button" hidden>
+            <span class="sidebar-show-more-icon">⌄</span>
+            <span>Show more</span>
+        </button>
+
+        <div class="sidebar-divider"></div>
+
+        <p class="sidebar-section-title">
+            <span>You</span>
+            <span class="sidebar-chevron">›</span>
+        </p>
+
+        <p id="sideLibrary" class="sidebar-item">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v17H6.5A2.5 2.5 0 0 0 4 22V5.5Z"></path>
+                <path d="M4 5.5V19a3 3 0 0 1 3-3h13"></path>
+            </svg>
+            <span>Library</span>
+        </p>
+
+        <p class="sidebar-item">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M6 4h12v16H6z"></path>
+                <path d="M9 8h6"></path>
+                <path d="M9 12h6"></path>
+                <path d="M9 16h4"></path>
+            </svg>
+            <span>History</span>
+        </p>
+
+        <p class="sidebar-item">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="4" y="4" width="16" height="16" rx="2"></rect>
+                <path d="m10 9 5 3-5 3V9Z"></path>
+            </svg>
+            <span>Your videos</span>
+        </p>
+
+        <p class="sidebar-item">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 4v10"></path>
+                <path d="m8 11 4 4 4-4"></path>
+                <path d="M5 20h14"></path>
+            </svg>
+            <span>Watch later</span>
+        </p>
+
+        <p class="sidebar-item">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9L12 3Z"></path>
+            </svg>
+            <span>Liked videos</span>
+        </p>
+
+    </nav>
 
 </aside>
 
@@ -219,6 +311,7 @@ function buildCard(v){
 function renderVideos(){
     const list = visibleVideos();
 
+    hideLoadMore();
     box.replaceChildren();
 
     list.forEach(v => {
@@ -412,10 +505,102 @@ async function maybeLoadRemoteHome(){
 // with YouTube results first and matching local videos below as a fallback.
 let searchSeq = 0;
 let activeSearchController = null;
+let searchNextToken = "";
+let searchRemoteVideos = [];
+let searchLoadMoreBtn = null;
+let searchLoadingMore = false;
+
+function hideLoadMore(){
+    if(searchLoadMoreBtn){
+        searchLoadMoreBtn.remove();
+        searchLoadMoreBtn = null;
+    }
+}
+
+function buildLoadMoreBtn(){
+    if(searchLoadMoreBtn && searchLoadMoreBtn.isConnected){
+        return searchLoadMoreBtn;
+    }
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "load-more";
+    btn.textContent = "Load more";
+    btn.setAttribute("aria-label", "Load more YouTube results");
+    btn.addEventListener("click", loadMoreResults);
+    searchLoadMoreBtn = btn;
+    return btn;
+}
+
+function updateLoadMore(){
+    const hasMore = Boolean(searchNextToken) && searchRemoteVideos.length > 0;
+    if(hasMore && !(searchLoadMoreBtn && searchLoadMoreBtn.isConnected)){
+        box.after(buildLoadMoreBtn());
+    }
+    else if(!hasMore && searchLoadMoreBtn && searchLoadMoreBtn.isConnected){
+        searchLoadMoreBtn.remove();
+        searchLoadMoreBtn = null;
+    }
+}
+
+async function loadMoreResults(){
+    if(searchLoadingMore || !searchNextToken || !currentQuery){
+        return;
+    }
+    const client = ytClient();
+    if(!client){
+        return;
+    }
+    const q = currentQuery;
+    const seq = searchSeq;
+    const btn = searchLoadMoreBtn;
+
+    searchLoadingMore = true;
+    if(btn){
+        btn.disabled = true;
+        btn.textContent = "Loading...";
+    }
+
+    try{
+        const result = await client.search(q, 20, searchNextToken);
+        // Bail if the user typed something new while the page loaded.
+        if(seq !== searchSeq || q !== currentQuery){
+            return;
+        }
+        const page = result.videos || [];
+        if(page.length){
+            searchRemoteVideos = searchRemoteVideos.concat(page);
+            searchNextToken = result.nextPageToken || "";
+            const localMatches = videos.filter(videoMatches);
+            renderVideoList(searchRemoteVideos.concat(localMatches));
+        }
+        else{
+            searchNextToken = "";
+        }
+        showStatus("");
+    }
+    catch(e){
+        logHome("warn", "Load more failed:", e);
+        showStatus("Could not load more results. Please try again.");
+    }
+    finally{
+        searchLoadingMore = false;
+        if(btn){
+            btn.disabled = false;
+            btn.textContent = "Load more";
+        }
+        updateLoadMore();
+    }
+}
+
 async function doDynamicSearch(){
     const client = ytClient();
     const q = currentQuery;
     const seq = ++searchSeq;
+
+    // Reset pagination state for this query.
+    searchNextToken = "";
+    searchRemoteVideos = [];
+    hideLoadMore();
 
     // Cancel any in-flight YouTube API request from a previous keystroke.
     if(activeSearchController){
@@ -452,8 +637,9 @@ async function doDynamicSearch(){
     let remote = [];
     let apiError = "";
     try{
-        const result = await client.search(q, 20, controller.signal);
+        const result = await client.search(q, 20, "", controller.signal);
         remote = result.videos || [];
+        searchNextToken = result.nextPageToken || "";
         apiError = result.error || "";
     }
     catch(e){
@@ -470,12 +656,13 @@ async function doDynamicSearch(){
 
     // Compose: remote YouTube results + local matches (dedupe is inherent since
     // ids are namespaced yt:... vs local ids).
-    let combined = remote.slice(0, 30);
-    combined = combined.concat(localMatches);
+    searchRemoteVideos = remote.slice(0, 30);
+    let combined = searchRemoteVideos.concat(localMatches);
 
     if(!remote.length && !localMatches.length){
         showStatus(apiError ? ("Could not search YouTube: " + apiError) : "No videos found for this search.");
         renderVideoList(combined);
+        updateLoadMore();
         return;
     }
 
@@ -487,6 +674,7 @@ async function doDynamicSearch(){
         showStatus("");
     }
     renderVideoList(combined);
+    updateLoadMore();
 }
 
 function logHome(level, msg, err){
@@ -621,12 +809,12 @@ async function loadTrendingYouTube(){
 
 
 makeSideItemInteractive(sideSubs, () => {
-    showSidebarMsg("Subscriptions page coming soon");
+    window.location.href = "subscriptions.html";
 });
 
 
 makeSideItemInteractive(sideLibrary, () => {
-    showSidebarMsg("Library page coming soon");
+    window.location.href = "library.html";
 });
 
 
@@ -660,6 +848,150 @@ window.MyTubeYouTube = { search: search, trending: trending };
 window.dispatchEvent(new Event("mytube-yt-ready"));
 </script>
 
+
+<!-- MyTube sidebar subscriptions -->
+<script type="module">
+import { getSubscriptions } from "./data.js";
+import { auth } from "./firebase.js";
+
+const sidebarList = document.getElementById("sidebarSubscriptionsList");
+const showMoreBtn = document.getElementById("sidebarShowMore");
+
+let sidebarSubscriptions = [];
+let sidebarExpanded = false;
+
+function getSubscriptionTime(item){
+    const value = item?.subscribedAt;
+
+    if(value && typeof value.toMillis === "function"){
+        return value.toMillis();
+    }
+
+    if(value?.seconds){
+        return Number(value.seconds) * 1000;
+    }
+
+    const time = Date.parse(value || "");
+    return Number.isFinite(time) ? time : 0;
+}
+
+function clearSidebarSubscriptions(){
+    sidebarSubscriptions = [];
+    sidebarExpanded = false;
+
+    if(sidebarList){
+        sidebarList.replaceChildren();
+    }
+
+    if(showMoreBtn){
+        showMoreBtn.hidden = true;
+    }
+}
+
+function createSubscriptionRow(subscription){
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "sidebar-subscription";
+
+    const avatar = document.createElement("img");
+    avatar.className = "sidebar-subscription-avatar";
+    avatar.alt = "";
+    avatar.loading = "lazy";
+
+    const name = String(
+        subscription.channelName ||
+        subscription.id ||
+        "Channel"
+    );
+
+    if(subscription.channelThumb){
+        avatar.src = subscription.channelThumb;
+        avatar.onerror = () => {
+            avatar.removeAttribute("src");
+        };
+    }
+
+    const label = document.createElement("span");
+    label.className = "sidebar-subscription-name";
+    label.textContent = name;
+
+    button.append(avatar, label);
+
+    button.addEventListener("click", () => {
+        window.location.href = "subscriptions.html";
+    });
+
+    return button;
+}
+
+function renderSidebarSubscriptions(){
+    if(!sidebarList || !showMoreBtn){
+        return;
+    }
+
+    sidebarList.replaceChildren();
+
+    const visible = sidebarExpanded
+        ? sidebarSubscriptions
+        : sidebarSubscriptions.slice(0, 7);
+
+    visible.forEach(subscription => {
+        sidebarList.appendChild(createSubscriptionRow(subscription));
+    });
+
+    showMoreBtn.hidden = sidebarSubscriptions.length <= 7;
+
+    const icon = showMoreBtn.querySelector(".sidebar-show-more-icon");
+    const text = showMoreBtn.querySelector("span:last-child");
+
+    if(icon){
+        icon.textContent = sidebarExpanded ? "⌃" : "⌄";
+    }
+
+    if(text){
+        text.textContent = sidebarExpanded ? "Show less" : "Show more";
+    }
+}
+
+async function loadSidebarSubscriptions(user){
+    if(!user){
+        clearSidebarSubscriptions();
+        return;
+    }
+
+    try{
+        const subscriptions = await getSubscriptions(user.uid);
+
+        sidebarSubscriptions = Array.isArray(subscriptions)
+            ? subscriptions.slice().sort(
+                (a, b) => getSubscriptionTime(b) - getSubscriptionTime(a)
+            )
+            : [];
+
+        renderSidebarSubscriptions();
+    }
+    catch(error){
+        console.warn(
+            "Could not load sidebar subscriptions:",
+            error
+        );
+        clearSidebarSubscriptions();
+    }
+}
+
+if(showMoreBtn){
+    showMoreBtn.addEventListener("click", () => {
+        sidebarExpanded = !sidebarExpanded;
+        renderSidebarSubscriptions();
+    });
+}
+
+window.addEventListener("mytube-auth-change", () => {
+    loadSidebarSubscriptions(auth.currentUser);
+});
+
+loadSidebarSubscriptions(auth.currentUser);
+</script>
 
 
 </body>

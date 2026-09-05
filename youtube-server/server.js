@@ -20,13 +20,14 @@
 //                       directory two levels above this file)
 // =============================================================================
 
-const http = require("node:http");
-const https = require("node:https");
-const fs = require("node:fs");
-const path = require("node:path");
-const { URL } = require("node:url");
+import http from "node:http";
+import https from "node:https";
+import fs from "node:fs";
+import path from "node:path";
+import { URL, fileURLToPath } from "node:url";
+import * as normalize from "../shared/normalize.js";
 
-const normalize = require("./normalize.js");
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = parseInt(process.env.PORT || "3456", 10);
 const API_KEY = process.env.YOUTUBE_API_KEY || "";
@@ -75,7 +76,11 @@ function cacheSet(key, value){
 // We allow the two local dev origins explicitly instead of using "*".
 const CORS_ALLOWED_ORIGINS = [
   "http://127.0.0.1:5504",
-  "http://localhost:5504"
+  "http://localhost:5504",
+  "http://127.0.0.1:8080",
+  "http://localhost:8080",
+  "http://127.0.0.1:8081",
+  "http://localhost:8081"
 ];
 
 function isAllowedOrigin(origin){
@@ -87,6 +92,37 @@ function isAllowedOrigin(origin){
 function resolveAllowOrigin(req){
   const origin = req.headers.origin;
   return isAllowedOrigin(origin) ? origin : null;
+}
+
+// Simple per-IP sliding-window rate limit for the API. Local dev convenience:
+// prevents an accidental tight-loop or shared use of a dev box from exhausting
+// the shared YouTube quota. Limiter is in-memory; resets on restart.
+const RATE_WINDOW_MS = 5 * 60 * 1000;
+const RATE_MAX_PER_WINDOW = 120;
+const rateBuckets = new Map();
+
+function rateLimitAllowed(req){
+  const ip = req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+  const bucket = rateBuckets.get(ip) || { count: 0, windowStart: now };
+
+  if(now - bucket.windowStart >= RATE_WINDOW_MS){
+    bucket.count = 0;
+    bucket.windowStart = now;
+  }
+
+  bucket.count++;
+  rateBuckets.set(ip, bucket);
+
+  if(rateBuckets.size > 5000){
+    for(const [key, entry] of rateBuckets){
+      if(now - entry.windowStart >= RATE_WINDOW_MS){
+        rateBuckets.delete(key);
+      }
+    }
+  }
+
+  return bucket.count <= RATE_MAX_PER_WINDOW;
 }
 
 function sendJSON(res, status, obj){
@@ -269,7 +305,7 @@ async function ytFetch(cacheKey, url){
 // can reliably distinguish our API server from any other server (e.g. Live
 // Server) that might respond with a plain 404 for /api/ping.
 function handlePing(req, res){
-  return sendJSON(res, 200, { ok: true, service: "mytube-api" });
+  return sendJSON(res, 200, { ok: true, service: "mytube-youtube-api", configured: Boolean(API_KEY) });
 }
 
 // GET /api/trending?max=<n>&region=<code>
@@ -291,8 +327,8 @@ async function handleTrending(req, res, params){
     const url = YT_API_BASE + "/videos?part=snippet,contentDetails,statistics&chart=mostPopular" +
       "&regionCode=" + encodeURIComponent(region) + "&maxResults=" + maxResults;
     const data = await ytFetch(cacheKey, url);
-    const videos = normalize.normalizeVideosResponse(data);
-    return sendJSON(res, 200, { videos });
+    const { videos } = normalize.normalizeVideosResponse(data);
+    return sendJSON(res, 200, { videos, nextPageToken: data.nextPageToken || "" });
   }
   catch(err){
     logYouTubeError(err);
@@ -318,13 +354,17 @@ async function handleSearch(req, res, params){
   }
 
   const maxResults = Math.min(Math.max(parseInt(params.get("max") || "20", 10) || 20, 1), 50);
-  const cacheKey = "search:" + q.toLowerCase() + ":" + maxResults;
+  const pageToken = (params.get("pageToken") || "").trim();
+  const cacheKey = "search:" + q.toLowerCase() + ":" + maxResults + ":" + pageToken;
 
   try{
-    const url = YT_API_BASE + "/search?part=snippet&type=video&maxResults=" + maxResults +
+    let url = YT_API_BASE + "/search?part=snippet&type=video&maxResults=" + maxResults +
       "&q=" + encodeURIComponent(q);
+    if(pageToken){
+      url += "&pageToken=" + encodeURIComponent(pageToken);
+    }
     const data = await ytFetch(cacheKey, url);
-    const videos = normalize.normalizeSearchResponse(data);
+    const videos = normalize.normalizeSearchResponse(data).videos;
 
     // Optionally enrich with durations & view counts from videos.list.
     try{
@@ -334,7 +374,7 @@ async function handleSearch(req, res, params){
       // Non-fatal: we can still return results without stats/durations.
     }
 
-    return sendJSON(res, 200, { videos });
+    return sendJSON(res, 200, { videos, nextPageToken: data.nextPageToken || "" });
   }
   catch(err){
     logYouTubeError(err);
@@ -375,6 +415,143 @@ async function handleVideo(req, res, params){
     return sendJSON(res, 502, {
       error: normalizeError(err, "Could not fetch video."),
       video: null
+    });
+  }
+}
+
+// GET /api/channelVideos?channelId=<id>&max=<n>
+// Returns recent videos from a specific YouTube channel via its uploads
+// playlist, avoiding the expensive YouTube Search API.
+async function handleChannelVideos(req, res, params){
+  const channelId = (params.get("channelId") || "").trim();
+  if(!channelId){
+    return sendJSON(res, 400, { error: "Missing channelId", videos: [] });
+  }
+  if(!API_KEY){
+    return sendJSON(res, 503, { error: "YouTube API key not configured.", videos: [] });
+  }
+
+  const maxResults = Math.min(
+    Math.max(parseInt(params.get("max") || "8", 10) || 8, 1),
+    25
+  );
+  const pageToken = (params.get("pageToken") || "").trim();
+
+  try{
+    // Get the channel's uploads playlist.
+    const channelCacheKey = "channelUploads:" + channelId;
+    const channelUrl =
+      YT_API_BASE +
+      "/channels?part=contentDetails&id=" +
+      encodeURIComponent(channelId);
+
+    const channelData = await ytFetch(channelCacheKey, channelUrl);
+
+    const channelItem = channelData.items?.[0];
+    const uploadsPlaylistId =
+      channelItem?.contentDetails?.relatedPlaylists?.uploads || "";
+
+    if(!uploadsPlaylistId){
+      return sendJSON(res, 200, {
+        videos: [],
+        nextPageToken: ""
+      });
+    }
+
+    // Get the latest videos from the uploads playlist.
+    const cacheKey =
+      "channelVideos:" +
+      channelId +
+      ":" +
+      maxResults +
+      ":" +
+      pageToken;
+
+    let playlistUrl =
+      YT_API_BASE +
+      "/playlistItems?part=snippet,contentDetails&playlistId=" +
+      encodeURIComponent(uploadsPlaylistId) +
+      "&maxResults=" +
+      maxResults;
+
+    if(pageToken){
+      playlistUrl += "&pageToken=" + encodeURIComponent(pageToken);
+    }
+
+    const playlistData = await ytFetch(cacheKey, playlistUrl);
+
+    const ids = (playlistData.items || [])
+      .map(item => item?.contentDetails?.videoId)
+      .filter(Boolean);
+
+    if(!ids.length){
+      return sendJSON(res, 200, {
+        videos: [],
+        nextPageToken: playlistData.nextPageToken || ""
+      });
+    }
+
+    // Fetch full video details in one batch.
+    const detailsCacheKey = "channelVideoDetails:" + ids.join(",");
+    const detailsUrl =
+      YT_API_BASE +
+      "/videos?part=snippet,contentDetails,statistics,status&id=" +
+      encodeURIComponent(ids.join(","));
+
+    const detailsData = await ytFetch(detailsCacheKey, detailsUrl);
+
+    const detailsById = new Map();
+
+    for(const item of (detailsData.items || [])){
+      if(item?.id){
+        detailsById.set(item.id, item);
+      }
+    }
+
+    const videos = [];
+
+    for(const item of (playlistData.items || [])){
+      const id = item?.contentDetails?.videoId;
+
+      if(!id){
+        continue;
+      }
+
+      const detail = detailsById.get(id);
+
+      if(detail){
+        const video = normalize.normalizeVideoItem(detail);
+
+        if(video){
+          videos.push(video);
+        }
+      }
+      else{
+        // Fallback to playlist metadata if a detailed video response is
+        // unavailable for this item.
+        const video = normalize.normalizeSearchItem({
+          id: {
+            videoId: id
+          },
+          snippet: item?.snippet || {}
+        });
+
+        if(video){
+          videos.push(video);
+        }
+      }
+    }
+
+    return sendJSON(res, 200, {
+      videos,
+      nextPageToken: playlistData.nextPageToken || ""
+    });
+  }
+  catch(err){
+    logYouTubeError(err);
+    return sendJSON(res, 502, {
+      error: normalizeError(err, "Could not load channel videos."),
+      videos: []
     });
   }
 }
@@ -423,14 +600,18 @@ async function handleComments(req, res, params){
   }
 
   const maxResults = Math.min(Math.max(parseInt(params.get("max") || "20", 10) || 20, 1), 50);
-  const cacheKey = "comments:" + id + ":" + maxResults;
+  const pageToken = (params.get("pageToken") || "").trim();
+  const cacheKey = "comments:" + id + ":" + maxResults + ":" + pageToken;
 
   try{
-    const url = YT_API_BASE + "/commentThreads?part=snippet&videoId=" + encodeURIComponent(id) +
+    let url = YT_API_BASE + "/commentThreads?part=snippet&videoId=" + encodeURIComponent(id) +
       "&maxResults=" + maxResults + "&order=relevance&textFormat=plainText";
+    if(pageToken){
+      url += "&pageToken=" + encodeURIComponent(pageToken);
+    }
     const data = await ytFetch(cacheKey, url);
-    const comments = normalize.normalizeCommentsResponse(data);
-    return sendJSON(res, 200, { comments });
+    const comments = normalize.normalizeCommentsResponse(data).comments;
+    return sendJSON(res, 200, { comments, nextPageToken: data.nextPageToken || "" });
   }
   catch(err){
     logYouTubeError(err);
@@ -466,10 +647,10 @@ async function handleRelated(req, res, params){
     }
     const snippet = vidItems[0].snippet || {};
     const channelId = snippet.channelId;
-    const title = snippet.title || "";
 
-    // 2) Query for videos from the same channel plus a related keyword search,
-    //    then merge and dedupe. This is the official, allowed approach.
+    // 2) Query for videos from the same channel. This is the official, allowed
+    //    approach — and the cheaper one: a single search call plus one stats
+    //    batch instead of two searches (saves ~100 quota units per request).
     const results = [];
 
     const channelCacheKey = "channel:" + channelId + ":" + maxResults;
@@ -478,21 +659,8 @@ async function handleRelated(req, res, params){
         const chanUrl = YT_API_BASE + "/search?part=snippet&type=video&channelId=" +
           encodeURIComponent(channelId) + "&maxResults=" + maxResults;
         const chanData = await ytFetch(channelCacheKey, chanUrl);
-        const chanVideos = normalize.normalizeSearchResponse(chanData);
+        const chanVideos = normalize.normalizeSearchResponse(chanData).videos;
         results.push(...chanVideos);
-      }
-      catch(e){ /* ignore */ }
-    }
-
-    // 3) Also search by the video title's first few meaningful words.
-    const keywords = (title || "").split(/\s+/).filter(w => w.length > 2).slice(0, 3).join(" ");
-    if(results.length < maxResults && keywords){
-      try{
-        const searchUrl = YT_API_BASE + "/search?part=snippet&type=video&maxResults=" +
-          maxResults + "&q=" + encodeURIComponent(keywords);
-        const searchData = await ytFetch("relatedsearch:" + keywords + ":" + maxResults, searchUrl);
-        const searchVideos = normalize.normalizeSearchResponse(searchData);
-        results.push(...searchVideos);
       }
       catch(e){ /* ignore */ }
     }
@@ -516,7 +684,7 @@ async function handleRelated(req, res, params){
     }
     catch(e){ /* non-fatal */ }
 
-    return sendJSON(res, 200, { videos: deduped });
+    return sendJSON(res, 200, { videos: deduped, nextPageToken: "" });
   }
   catch(err){
     logYouTubeError(err);
@@ -555,7 +723,7 @@ async function enrichWithStats(videos){
     const viewCountInt = parseInt(stats.viewCount, 10);
     if(Number.isFinite(viewCountInt)){
       v.viewCount = viewCountInt;
-      v.views = viewCountInt ? (normalize.formatCount(viewCountInt) + " views") : "";
+      v.views = viewCountInt ? `${normalize.formatCount(viewCountInt)} views` : "";
     }
     const dur = normalize.formatDuration(details.duration);
     if(dur){
@@ -597,10 +765,12 @@ function serveStatic(req, res, urlPath){
     return res.end("Bad Request");
   }
 
-  // Never serve sensitive files (env, git metadata).
-  const SENSITIVE = [".env", ".env.example", ".git", ".gitignore", "package-lock.json"];
+  // Never serve sensitive files (env, git metadata). The URL path always starts
+  // with "/", so normalize away that leading slash before matching names.
+  const rootRelative = filePath.replace(/^\/+/, "");
+  const SENSITIVE = [".env", ".env.example", ".git", ".gitignore", "package-lock.json", "package.json"];
   for(const name of SENSITIVE){
-    if(filePath === name || filePath.startsWith(name + "/")){
+    if(rootRelative === name || rootRelative.startsWith(name + "/")){
       res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
       return res.end("Not Found");
     }
@@ -754,6 +924,11 @@ const server = http.createServer(async (req, res) => {
     if(req.method !== "GET"){
       return sendJSON(res, 405, { error: "Method not allowed" });
     }
+
+    if(!rateLimitAllowed(req)){
+      return sendJSON(res, 429, { error: "Too many requests. Please slow down and try again shortly." });
+    }
+
     try{
       if(route === "ping"){
         return handlePing(req, res);
@@ -766,6 +941,9 @@ const server = http.createServer(async (req, res) => {
       }
       if(route.startsWith("video")){
         return await handleVideo(req, res, url.searchParams);
+      }
+      if(route === "channelVideos"){
+        return await handleChannelVideos(req, res, url.searchParams);
       }
       if(route.startsWith("channel")){
         return await handleChannel(req, res, url.searchParams);

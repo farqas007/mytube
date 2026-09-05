@@ -5,9 +5,65 @@ import {
   normalizeVideosResponse,
   normalizeChannelResponse,
   normalizeCommentsResponse
-} from "./worker-normalize.js";
+} from "./shared/normalize.js";
 
 const YT_API_BASE = "https://www.googleapis.com/youtube/v3";
+
+const ALLOWED_ORIGINS = new Set([
+  "http://localhost:5504",
+  "http://127.0.0.1:5504",
+  "https://mytube.farqas007.workers.dev"
+]);
+
+function originAllowed(request) {
+  return ALLOWED_ORIGINS.has(request?.headers?.get("Origin") || "");
+}
+
+// -----------------------------------------------------------------------------
+// Simple per-IP sliding-window rate limit. Uses the Cloudflare-provided client
+// IP when available. In-memory per-isolate, so it is best-effort (not durable),
+// but it stops casual abuse from exhausting the shared YouTube quota.
+// -----------------------------------------------------------------------------
+
+const RATE_WINDOW_MS = 5 * 60 * 1000;
+const RATE_MAX_PER_WINDOW = 120;
+const rateBuckets = new Map();
+
+function clientIp(request) {
+  return (
+    request?.headers?.get("CF-Connecting-IP") ||
+    request?.headers?.get("X-Forwarded-For")?.split(",")[0]?.trim() ||
+    "unknown"
+  );
+}
+
+function rateLimitAllowed(request) {
+  const ip = clientIp(request);
+  const now = Date.now();
+  const bucket = rateBuckets.get(ip) || {
+    count: 0,
+    windowStart: now
+  };
+
+  if (now - bucket.windowStart >= RATE_WINDOW_MS) {
+    bucket.count = 0;
+    bucket.windowStart = now;
+  }
+
+  bucket.count++;
+  rateBuckets.set(ip, bucket);
+
+  if (rateBuckets.size > 5000) {
+    // Crude but effective: drop any entry whose window has fully expired.
+    for (const [key, entry] of rateBuckets) {
+      if (now - entry.windowStart >= RATE_WINDOW_MS) {
+        rateBuckets.delete(key);
+      }
+    }
+  }
+
+  return bucket.count <= RATE_MAX_PER_WINDOW;
+}
 
 const CACHE_TTL = 10 * 60 * 1000;
 const MAX_CACHE_ENTRIES = 200;
@@ -20,14 +76,8 @@ function json(data, status = 200, request) {
     "Cache-Control": "no-store"
   };
 
-  const origin = request?.headers?.get("Origin");
-
-  if (
-    origin === "http://localhost:5504" ||
-    origin === "http://127.0.0.1:5504" ||
-    origin === "https://mytube.farqas007.workers.dev"
-  ) {
-    headers["Access-Control-Allow-Origin"] = origin;
+  if (originAllowed(request)) {
+    headers["Access-Control-Allow-Origin"] = request.headers.get("Origin");
     headers["Vary"] = "Origin";
   }
 
@@ -254,15 +304,21 @@ async function getVideoDetails(videoId, apiKey) {
   return result.data?.items?.[0] || null;
 }
 
-async function searchYouTube(query, max, apiKey) {
+async function searchYouTube(query, max, apiKey, pageToken) {
+  const params = {
+    part: "snippet",
+    type: "video",
+    q: query,
+    maxResults: Math.min(Math.max(Number(max) || 20, 1), 50)
+  };
+
+  if (pageToken) {
+    params.pageToken = pageToken;
+  }
+
   const searchResult = await ytFetch(
     "search",
-    {
-      part: "snippet",
-      type: "video",
-      q: query,
-      maxResults: Math.min(Math.max(Number(max) || 20, 1), 50)
-    },
+    params,
     apiKey
   );
 
@@ -342,20 +398,22 @@ async function getChannel(channelId, apiKey) {
   return normalizeChannelResponse(result.data);
 }
 
-async function getComments(videoId, max, apiKey) {
-  const result = await ytFetch(
-    "commentThreads",
-    {
-      part: "snippet",
-      videoId,
-      maxResults: Math.min(Math.max(Number(max) || 20, 1), 100),
-      order: "relevance",
-      textFormat: "plainText"
-    },
-    apiKey
-  );
+async function getComments(videoId, max, apiKey, pageToken) {
+  const params = {
+    part: "snippet",
+    videoId,
+    maxResults: Math.min(Math.max(Number(max) || 20, 1), 100),
+    order: "relevance",
+    textFormat: "plainText"
+  };
 
-  return normalizeCommentsResponse(result.data);
+  if (pageToken) {
+    params.pageToken = pageToken;
+  }
+
+  return normalizeCommentsResponse(
+    (await ytFetch("commentThreads", params, apiKey)).data
+  );
 }
 
 async function getRelated(videoId, max, apiKey) {
@@ -369,7 +427,6 @@ async function getRelated(videoId, max, apiKey) {
 
   const targetSnippet = target.snippet || {};
   const channelId = targetSnippet.channelId || "";
-  const title = targetSnippet.title || "";
 
   const results = [];
   const seen = new Set([videoId]);
@@ -400,47 +457,6 @@ async function getRelated(videoId, max, apiKey) {
       results.push(
         normalizeSearchItem(item)
       );
-    }
-  }
-
-  if (results.length < Number(max || 12)) {
-    const keywords = title
-      .replace(/[^\p{L}\p{N}\s]/gu, " ")
-      .split(/\s+/)
-      .filter(word => word.length > 2)
-      .slice(0, 6)
-      .join(" ");
-
-    if (keywords) {
-      const keywordSearch = await ytFetch(
-        "search",
-        {
-          part: "snippet",
-          type: "video",
-          q: keywords,
-          maxResults: Math.min(
-            Math.max(Number(max) || 12, 1),
-            25
-          )
-        },
-        apiKey
-      );
-
-      for (const item of keywordSearch.data?.items || []) {
-        const id = item?.id?.videoId;
-
-        if (!id || seen.has(id)) continue;
-
-        seen.add(id);
-
-        results.push(
-          normalizeSearchItem(item)
-        );
-
-        if (results.length >= Number(max || 12)) {
-          break;
-        }
-      }
     }
   }
 
@@ -481,19 +497,135 @@ async function getRelated(videoId, max, apiKey) {
   };
 }
 
+async function getChannelVideos(channelId, max, apiKey, pageToken) {
+  const maxResults = Math.min(
+    Math.max(Number(max) || 8, 1),
+    25
+  );
+
+  // Get the channel's uploads playlist.
+  // This avoids the expensive YouTube Search API.
+  const channelResult = await ytFetch(
+    "channels",
+    {
+      part: "contentDetails",
+      id: channelId
+    },
+    apiKey
+  );
+
+  const channelItem = channelResult.data?.items?.[0];
+  const uploadsPlaylistId =
+    channelItem?.contentDetails?.relatedPlaylists?.uploads || "";
+
+  if (!uploadsPlaylistId) {
+    return {
+      videos: [],
+      nextPageToken: ""
+    };
+  }
+
+  // Get the latest videos from the uploads playlist.
+  const playlistResult = await ytFetch(
+    "playlistItems",
+    {
+      part: "snippet,contentDetails",
+      playlistId: uploadsPlaylistId,
+      maxResults
+    ,
+      ...(pageToken ? { pageToken } : {})
+    },
+    apiKey
+  );
+
+  const playlistData = playlistResult.data;
+  const ids = (playlistData?.items || [])
+    .map(item => item?.contentDetails?.videoId)
+    .filter(Boolean);
+
+  if (!ids.length) {
+    return {
+      videos: [],
+      nextPageToken: playlistData?.nextPageToken || ""
+    };
+  }
+
+  // Fetch full video details so duration, views, likes, etc.
+  // remain identical to the existing MyTube video shape.
+  const detailsResult = await ytFetch(
+    "videos",
+    {
+      part: "snippet,contentDetails,statistics,status",
+      id: ids.join(",")
+    },
+    apiKey
+  );
+
+  const detailsById = new Map();
+
+  for (const item of detailsResult.data?.items || []) {
+    if (item?.id) {
+      detailsById.set(item.id, item);
+    }
+  }
+
+  const videos = [];
+
+  for (const item of playlistData?.items || []) {
+    const id = item?.contentDetails?.videoId;
+
+    if (!id) continue;
+
+    const detail = detailsById.get(id);
+
+    if (detail) {
+      const video = normalizeVideoItem(detail);
+
+      if (video) {
+        videos.push(video);
+      }
+    } else {
+      // Fallback to playlist snippet if the detailed video response
+      // does not contain this item.
+      const video = normalizeSearchItem({
+        id: {
+          videoId: id
+        },
+        snippet: item?.snippet || {}
+      });
+
+      if (video) {
+        videos.push(video);
+      }
+    }
+  }
+
+  return {
+    videos,
+    nextPageToken: playlistData?.nextPageToken || ""
+  };
+}
+
 async function handleAPI(request, env) {
   const url = new URL(request.url);
   const route = url.pathname.replace(/^\/api\/?/, "");
   const apiKey = env.YOUTUBE_API_KEY || "";
 
   if (request.method === "OPTIONS") {
+    const headers = {
+      "Access-Control-Allow-Methods": "GET, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Max-Age": "600"
+    };
+
+    if (originAllowed(request)) {
+      headers["Access-Control-Allow-Origin"] = request.headers.get("Origin");
+      headers["Vary"] = "Origin";
+    }
+
     return new Response(null, {
       status: 204,
-      headers: {
-        "Access-Control-Allow-Origin": request.headers.get("Origin") || "*",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type"
-      }
+      headers
     });
   }
 
@@ -503,6 +635,17 @@ async function handleAPI(request, env) {
         error: "Method not allowed."
       },
       405,
+      request
+    );
+  }
+
+  if (!rateLimitAllowed(request)) {
+    return json(
+      {
+        error: "Too many requests. Please slow down and try again shortly.",
+        code: "RATE_LIMITED"
+      },
+      429,
       request
     );
   }
@@ -535,11 +678,13 @@ async function handleAPI(request, env) {
       }
 
       const max = url.searchParams.get("max") || "20";
+      const pageToken = url.searchParams.get("pageToken") || "";
 
       const result = await searchYouTube(
         q,
         max,
-        apiKey
+        apiKey,
+        pageToken
       );
 
       return json(result, 200, request);
@@ -623,11 +768,13 @@ async function handleAPI(request, env) {
       }
 
       const max = url.searchParams.get("max") || "20";
+      const pageToken = url.searchParams.get("pageToken") || "";
 
       const result = await getComments(
         id,
         max,
-        apiKey
+        apiKey,
+        pageToken
       );
 
       return json(result, 200, request);
@@ -653,6 +800,33 @@ async function handleAPI(request, env) {
         id,
         max,
         apiKey
+      );
+
+      return json(result, 200, request);
+    }
+
+    if (route === "channelVideos") {
+      const channelId = url.searchParams.get("channelId")?.trim();
+
+      if (!channelId) {
+        return json(
+          {
+            videos: [],
+            error: "Channel ID is required."
+          },
+          400,
+          request
+        );
+      }
+
+      const max = url.searchParams.get("max") || "8";
+      const pageToken = url.searchParams.get("pageToken") || "";
+
+      const result = await getChannelVideos(
+        channelId,
+        max,
+        apiKey,
+        pageToken
       );
 
       return json(result, 200, request);

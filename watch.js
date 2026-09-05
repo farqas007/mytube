@@ -4,6 +4,16 @@ import { auth } from "./firebase.js";
 // ================= PHASE 7: YOUTUBE CLIENT =================
 import { getVideo, related, channel, comments } from "./youtube.js";
 
+// ================= FIRESTORE DATA LAYER =================
+import {
+    getSubscriptions, addSubscription, removeSubscription, isSubscribedByChannel,
+    addToHistory, getHistory,
+    getSaved as fsGetSaved, addToSaved, removeFromSaved, isSavedVideo,
+    getLiked as fsGetLiked, addToLiked, removeFromLiked, isLikedVideo,
+    getPlaylists, createPlaylist, addToPlaylist, removeFromPlaylist, getPlaylistItems,
+    subscribeComments, addCommentToStore, removeCommentById
+} from "./data.js";
+
 
 // ================= VIDEO DATABASE =================
 // Single source of truth shared with the homepage (see videos.js).
@@ -181,11 +191,15 @@ function renderContentState(){
 }
 
 
-function showVideoError(show){
+function showVideoError(show, message){
     const err = document.getElementById("videoErrorMsg");
-    if(err){
-        err.style.display = show ? "flex" : "none";
+    if(!err){
+        return;
     }
+    if(typeof message === "string"){
+        err.textContent = message;
+    }
+    err.style.display = show ? "flex" : "none";
 }
 
 
@@ -246,7 +260,7 @@ function loadVideo(){
         video.load();
         video.addEventListener("error", () => {
             console.log("Video file load failed:", v.file);
-            showVideoError(true);
+            showVideoError(true, "This video isn't available right now — missing file: " + (v.file || "?") + ". Add the file to the videos/ folder to enable playback.");
             showBuffering(false);
         });
         video.addEventListener("waiting", () => {
@@ -266,6 +280,7 @@ function loadVideo(){
         video.addEventListener("loadedmetadata", () => {
             showBuffering(false);
             renderTimeDisplay();
+            maybeResumePlayback();
         });
         video.addEventListener("timeupdate", () => {
             renderTimeDisplay();
@@ -282,6 +297,7 @@ function loadVideo(){
     renderDescription();
     renderRelatedSection();
     renderComments();
+    syncFirestoreComments();
 }
 
 
@@ -493,6 +509,7 @@ function renderYtSubViews(v){
     renderDescription();
     renderRelatedSection();
     renderComments();
+    syncFirestoreComments();
 
     if(isYt){
         const sourceId = ytSourceId(rawId);
@@ -511,6 +528,10 @@ function renderYtSubViews(v){
     // Recompute saved/subscribed state for the now-current YouTube video.
     isSaved = localStorage.getItem(saveKey()) === "1";
     refreshSubscribeState();
+    // Arm watch-history recording now that the active YouTube video is known.
+    // (The DOMContentLoaded recordHistory() call runs before YouTube metadata
+    // is available and would otherwise return early for yt: videos.)
+    recordHistory();
 }
 
 
@@ -541,6 +562,13 @@ async function loadYoutubeChannel(channelId){
     else if(subsEl){
         subsEl.textContent = "—";
     }
+
+    // The channel endpoint already returns the official YouTube thumbnail.
+    // Store it on the active video and re-render the existing channel UI.
+    if(c && active && active.channelId === channelId){
+        active.channelThumb = c.thumb || "";
+        renderChannel();
+    }
     if(link){
         link.href = "https://www.youtube.com/channel/" + encodeURIComponent(channelId);
         link.setAttribute("aria-label", "Open " + (c ? c.title : "channel") + " on YouTube");
@@ -563,11 +591,13 @@ async function loadYoutubeComments(sourceId){
     ytCommentsLoading = true;
     ytCommentsError = "";
     ytCommentsData = [];
+    ytCommentsNextToken = "";
     renderComments();
 
     try{
         const result = await comments(sourceId, 20);
         ytCommentsData = result.comments || [];
+        ytCommentsNextToken = result.nextPageToken || "";
         ytCommentsError = result.error || "";
     }
     catch(e){
@@ -582,6 +612,42 @@ async function loadYoutubeComments(sourceId){
     }
 
     ytCommentsLoading = false;
+    renderComments();
+}
+
+
+// Load the next page of public YouTube comments and append them to the merged
+// comments area. Only appears while ytCommentsNextToken is set.
+async function loadMoreYtComments(){
+    if(!isYt || !ytCommentsNextToken || ytCommentsLoading || ytCommentsLoadingMore){
+        return;
+    }
+    const sourceId = ytSourceId(rawId);
+    if(!sourceId){
+        return;
+    }
+    ytCommentsLoadingMore = true;
+    renderComments();
+
+    try{
+        const result = await comments(sourceId, 20, ytCommentsNextToken);
+        const page = result.comments || [];
+        if(page.length){
+            ytCommentsData = ytCommentsData.concat(page);
+        }
+        ytCommentsNextToken = result.nextPageToken || "";
+        ytCommentsError = result.error || "";
+    }
+    catch(e){
+        ytCommentsError = "could not load";
+        console.warn("YouTube comments load-more failed:", e);
+    }
+
+    const container = document.getElementById("comments");
+    if(!document.body.contains(container)){
+        return;
+    }
+    ytCommentsLoadingMore = false;
     renderComments();
 }
 
@@ -673,8 +739,30 @@ function renderChannel(){
         subsEl.textContent = v.subscribers || "";
     }
     if(avatarEl && v){
-        avatarEl.textContent = getInitials(v.channel);
         avatarEl.setAttribute("aria-hidden", "true");
+        avatarEl.replaceChildren();
+
+        if(v.channelThumb){
+            const img = document.createElement("img");
+            img.src = v.channelThumb;
+            img.alt = "";
+            img.loading = "lazy";
+            img.decoding = "async";
+            img.style.width = "100%";
+            img.style.height = "100%";
+            img.style.objectFit = "cover";
+            img.style.borderRadius = "inherit";
+
+            img.addEventListener("error", () => {
+                avatarEl.replaceChildren();
+                avatarEl.textContent = getInitials(v.channel);
+            }, { once: true });
+
+            avatarEl.appendChild(img);
+        }
+        else{
+            avatarEl.textContent = getInitials(v.channel);
+        }
     }
 }
 
@@ -1038,6 +1126,73 @@ let ytCommentsLoading = false;
 let ytCommentsError = "";
 let ytCommentsData = [];
 let ytCommentsSourceId = "";
+let ytCommentsNextToken = "";
+let ytCommentsLoadingMore = false;
+
+// Firestore-backed MyTube comments for the current video. null means the live
+// subscription is not active (loading, failed, or logged-out fallback), in which
+// case rendering falls back to the localStorage copy. When active it holds the
+// normalized [{id,userId,author,text,timestamp}] list, newest first.
+let fsComments = null;
+let fsCommentsUnsub = null;
+let fsCommentsActiveKey = "";
+
+
+// MyTube comments for this video: Firestore-first (live), else localStorage.
+function getCommentsSource(){
+    if(Array.isArray(fsComments)){
+        return fsComments.slice();
+    }
+    return loadComments(storageKey()).slice().sort((a, b) => b.timestamp - a.timestamp);
+}
+
+
+// Subscribe (once per page load) to the Firestore comments for this video.
+// Public reads work while logged out; posting still requires a signed-in user.
+// The rules deny access when the deployed Firestore rules are not updated yet,
+// which is caught by the onSnapshot error callback → localStorage fallback.
+function syncFirestoreComments(){
+    unsubFirestoreComments();
+    const key = storageKey();
+    fsCommentsActiveKey = key;
+    fsComments = null;
+    try{
+        fsCommentsUnsub = subscribeComments(key, (list) => {
+            if(fsCommentsActiveKey !== key){
+                return; // stale callback from a previous video — ignore
+            }
+            if(Array.isArray(list)){
+                fsComments = list;
+            }
+            else{
+                fsComments = null; // subscription failed → localStorage fallback
+            }
+            renderComments();
+        });
+    }
+    catch(e){
+        console.warn("Failed to start Firestore comment subscription:", e);
+        fsComments = null;
+    }
+}
+
+
+function unsubFirestoreComments(){
+    if(fsCommentsUnsub){
+        try{
+            fsCommentsUnsub();
+        }
+        catch(e){ /* ignore */ }
+        fsCommentsUnsub = null;
+    }
+    fsComments = null;
+    fsCommentsActiveKey = "";
+}
+
+
+window.addEventListener("pagehide", () => {
+    unsubFirestoreComments();
+});
 
 
 function renderComments(){
@@ -1055,9 +1210,8 @@ function renderComments(){
         return;
     }
 
-    // --- local-only path (unchanged for local MP4 videos) ---
-    const comments = loadComments(storageKey());
-    const sorted = comments.slice().sort((a, b) => b.timestamp - a.timestamp);
+    // --- local/MyTube path (local MP4 videos) ---
+    const sorted = getCommentsSource().sort((a, b) => b.timestamp - a.timestamp);
 
     if(countEl){
         countEl.textContent = `Comments (${sorted.length})`;
@@ -1083,7 +1237,7 @@ function renderComments(){
 // (read-only) plus the user's MyTube comments (interactive), both clearly
 // labeled instead of being split into separate duplicate sections.
 function renderMergedComments(container, countEl){
-    const local = loadComments(storageKey()).slice().sort((a, b) => b.timestamp - a.timestamp);
+    const local = getCommentsSource().sort((a, b) => b.timestamp - a.timestamp);
     const publicList = ytCommentsData;
 
     // Prefer the real total comment count from statistics.commentCount when the
@@ -1099,7 +1253,7 @@ function renderMergedComments(container, countEl){
 
     container.replaceChildren();
 
-    if(ytCommentsLoading){
+    if(ytCommentsLoading && ytCommentsData.length === 0){
         const p = document.createElement("p");
         p.className = "comment-empty";
         p.textContent = "Loading comments...";
@@ -1135,6 +1289,19 @@ function renderMergedComments(container, countEl){
         local.forEach(comment => {
             container.appendChild(buildLocalCommentNode(comment));
         });
+    }
+
+    if(publicList.length && ytCommentsNextToken){
+        const moreBtn = document.createElement("button");
+        moreBtn.type = "button";
+        moreBtn.className = "load-more comment-load-more";
+        moreBtn.textContent = ytCommentsLoadingMore ? "Loading..." : "Load more comments";
+        moreBtn.disabled = ytCommentsLoadingMore;
+        moreBtn.addEventListener("click", (e) => {
+            e.preventDefault();
+            loadMoreYtComments();
+        });
+        container.appendChild(moreBtn);
     }
 
     // Truthful fallback when no public or local comments are available.
@@ -1202,8 +1369,49 @@ function addComment(text){
     }
 
     const name = currentUserName() || "User";
-    const comments = loadComments(storageKey());
 
+    // Firestore-first when the live subscription for this video is active.
+    // Optimistically append a temp comment; the onSnapshot refresh replaces it
+    // with the server copy once the write lands.
+    if(Array.isArray(fsComments)){
+        const tmpId = "tmp_" + Date.now() + "_" + Math.floor(Math.random() * 1000);
+        const optimistic = {
+            id: tmpId,
+            userId: uid,
+            text: text,
+            author: name,
+            timestamp: Date.now()
+        };
+        fsComments = [optimistic].concat(fsComments.filter(c => c.id !== tmpId));
+        renderComments();
+
+        addCommentToStore(storageKey(), {
+            userId: uid,
+            text: text,
+            author: name
+        }).then(res => {
+            if(res){
+                return; // onSnapshot will refresh the list with the real doc.
+            }
+            // Firestore write failed (e.g. deployed rules not updated yet) →
+            // persist locally instead so the comment is not lost.
+            const localComments = loadComments(storageKey());
+            localComments.push({
+                id: "c_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
+                userId: uid,
+                text: text,
+                author: name,
+                timestamp: Date.now()
+            });
+            saveComments(storageKey(), localComments);
+            fsComments = null; // revert this video to the localStorage source
+            renderComments();
+        });
+        return true;
+    }
+
+    // Fallback: localStorage-aligned path.
+    const comments = loadComments(storageKey());
     const newComment = {
         id: "c_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
         userId: uid,
@@ -1224,6 +1432,29 @@ function deleteComment(commentId){
     if(!uid){
         return;
     }
+
+    // Firestore-first: remove the comment doc; onSnapshot refreshes the list.
+    if(Array.isArray(fsComments)){
+        const target = fsComments.find(c => c.id === commentId);
+        if(!target || target.userId !== uid){
+            return;
+        }
+        const wasRemote = !String(commentId).startsWith("tmp_");
+        if(wasRemote){
+            removeCommentById(commentId).then(ok => {
+                if(ok){
+                    return; // onSnapshot will refresh
+                }
+                // Firestore delete failed → remove from localStorage as fallback.
+                const comments = loadComments(storageKey()).filter(c => c.id !== commentId);
+                saveComments(storageKey(), comments);
+            });
+        }
+        fsComments = fsComments.filter(c => c.id !== commentId);
+        renderComments();
+        return;
+    }
+
     // Only remove the comment that belongs to the current user.
     const comments = loadComments(storageKey()).filter(c => c.id !== commentId || c.userId !== uid);
     saveComments(storageKey(), comments);
@@ -1249,9 +1480,13 @@ function setupCommentForm(){
         form.dataset.commentWired = "1";
         form.addEventListener("submit", (e) => {
             e.preventDefault();
-            const text = input.value.trim();
+            let text = input.value.trim();
             if(!text){
                 return;
+            }
+            // Hard cap even if the browser maxlength is bypassed.
+            if(text.length > 2000){
+                text = text.slice(0, 2000);
             }
             const added = addComment(text);
             if(added){
@@ -1293,14 +1528,77 @@ function setupCommentForm(){
 // ================= PLAYER CONTROLS =================
 
 
+// Keep the custom play/pause button in sync with the real player state.
+// Previously the button was a static "▶" that never reflected playback.
+function syncPlayButton(){
+    const btn = document.getElementById("playBtn");
+    if(!btn){
+        return;
+    }
+    const paused = !video || video.paused;
+    btn.textContent = paused ? "▶" : "⏸";
+    btn.setAttribute("aria-label", paused ? "Play" : "Pause");
+    btn.setAttribute("aria-pressed", paused ? "false" : "true");
+}
+
+
+// Restore playback position from watch history (stored as a 0-100 percentage)
+// for local videos. YouTube embeds are not resumed (no JS API wired).
+async function maybeResumePlayback(){
+    if(isYt || !video || !video.duration || video.dataset.resumeDone === "1"){
+        return;
+    }
+    const uid = uidOrNull();
+    if(!uid){
+        return;
+    }
+    const videoId = (current && current.id) || storageKey();
+    try{
+        const items = await getHistory(uid, 25);
+        const entry = items.find(i =>
+            i.videoId === videoId &&
+            typeof i.progress === "number" &&
+            i.progress > 1
+        );
+        if(!entry){
+            return;
+        }
+        // Never resume at the very end of a video — treat "finished" as done.
+        const pct = Math.min(entry.progress, 98);
+        const target = (pct / 100) * video.duration;
+        if(isFinite(target) && target > 1){
+            video.dataset.resumeDone = "1";
+            video.currentTime = target;
+            renderTimeDisplay();
+        }
+    }
+    catch(e){
+        console.warn("Resume lookup failed:", e);
+    }
+}
+
+
 function setupPlayerControls(){
     if(!video){
         return;
     }
 
+    syncPlayButton();
+
     const progress = document.getElementById("progress");
     const volume = document.getElementById("volume");
     const speed = document.getElementById("speed");
+
+    video.addEventListener("play", syncPlayButton);
+    video.addEventListener("pause", syncPlayButton);
+
+    // Auto-advance to the next local video when the current one ends.
+    video.addEventListener("ended", () => {
+        const idx = getIndexById(rawId);
+        if(idx >= 0 && idx < videos.length - 1){
+            navigateToVideo(videos[idx + 1].id);
+        }
+    });
 
     video.addEventListener("timeupdate", () => {
         if(progress && video.duration){
@@ -1351,6 +1649,7 @@ window.playPause = function(){
     else{
         video.pause();
     }
+    syncPlayButton();
 };
 
 
@@ -1461,6 +1760,7 @@ function toggleShortcut(){
     else{
         video.pause();
     }
+    syncPlayButton();
 }
 
 
@@ -1490,6 +1790,22 @@ const shareBtn = document.getElementById("shareBtn");
 const saveBtn = document.getElementById("saveBtn");
 const subscribeBtn = document.getElementById("subscribeBtn");
 const actionMsg = document.getElementById("actionMsg");
+
+
+// Toast-style feedback for the action row. Defined here (it was previously
+// called but never implemented) and auto-cleared so repeated actions always
+// surface the latest message.
+let actionMsgTimer = null;
+function setActionMsg(text){
+    if(!actionMsg){
+        return;
+    }
+    actionMsg.textContent = text || "";
+    clearTimeout(actionMsgTimer);
+    actionMsgTimer = setTimeout(() => {
+        actionMsg.textContent = "";
+    }, 3000);
+}
 
 
 let isLiked = false;
@@ -1639,6 +1955,29 @@ function setVote(next){
 
     persistVoteState();
     renderLikeDislike();
+
+    // Persist liked state to Firestore when logged in. Any state other than
+    // "liked" (neutral OR disliked) must clear the Firestore record, otherwise
+    // switching a previously-liked video to Dislike leaves a stale entry in
+    // the Liked Videos library. deleteDoc on a missing doc is a no-op.
+    const uid = uidOrNull();
+    if(uid && active){
+        if(voteState === "liked"){
+            addToLiked(uid, {
+                videoId: active.id || storageKey(),
+                type: isYt ? "youtube" : "local",
+                title: active.title || "",
+                thumb: active.thumb || "",
+                channel: active.channel || "",
+                views: active.views || "",
+                duration: active.time || "",
+                likeCount: active.likeCount || 0
+            });
+        }
+        else{
+            removeFromLiked(uid, active.id || storageKey());
+        }
+    }
 }
 
 
@@ -1713,6 +2052,24 @@ if(saveBtn){
             localStorage.removeItem(saveKey());
         }
         renderSave();
+        // Persist to Firestore when logged in.
+        const uid = uidOrNull();
+        if(uid && active){
+            if(isSaved){
+                addToSaved(uid, {
+                    videoId: active.id || storageKey(),
+                    type: isYt ? "youtube" : "local",
+                    title: active.title || "",
+                    thumb: active.thumb || "",
+                    channel: active.channel || "",
+                    views: active.views || "",
+                    duration: active.time || ""
+                });
+            }
+            else{
+                removeFromSaved(uid, active.id || storageKey());
+            }
+        }
     };
 }
 
@@ -1746,6 +2103,15 @@ function renderSubscribe(){
 
 if(subscribeBtn){
     subscribeBtn.onclick = function(){
+        const v = active || current;
+        if(!v){
+            return;
+        }
+        const uid = uidOrNull();
+        if(!uid){
+            setActionMsg("Please log in to subscribe.");
+            return;
+        }
         isSubscribed = !isSubscribed;
         if(isSubscribed){
             localStorage.setItem(subscribeKey(), "1");
@@ -1754,7 +2120,298 @@ if(subscribeBtn){
             localStorage.removeItem(subscribeKey());
         }
         renderSubscribe();
+        // Persist to Firestore.
+        if(isSubscribed){
+            addSubscription(uid, {
+                channelId: v.channelId || "",
+                channelName: v.channel || "",
+                channelThumb: v.channelThumb || "",
+                subscriberCount: v.subscribers || ""
+            });
+        }
+        else{
+            removeSubscription(uid, v.channelId || "", v.channel || "");
+        }
     };
+}
+
+
+// ================= PLAYLISTS (ADD TO PLAYLIST) =================
+// Playlists live per-user in Firestore only (no localStorage fallback for this
+// feature). The watch-page popover lets a logged-in user create a playlist and
+// add/remove the current video.
+
+const playlistBtn = document.getElementById("playlistBtn");
+const playlistPopover = document.getElementById("playlistPopover");
+const playlistChoices = document.getElementById("playlistChoices");
+const playlistNewName = document.getElementById("playlistNewName");
+const playlistCreateBtn = document.getElementById("playlistCreateBtn");
+const playlistMsg = document.getElementById("playlistMsg");
+
+let cachedPlaylists = null;
+
+function setPlaylistMsg(text){
+    if(playlistMsg){
+        playlistMsg.textContent = text || "";
+    }
+}
+
+function currentPlaylistEntry(){
+    const v = active || current;
+    if(!v){
+        return null;
+    }
+    return {
+        videoId: v.id || storageKey(),
+        type: isYt ? "youtube" : "local",
+        title: v.title || "",
+        thumb: v.thumb || "",
+        channel: v.channel || "",
+        views: v.views || "",
+        duration: v.time || ""
+    };
+}
+
+async function loadPlaylists(){
+    const uid = uidOrNull();
+    if(!uid){
+        return [];
+    }
+    if(cachedPlaylists !== null){
+        return cachedPlaylists;
+    }
+    cachedPlaylists = await getPlaylists(uid);
+    return cachedPlaylists;
+}
+
+function emptyPlaylistChoices(message){
+    if(!playlistChoices){
+        return;
+    }
+    playlistChoices.replaceChildren();
+    const p = document.createElement("p");
+    p.className = "comment-empty";
+    p.textContent = message;
+    playlistChoices.appendChild(p);
+}
+
+async function renderPlaylistChoices(){
+    if(!playlistChoices){
+        return;
+    }
+    const uid = uidOrNull();
+    const entry = currentPlaylistEntry();
+    if(!uid){
+        emptyPlaylistChoices("Log in to use playlists.");
+        return;
+    }
+    if(!entry){
+        emptyPlaylistChoices("No video to add yet.");
+        return;
+    }
+
+    emptyPlaylistChoices("Loading playlists...");
+    const playlists = await loadPlaylists();
+    if(!playlists.length){
+        emptyPlaylistChoices("No playlists yet — create one below.");
+        return;
+    }
+
+    // Determine membership for this video across all playlists in parallel.
+    const membership = {};
+    await Promise.all(playlists.map(async (pl) => {
+        const items = await getPlaylistItems(uid, pl.id);
+        membership[pl.id] = items.some(item => (item.videoId || item.id) === entry.videoId);
+    }));
+
+    playlistChoices.replaceChildren();
+    playlists.forEach((pl) => {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "playlist-choice";
+        row.setAttribute("aria-pressed", membership[pl.id] ? "true" : "false");
+        const label = () => (row.getAttribute("aria-pressed") === "true" ? "✓ " : "+ ") + (pl.name || "Untitled playlist");
+        row.textContent = label();
+        row.onclick = async () => {
+            row.disabled = true;
+            const has = row.getAttribute("aria-pressed") === "true";
+            const ok = has
+                ? await removeFromPlaylist(uid, pl.id, entry.videoId)
+                : await addToPlaylist(uid, pl.id, entry);
+            row.disabled = false;
+            if(ok){
+                const nowIn = !has;
+                row.setAttribute("aria-pressed", nowIn ? "true" : "false");
+                row.textContent = label();
+                setPlaylistMsg((nowIn ? "Added to " : "Removed from ") + (pl.name || "playlist"));
+            }
+            else{
+                setPlaylistMsg("Could not update the playlist — check your connection.");
+            }
+        };
+        playlistChoices.appendChild(row);
+    });
+}
+
+async function handleCreatePlaylist(){
+    const uid = uidOrNull();
+    const entry = currentPlaylistEntry();
+    if(!uid){
+        setActionMsg("Please log in to use playlists.");
+        return;
+    }
+    if(!entry){
+        return;
+    }
+    const name = (playlistNewName ? playlistNewName.value : "").trim();
+    if(!name){
+        setPlaylistMsg("Enter a playlist name first.");
+        if(playlistNewName){
+            playlistNewName.focus();
+        }
+        return;
+    }
+    if(playlistCreateBtn){
+        playlistCreateBtn.disabled = true;
+    }
+    const playlistId = await createPlaylist(uid, name);
+    cachedPlaylists = null;
+    if(playlistNewName){
+        playlistNewName.value = "";
+    }
+    if(!playlistId){
+        if(playlistCreateBtn){
+            playlistCreateBtn.disabled = false;
+        }
+        setPlaylistMsg("Could not create that playlist.");
+        return;
+    }
+    const added = await addToPlaylist(uid, playlistId, entry);
+    if(playlistCreateBtn){
+        playlistCreateBtn.disabled = false;
+    }
+    setPlaylistMsg(added
+        ? "Playlist \"" + name + "\" created and this video was added."
+        : "Playlist created, but adding this video failed.");
+    renderPlaylistChoices();
+}
+
+async function openPlaylistPopover(){
+    if(!playlistPopover){
+        return;
+    }
+    playlistPopover.style.display = "block";
+    if(playlistBtn){
+        playlistBtn.setAttribute("aria-expanded", "true");
+    }
+    setPlaylistMsg("");
+    await renderPlaylistChoices();
+    const firstChoice = playlistChoices ? playlistChoices.querySelector("button") : null;
+    if(firstChoice){
+        firstChoice.focus();
+    }
+    else if(playlistNewName){
+        playlistNewName.focus();
+    }
+}
+
+function closePlaylistPopover(){
+    if(!playlistPopover){
+        return;
+    }
+    playlistPopover.style.display = "none";
+    if(playlistBtn){
+        playlistBtn.setAttribute("aria-expanded", "false");
+    }
+    setPlaylistMsg("");
+}
+
+function togglePlaylistPopover(){
+    if(playlistPopover && playlistPopover.style.display === "block"){
+        closePlaylistPopover();
+        return;
+    }
+    if(!uidOrNull()){
+        setActionMsg("Please log in to use playlists.");
+        return;
+    }
+    openPlaylistPopover();
+}
+
+function setupPlaylistUI(){
+    if(playlistBtn){
+        playlistBtn.onclick = togglePlaylistPopover;
+    }
+    if(playlistCreateBtn){
+        playlistCreateBtn.onclick = handleCreatePlaylist;
+    }
+    if(playlistNewName){
+        playlistNewName.addEventListener("keydown", (e) => {
+            if(e.key === "Enter"){
+                e.preventDefault();
+                handleCreatePlaylist();
+            }
+        });
+    }
+    // Close on Escape or when clicking/tapping outside the popover.
+    document.addEventListener("keydown", (e) => {
+        if(e.key === "Escape"){
+            closePlaylistPopover();
+        }
+    });
+    document.addEventListener("click", (e) => {
+        if(playlistPopover && playlistBtn
+            && playlistPopover.style.display === "block"
+            && !playlistPopover.contains(e.target)
+            && !playlistBtn.contains(e.target)){
+            closePlaylistPopover();
+        }
+    });
+}
+
+
+// ================= WATCH HISTORY =================
+// Records video views to Firestore when logged in. Debounced to avoid
+// excessive writes — a new record is created or updated at most once per
+// 30-second window. Progress is tracked for local videos.
+
+let historyTimer = null;
+const HISTORY_DEBOUNCE_MS = 30000;
+
+function recordHistory(){
+    const uid = uidOrNull();
+    if(!uid){
+        return;
+    }
+    const v = active;
+    if(!v){
+        return;
+    }
+    clearTimeout(historyTimer);
+    historyTimer = setTimeout(() => {
+        const progress = (!isYt && video && video.duration)
+            ? Math.round((video.currentTime / video.duration) * 100)
+            : 0;
+        addToHistory(uid, {
+            videoId: v.id || storageKey(),
+            type: isYt ? "youtube" : "local",
+            title: v.title || "",
+            thumb: v.thumb || "",
+            channel: v.channel || "",
+            duration: v.time || "",
+            progress: progress
+        });
+    }, HISTORY_DEBOUNCE_MS);
+}
+
+
+// ================= FIRESTORE SYNC HELPERS =================
+// When logged in, write to both Firestore and localStorage for resilience.
+// When logged out, localStorage only (existing behavior).
+
+function uidOrNull(){
+    const user = auth && auth.currentUser;
+    return user ? user.uid : null;
 }
 
 
@@ -1768,12 +2425,14 @@ window.addEventListener("DOMContentLoaded", () => {
     setupVoteButtons();
     renderSave();
     renderSubscribe();
+    setupPlaylistUI();
     setupCommentForm();
     renderMute();
     renderPrevNext();
     setupKeyboardShortcuts();
     renderTimeDisplay();
     loadVideo();
+    recordHistory();
 });
 
 
@@ -1786,7 +2445,113 @@ window.addEventListener("mytube-auth-change", () => {
     }
     setupCommentForm();
     renderComments();
+    // Record history now that we know the auth state.
+    recordHistory();
+    // Sync save/like/subscribe state from Firestore.
+    syncStateFromFirestore();
 });
+
+
+// When the user logs in, mirror Firestore state (save/like/subscribe) into
+// localStorage so the existing buttons reflect the persisted state immediately.
+// If Firestore has no record but localStorage does, migrate the local value up
+// so previously-saved/subscribed/liked items are preserved across devices.
+async function syncStateFromFirestore(){
+    const uid = uidOrNull();
+    if(!uid || !active){
+        return;
+    }
+    const v = active;
+    const videoId = v.id || storageKey();
+    try{
+        const [saved, liked, subscribed] = await Promise.all([
+            isSavedVideo(uid, videoId),
+            isLikedVideo(uid, videoId),
+            isSubscribedByChannel(uid, v.channelId || "", v.channel || "")
+        ]);
+
+        // --- SAVED ---
+        const localSaved = localStorage.getItem(saveKey()) === "1";
+        if(saved === true){
+            isSaved = true;
+            localStorage.setItem(saveKey(), "1");
+        }
+        else if(saved === false && localSaved){
+            // Migrate legacy local save to Firestore.
+            addToSaved(uid, {
+                videoId: videoId,
+                type: isYt ? "youtube" : "local",
+                title: v.title || "",
+                thumb: v.thumb || "",
+                channel: v.channel || "",
+                views: v.views || "",
+                duration: v.time || ""
+            });
+        }
+        else if(saved !== null){
+            isSaved = localSaved;
+            if(!isSaved){
+                localStorage.removeItem(saveKey());
+            }
+        }
+        renderSave();
+
+        // --- LIKED ---
+        const localLiked = localStorage.getItem(likeStateKey()) === "1";
+        if(liked === true){
+            if(voteState !== "liked"){
+                voteState = "liked";
+                isLiked = true;
+                localStorage.setItem(likeStateKey(), "1");
+            }
+        }
+        else if(liked === false && localLiked){
+            // Migrate legacy local like to Firestore.
+            addToLiked(uid, {
+                videoId: videoId,
+                type: isYt ? "youtube" : "local",
+                title: v.title || "",
+                thumb: v.thumb || "",
+                channel: v.channel || "",
+                views: v.views || "",
+                duration: v.time || "",
+                likeCount: v.likeCount || 0
+            });
+            voteState = "liked";
+            isLiked = true;
+        }
+        else if(liked !== null){
+            voteState = localLiked ? "liked" : "neutral";
+            isLiked = voteState === "liked";
+            isDisliked = false;
+            localStorage.setItem(likeStateKey(), isLiked ? "1" : "0");
+        }
+        renderLikeDislike();
+
+        // --- SUBSCRIBED ---
+        const localSub = localStorage.getItem(subscribeKey()) === "1";
+        if(subscribed === true){
+            isSubscribed = true;
+            localStorage.setItem(subscribeKey(), "1");
+        }
+        else if(subscribed === false && localSub){
+            // Migrate legacy local subscription to Firestore.
+            addSubscription(uid, {
+                channelId: v.channelId || "",
+                channelName: v.channel || "",
+                channelThumb: v.channelThumb || "",
+                subscriberCount: v.subscribers || ""
+            });
+        }
+        else if(subscribed !== null){
+            isSubscribed = localSub;
+        }
+        renderSubscribe();
+    }
+    catch(e){
+        console.warn("Failed to sync state from Firestore:", e);
+    }
+}
 
 
 console.log("MyTube Watch JS Loaded ✅");

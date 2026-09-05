@@ -1,12 +1,13 @@
 // ================= PROFILE PAGE =================
-// Local-only profile view (Firebase auth for identity, localStorage for saved
-// videos and subscriptions). No Firestore, no server-side data.
+// Profile view: Firebase auth for identity, Firestore for saved videos and
+// subscriptions (with localStorage fallback) for resilience when logged out.
 
 import { auth } from "./firebase.js";
 import {
     onAuthStateChanged
 }
 from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getSaved, getSubscriptions } from "./data.js";
 
 
 const videos = window.MyTubeVideos || [];
@@ -43,7 +44,7 @@ function safeDisplayName(user){
 }
 
 
-function getSavedVideos(){
+function getSavedVideosLocal(){
     return videos.filter(v => {
         try{
             return localStorage.getItem("mytube_saved_" + v.id) === "1";
@@ -56,7 +57,7 @@ function getSavedVideos(){
 }
 
 
-function getSubscribedChannels(){
+function getSubscribedChannelsLocal(){
     const subscribed = [];
     videos.forEach(v => {
         try{
@@ -74,13 +75,8 @@ function getSubscribedChannels(){
 }
 
 
-function renderSavedVideos(){
-    if(!savedListEl){
-        return;
-    }
+function renderSavedList(saved){
     savedListEl.replaceChildren();
-
-    const saved = getSavedVideos();
 
     if(saved.length === 0){
         const empty = document.createElement("p");
@@ -107,7 +103,7 @@ function renderSavedVideos(){
         title.textContent = v.title;
 
         const meta = document.createElement("p");
-        meta.textContent = v.channel + " • " + v.views;
+        meta.textContent = (v.channel || "") + (v.views ? (" \u2022 " + v.views) : "");
 
         info.appendChild(title);
         info.appendChild(meta);
@@ -119,13 +115,72 @@ function renderSavedVideos(){
 }
 
 
-function renderSubscribedChannels(){
+async function renderSavedVideos(){
+    if(!savedListEl){
+        return;
+    }
+
+    const user = (auth && auth.currentUser) || null;
+
+    let savedItems = [];
+
+    // Logged in: prefer Firestore.
+    if(user){
+        try{
+            const fsSaved = await getSaved(user.uid);
+            savedItems = fsSaved.map(s => ({
+                id: s.videoId || s.id,
+                title: s.title || "",
+                thumb: s.thumb || "",
+                channel: s.channel || "",
+                views: s.views || ""
+            }));
+        }
+        catch(error){
+            console.warn("Could not load saved from Firestore:", error);
+        }
+    }
+
+    // Fall back to localStorage if Firestore gave nothing.
+    if(savedItems.length === 0){
+        const localSaved = getSavedVideosLocal();
+        if(localSaved.length > 0){
+            renderSavedList(localSaved);
+            return;
+        }
+    }
+
+    renderSavedList(savedItems);
+}
+
+
+async function renderSubscribedChannels(){
     if(!subsListEl){
         return;
     }
     subsListEl.replaceChildren();
 
-    const channels = getSubscribedChannels();
+    const user = (auth && auth.currentUser) || null;
+
+    let channels = [];
+
+    // Logged in: prefer Firestore.
+    if(user){
+        try{
+            const subs = await getSubscriptions(user.uid);
+            channels = subs
+                .map(s => s.channelName || s.id)
+                .filter(Boolean);
+        }
+        catch(error){
+            console.warn("Could not load subscriptions from Firestore:", error);
+        }
+    }
+
+    // Fall back to localStorage if Firestore gave nothing.
+    if(channels.length === 0){
+        channels = getSubscribedChannelsLocal();
+    }
 
     if(channels.length === 0){
         const empty = document.createElement("p");
