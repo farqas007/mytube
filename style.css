@@ -91,6 +91,46 @@ button:hover{
 
 
 
+/* ================= VOICE SEARCH ================= */
+
+.voice-search-btn{
+    background:none;
+    color:#aaa;
+    border:none;
+    width:40px;
+    height:40px;
+    padding:0;
+    border-radius:50%;
+    cursor:pointer;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    flex-shrink:0;
+    transition:background .2s,color .2s;
+}
+
+.voice-search-btn:hover{
+    background:#333;
+    color:white;
+}
+
+.voice-search-btn.listening{
+    background:red;
+    color:white;
+    animation:voice-pulse 1.2s ease-in-out infinite;
+}
+
+.voice-search-btn:focus-visible{
+    outline:2px solid red;
+    outline-offset:2px;
+}
+
+@keyframes voice-pulse{
+    0%,100%{box-shadow:0 0 0 0 rgba(255,0,0,.4)}
+    50%{box-shadow:0 0 0 8px rgba(255,0,0,0)}
+}
+
+
 /* ================= HOME PAGE ================= */
 
 
@@ -672,12 +712,20 @@ header{
 
 
 /* Full-width, touch-friendly search box on its own row so it stays usable
-   on tiny screens (320px+) instead of being squeezed into a narrow column. */
+   on tiny screens (320px+) instead of being squeezed into a narrow column. The
+   voice-search button shares this row so it stays thumb-reachable. */
 header input{
 
-    width:100%;
+    width:auto;
 
-    flex:1 1 100%;
+    flex:1 1 0;
+
+    order:5;
+
+}
+
+
+.voice-search-btn{
 
     order:5;
 
