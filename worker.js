@@ -370,14 +370,15 @@ async function searchYouTube(query, max, apiKey, pageToken) {
   };
 }
 
-async function getTrending(max, region, apiKey) {
+async function getTrending(max, region, apiKey, pageToken) {
   const result = await ytFetch(
     "videos",
     {
       part: "snippet,contentDetails,statistics,status",
       chart: "mostPopular",
       regionCode: region || "PK",
-      maxResults: Math.min(Math.max(Number(max) || 12, 1), 50)
+      maxResults: Math.min(Math.max(Number(max) || 12, 1), 50),
+      ...(pageToken ? { pageToken } : {})
     },
     apiKey
   );
@@ -693,11 +694,13 @@ async function handleAPI(request, env) {
     if (route === "trending") {
       const max = url.searchParams.get("max") || "12";
       const region = url.searchParams.get("region") || "PK";
+      const pageToken = url.searchParams.get("pageToken") || "";
 
       const result = await getTrending(
         max,
         region,
-        apiKey
+        apiKey,
+        pageToken
       );
 
       return json(result, 200, request);

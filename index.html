@@ -73,20 +73,6 @@ Logout
 
 <aside class="sidebar" aria-label="Main navigation">
 
-    <div class="sidebar-top">
-        <button class="sidebar-menu-btn" type="button" aria-label="Menu">
-            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M4 6h16"></path>
-                <path d="M4 12h16"></path>
-                <path d="M4 18h16"></path>
-            </svg>
-        </button>
-        <div class="sidebar-brand">
-            <span class="sidebar-brand-icon">▶</span>
-            <span>MyTube</span>
-        </div>
-    </div>
-
     <nav class="sidebar-nav">
 
         <p id="sideHome" class="sidebar-item active">
@@ -209,7 +195,6 @@ No videos found 😕
 
 <script>
 
-const videos = window.MyTubeVideos || [];
 const categories = window.MyTubeCategories || [];
 
 const box = document.getElementById("videoList");
@@ -228,41 +213,6 @@ let trendingMode = false;
 
 function openVideo(id){
     window.location.href = "watch.html?id=" + id;
-}
-
-
-// ================= FILTERING =================
-
-function videoMatches(v){
-    if(!v) return false;
-
-    if(currentCategory !== "All" && v.category !== currentCategory){
-        return false;
-    }
-
-    if(currentQuery){
-        const haystack = [v.title, v.channel, v.category, v.description]
-            .filter(Boolean)
-            .join(" ")
-            .toLowerCase();
-        if(!haystack.includes(currentQuery)){
-            return false;
-        }
-    }
-
-    return true;
-}
-
-
-function visibleVideos(){
-    let list = videos.filter(videoMatches);
-
-    if(trendingMode){
-        // Local/demo trending: sort by numeric viewCount descending.
-        list = list.slice().sort((a, b) => (b.viewCount || 0) - (a.viewCount || 0));
-    }
-
-    return list;
 }
 
 
@@ -313,24 +263,6 @@ function buildCard(v){
 }
 
 
-function renderVideos(){
-    const list = visibleVideos();
-
-    hideLoadMore();
-    box.replaceChildren();
-
-    list.forEach(v => {
-        box.appendChild(buildCard(v));
-    });
-
-    // No results: only show when there is an active query or a non-All category.
-    const activeFilter = Boolean(currentQuery) || currentCategory !== "All";
-    if(noResultsEl){
-        noResultsEl.style.display = (activeFilter && list.length === 0) ? "block" : "none";
-    }
-}
-
-
 // ================= CATEGORY FILTER =================
 
 function buildCategoryFilter(){
@@ -349,7 +281,7 @@ function buildCategoryFilter(){
         btn.addEventListener("click", () => {
             currentCategory = cat;
             renderCategoryFilter();
-            renderVideos();
+            renderMain();
         });
         filterBar.appendChild(btn);
     });
@@ -371,7 +303,8 @@ function renderCategoryFilter(){
 // ================= SEARCH =================
 
 function searchVideo(){
-    // Preserve the existing contract: empty query shows all videos.
+    // Voice search (voice-search.js) and the search button route through this
+    // same pipeline, which renders YouTube-only results (never local videos).
     currentQuery = (searchInput ? searchInput.value : "").trim().toLowerCase();
     renderMain();
 }
@@ -455,59 +388,145 @@ function cardMeta(v){
 }
 
 // Determine which render path to use:
-//  - if a category is active (and no query) we keep the local category browse.
-//  - otherwise a query triggers dynamic search; no query triggers home browse.
+//  - a query (or a selected category chip) triggers a YouTube-only search;
+//  - the plain homepage view renders the paginated YouTube home feed.
 function renderMain(){
-    if(currentQuery){
+    if(currentQuery || currentCategory !== "All"){
         doDynamicSearch();
         return;
     }
-    // Home / category browse: local render + a dynamic discovery strip.
-    renderVideos();
-    maybeLoadRemoteHome();
+    loadHomeFeed();
 }
 
 
-// Homepage: when browsing the default view (no query, All category, not
-// trending), prepend dynamically discovered videos on top of the local grid.
-// The page NEVER depends on this — failure leaves the local videos alone.
-// Discovery uses the official YouTube Data API "most popular" feed rather than
-// a fixed search term, so the homepage reflects really-watched videos instead
-// of pretending a keyword query is YouTube's real recommendation algorithm.
-let homeDiscoveryDone = false;
-async function maybeLoadRemoteHome(){
-    if(homeDiscoveryDone || trendingMode || currentQuery || currentCategory !== "All"){
+// Homepage feed: the default view renders ONLY the YouTube "most popular" feed.
+// Local videos are never rendered here — not as a base grid and not as an
+// API-failure fallback. Failures surface a user-facing status message instead.
+let homeSeq = 0;
+let homeNextToken = "";
+let homeVideos = [];
+let homeLoadMoreBtn = null;
+let homeLoadingMore = false;
+
+function homeUpdateLoadMore(){
+    const hasMore = Boolean(homeNextToken) && homeVideos.length > 0;
+    if(hasMore && !homeLoadMoreBtn){
+        homeLoadMoreBtn = buildLoadMoreBtn(loadMoreHome, "Load more");
+        box.after(homeLoadMoreBtn);
+    }
+    else if(!hasMore && homeLoadMoreBtn){
+        homeLoadMoreBtn.remove();
+        homeLoadMoreBtn = null;
+    }
+}
+
+async function loadMoreHome(){
+    if(homeLoadingMore || !homeNextToken){
         return;
     }
     const client = ytClient();
     if(!client){
-        // Module not loaded yet (deferred <script type="module"> runs after
-        // this inline script). Retry once the YouTube module is ready.
-        whenYTReady(maybeLoadRemoteHome);
         return;
     }
-    homeDiscoveryDone = true;
+    const seq = homeSeq;
+    const btn = homeLoadMoreBtn;
+
+    homeLoadingMore = true;
+    if(btn){
+        btn.disabled = true;
+        btn.textContent = "Loading...";
+    }
+
     try{
-        const feed = await client.trending(12);
-        const remote = (feed.videos || []).slice(0, 8);
-        if(!remote.length){
+        const feed = await client.trending(12, false, homeNextToken);
+        if(seq !== homeSeq){
             return;
         }
-        // Prepend remote cards above the locally-rendered grid.
-        const localCards = Array.from(box.children);
-        box.replaceChildren();
-        remote.forEach(v => { box.appendChild(buildCard(v)); });
-        localCards.forEach(c => { box.appendChild(c); });
+        const before = homeVideos.length;
+        const seen = new Set(homeVideos.map(v => v.id));
+        const page = (feed.videos || []).filter(v => v && v.id && !seen.has(v.id));
+        homeVideos = homeVideos.concat(page);
+        homeNextToken = feed.nextPageToken || "";
+        if(homeVideos.length === before){
+            // The next page contained no new unique videos — stop paginating.
+            homeNextToken = "";
+        }
+        renderVideoList(homeVideos);
         showStatus("");
     }
     catch(e){
-        logHome("warn", "Home discovery failed, using local videos.", e);
+        if(seq !== homeSeq){
+            return;
+        }
+        logHome("warn", "Home load more failed:", e);
+        showStatus("Could not load more videos. Please try again.");
+    }
+    finally{
+        homeLoadingMore = false;
+        if(btn){
+            btn.disabled = false;
+            btn.textContent = "Load more";
+        }
+        homeUpdateLoadMore();
+    }
+}
+
+async function loadHomeFeed(fresh){
+    const client = ytClient();
+    const seq = ++homeSeq;
+
+    // Reset pagination state and any stale load-more button.
+    homeNextToken = "";
+    homeVideos = [];
+    hideLoadMore();
+    box.replaceChildren();
+
+    if(!client){
+        // The YouTube module is deferred (type="module"), so it may not be ready
+        // yet — retry once it reports readiness.
+        whenYTReady(() => {
+            if(seq === homeSeq){
+                loadHomeFeed(fresh);
+            }
+        });
+        showStatus("Loading YouTube videos...");
+        return;
+    }
+
+    showStatus("Loading YouTube videos...");
+    try{
+        const feed = await client.trending(12, Boolean(fresh));
+        if(seq !== homeSeq){
+            return;
+        }
+        homeVideos = (feed.videos || []).filter(v => v && v.id);
+        homeNextToken = feed.nextPageToken || "";
+        if(!homeVideos.length){
+            showStatus(feed.error
+                ? ("Could not load YouTube videos: " + feed.error)
+                : "No YouTube videos available right now.");
+        }
+        else{
+            showStatus("");
+        }
+        renderVideoList(homeVideos);
+        homeUpdateLoadMore();
+    }
+    catch(e){
+        if(seq !== homeSeq){
+            return;
+        }
+        logHome("warn", "Home feed failed:", e);
+        showStatus("Could not load YouTube videos. Please try again.");
+        box.replaceChildren();
     }
 }
 
 
-// Perform a dynamic YouTube search for the current query, then render results
-// with YouTube results first and matching local videos below as a fallback.
+// Perform a dynamic YouTube search for the current query (or, when a category
+// chip is active with no query, the category name) and render the results.
+// Results are YouTube-only — local videos never appear here, even when the
+// YouTube API is unreachable.
 let searchSeq = 0;
 let activeSearchController = null;
 let searchNextToken = "";
@@ -515,31 +534,42 @@ let searchRemoteVideos = [];
 let searchLoadMoreBtn = null;
 let searchLoadingMore = false;
 
+// The effective search term: the typed query, or the selected category name
+// when browsing a category chip without a query. "" on the plain homepage view
+// (which renders the home feed instead).
+function searchTerm(){
+    return currentQuery || (currentCategory !== "All" ? currentCategory : "");
+}
+
+// Shared pagination button builder. Search and home feeds keep their own button
+// instance + handler; hideLoadMore removes whatever is showing so switching
+// views never leaves a stale/competing "Load more" behind.
+function buildLoadMoreBtn(onClick, label){
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "load-more";
+    btn.textContent = label || "Load more";
+    btn.setAttribute("aria-label", "Load more YouTube videos");
+    btn.addEventListener("click", onClick);
+    return btn;
+}
+
 function hideLoadMore(){
     if(searchLoadMoreBtn){
         searchLoadMoreBtn.remove();
         searchLoadMoreBtn = null;
     }
-}
-
-function buildLoadMoreBtn(){
-    if(searchLoadMoreBtn && searchLoadMoreBtn.isConnected){
-        return searchLoadMoreBtn;
+    if(homeLoadMoreBtn){
+        homeLoadMoreBtn.remove();
+        homeLoadMoreBtn = null;
     }
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "load-more";
-    btn.textContent = "Load more";
-    btn.setAttribute("aria-label", "Load more YouTube results");
-    btn.addEventListener("click", loadMoreResults);
-    searchLoadMoreBtn = btn;
-    return btn;
 }
 
 function updateLoadMore(){
     const hasMore = Boolean(searchNextToken) && searchRemoteVideos.length > 0;
     if(hasMore && !(searchLoadMoreBtn && searchLoadMoreBtn.isConnected)){
-        box.after(buildLoadMoreBtn());
+        searchLoadMoreBtn = buildLoadMoreBtn(loadMoreResults, "Load more");
+        box.after(searchLoadMoreBtn);
     }
     else if(!hasMore && searchLoadMoreBtn && searchLoadMoreBtn.isConnected){
         searchLoadMoreBtn.remove();
@@ -548,14 +578,14 @@ function updateLoadMore(){
 }
 
 async function loadMoreResults(){
-    if(searchLoadingMore || !searchNextToken || !currentQuery){
+    if(searchLoadingMore || !searchNextToken || !searchTerm()){
         return;
     }
     const client = ytClient();
     if(!client){
         return;
     }
-    const q = currentQuery;
+    const q = searchTerm();
     const seq = searchSeq;
     const btn = searchLoadMoreBtn;
 
@@ -567,20 +597,23 @@ async function loadMoreResults(){
 
     try{
         const result = await client.search(q, 20, searchNextToken);
-        // Bail if the user typed something new while the page loaded.
-        if(seq !== searchSeq || q !== currentQuery){
+        // Bail if the user typed something new (or clicked a category) while
+        // the page was loading.
+        if(seq !== searchSeq || searchTerm() !== q){
             return;
         }
         const page = result.videos || [];
-        if(page.length){
-            searchRemoteVideos = searchRemoteVideos.concat(page);
-            searchNextToken = result.nextPageToken || "";
-            const localMatches = videos.filter(videoMatches);
-            renderVideoList(searchRemoteVideos.concat(localMatches));
-        }
-        else{
+        const before = searchRemoteVideos.length;
+        const seen = new Set(searchRemoteVideos.map(v => v.id));
+        searchRemoteVideos = searchRemoteVideos.concat(
+            page.filter(v => v && v.id && !seen.has(v.id))
+        );
+        searchNextToken = result.nextPageToken || "";
+        if(searchRemoteVideos.length === before){
+            // This page added no new unique videos — stop paginating.
             searchNextToken = "";
         }
+        renderVideoList(searchRemoteVideos);
         showStatus("");
     }
     catch(e){
@@ -599,39 +632,36 @@ async function loadMoreResults(){
 
 async function doDynamicSearch(){
     const client = ytClient();
-    const q = currentQuery;
+    const term = searchTerm();
     const seq = ++searchSeq;
 
-    // Reset pagination state for this query.
+    // Reset pagination state for this search.
     searchNextToken = "";
     searchRemoteVideos = [];
     hideLoadMore();
 
-    // Cancel any in-flight YouTube API request from a previous keystroke.
+    // Cancel any in-flight YouTube API request from a previous keystroke/chip.
     if(activeSearchController){
         activeSearchController.abort();
         activeSearchController = null;
     }
 
-    // Always show local matches immediately (instant, no network latency).
-    const localMatches = videos.filter(videoMatches);
     if(!client){
-        // Deferred module not loaded yet (e.g. initial ?q= restore runs before
-        // the <script type="module"> executes). Show local matches now, then
-        // re-run once the YouTube module reports ready so remote results appear.
-        renderVideoList(localMatches);
+        // Deferred module not loaded yet. Retry once it reports readiness —
+        // do NOT render local videos meanwhile.
         whenYTReady(() => {
-            if(seq === searchSeq && currentQuery && currentQuery === q){
+            if(seq === searchSeq && searchTerm() === term){
                 doDynamicSearch();
             }
         });
+        showStatus("Searching YouTube...");
         return;
     }
 
     // Require at least 2 characters before hitting the YouTube API.
-    if(q.length < 2){
-        renderVideoList(localMatches);
-        showStatus("");
+    if(term.length < 2){
+        box.replaceChildren();
+        showStatus(currentQuery ? "Type at least 2 characters to search YouTube." : "");
         return;
     }
 
@@ -642,7 +672,7 @@ async function doDynamicSearch(){
     let remote = [];
     let apiError = "";
     try{
-        const result = await client.search(q, 20, "", controller.signal);
+        const result = await client.search(term, 20, "", controller.signal);
         remote = result.videos || [];
         searchNextToken = result.nextPageToken || "";
         apiError = result.error || "";
@@ -659,26 +689,17 @@ async function doDynamicSearch(){
         return; // a newer search superseded this one
     }
 
-    // Compose: remote YouTube results + local matches (dedupe is inherent since
-    // ids are namespaced yt:... vs local ids).
     searchRemoteVideos = remote.slice(0, 30);
-    let combined = searchRemoteVideos.concat(localMatches);
-
-    if(!remote.length && !localMatches.length){
-        showStatus(apiError ? ("Could not search YouTube: " + apiError) : "No videos found for this search.");
-        renderVideoList(combined);
-        updateLoadMore();
-        return;
-    }
-
-    if(!remote.length && localMatches.length){
-        // API unavailable/file failed — show local fallback with a gentle note.
-        showStatus(apiError ? ("YouTube search unavailable (" + apiError + ") — showing local results.") : "");
+    if(!searchRemoteVideos.length){
+        searchNextToken = "";
+        showStatus(apiError
+            ? ("Could not search YouTube: " + apiError)
+            : "No YouTube videos found for this search.");
     }
     else{
         showStatus("");
     }
-    renderVideoList(combined);
+    renderVideoList(searchRemoteVideos);
     updateLoadMore();
 }
 
@@ -775,42 +796,13 @@ makeSideItemInteractive(sideTrending, () => {
     renderCategoryFilter();
     if(trendingMode){
         setSidebarActive("sideTrending");
-        renderVideos();
-        loadTrendingYouTube();
+        loadHomeFeed(true);
     }
     else{
         setSidebarActive("sideHome");
-        renderVideos();
+        loadHomeFeed();
     }
 });
-
-// Trending sidebar: merge the local top-viewed videos with the real YouTube
-// most-popular feed (loaded once per entry into trending mode). Local content
-// always remains — YouTube items are prepended when the API is reachable.
-let trendingFetchSeq = 0;
-async function loadTrendingYouTube(){
-    const client = ytClient();
-    if(!client){
-        whenYTReady(loadTrendingYouTube);
-        return;
-    }
-    const seq = ++trendingFetchSeq;
-    try{
-        const feed = await client.trending(12, true);
-        if(seq !== trendingFetchSeq || !trendingMode){
-            return; // a click left trending mode (or a newer request) — drop stale results
-        }
-        const remote = (feed.videos || []).slice(0, 8);
-        const localCards = Array.from(box.children);
-        box.replaceChildren();
-        remote.forEach(v => { box.appendChild(buildCard(v)); });
-        localCards.forEach(c => { box.appendChild(c); });
-        showStatus("");
-    }
-    catch(e){
-        logHome("warn", "YouTube trending failed, using local ranked videos.", e);
-    }
-}
 
 
 makeSideItemInteractive(sideSubs, () => {

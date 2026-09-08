@@ -321,11 +321,15 @@ async function handleTrending(req, res, params){
 
   const maxResults = Math.min(Math.max(parseInt(params.get("max") || "20", 10) || 20, 1), 50);
   const region = (params.get("region") || "US").toString().toUpperCase().slice(0, 2);
-  const cacheKey = "trending:" + region + ":" + maxResults;
+  const pageToken = (params.get("pageToken") || "").trim();
+  const cacheKey = "trending:" + region + ":" + maxResults + ":" + pageToken;
 
   try{
-    const url = YT_API_BASE + "/videos?part=snippet,contentDetails,statistics&chart=mostPopular" +
+    let url = YT_API_BASE + "/videos?part=snippet,contentDetails,statistics&chart=mostPopular" +
       "&regionCode=" + encodeURIComponent(region) + "&maxResults=" + maxResults;
+    if(pageToken){
+      url += "&pageToken=" + encodeURIComponent(pageToken);
+    }
     const data = await ytFetch(cacheKey, url);
     const { videos } = normalize.normalizeVideosResponse(data);
     return sendJSON(res, 200, { videos, nextPageToken: data.nextPageToken || "" });

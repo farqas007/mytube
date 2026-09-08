@@ -165,12 +165,15 @@ async function search(query, max, pageToken, signal){
   return { videos: videos || [], nextPageToken: nextPageToken || "", error: error || "", ok: ok };
 }
 
-// Official YouTube trending / "most popular" feed.
-async function trending(max, bustCache){
+// Official YouTube trending / "most popular" feed. Preserves nextPageToken (so
+// callers can paginate through the whole feed) and accepts a pageToken to fetch
+// subsequent pages (passed through to the backend proxy).
+async function trending(max, bustCache, pageToken){
   const params = { max: String(max || 20) };
   if(bustCache){ params._t = String(Date.now()); }
-  const { videos, error, ok } = await apiRequest("trending", params);
-  return { videos: videos || [], error: error || "", ok: ok };
+  if(pageToken){ params.pageToken = String(pageToken); }
+  const { videos, error, ok, nextPageToken } = await apiRequest("trending", params);
+  return { videos: videos || [], nextPageToken: nextPageToken || "", error: error || "", ok: ok };
 }
 
 // Fetch a single YouTube video by its source id.
