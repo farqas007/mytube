@@ -1330,6 +1330,13 @@ header input{
     opacity:0.6;
     cursor:default;
 }
+
+/* Infinite scroll sentinel: near-invisible target at the bottom of the home
+   feed that drives automatic page loading via IntersectionObserver. */
+
+#homeScrollSentinel{
+    height:1px;
+}
 /* =========================================================
    MyTube YouTube-style sidebar
    ========================================================= */

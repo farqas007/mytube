@@ -184,6 +184,11 @@ No videos found 😕
 <div id="dynamicStatus" class="no-results" style="display:none;" role="status" aria-live="polite"></div>
 
 
+<!-- Infinite scroll sentinel: sits outside #videoList so renderVideoList()'s
+     replaceChildren() can never delete it. Watch it to load the next home page. -->
+<div id="homeScrollSentinel" aria-hidden="true"></div>
+
+
 </div>
 
 
@@ -405,23 +410,97 @@ function renderMain(){
 let homeSeq = 0;
 let homeNextToken = "";
 let homeVideos = [];
-let homeLoadMoreBtn = null;
 let homeLoadingMore = false;
 
-function homeUpdateLoadMore(){
-    const hasMore = Boolean(homeNextToken) && homeVideos.length > 0;
-    if(hasMore && !homeLoadMoreBtn){
-        homeLoadMoreBtn = buildLoadMoreBtn(loadMoreHome, "Load more");
-        box.after(homeLoadMoreBtn);
+// Infinite scroll: a static sentinel after the video list drives page loads.
+// It lives outside #videoList so renderVideoList()'s replaceChildren() can't
+// delete it, and a single IntersectionObserver (set up once in init()) reacts.
+const homeScrollSentinel = document.getElementById("homeScrollSentinel");
+
+// True only for the default/trending home feed — never for a search query or a
+// selected category chip, which own their own pagination.
+function homeFeedActive(){
+    return !currentQuery && currentCategory === "All";
+}
+
+function homeSentinelNearBottom(){
+    if(!homeScrollSentinel){
+        return false;
     }
-    else if(!hasMore && homeLoadMoreBtn){
-        homeLoadMoreBtn.remove();
-        homeLoadMoreBtn = null;
+    const rect = homeScrollSentinel.getBoundingClientRect();
+    const viewport = window.innerHeight || document.documentElement.clientHeight || 0;
+    // 800px matches the observer's rootMargin so both paths stay in sync.
+    return rect.top <= viewport + 800;
+}
+
+function maybeLoadMoreHome(){
+    if(!homeFeedActive() ||
+       homeLoadingMore ||
+       !homeNextToken ||
+       homeVideos.length === 0){
+        return;
+    }
+    if(!homeSentinelNearBottom()){
+        return; // user is far from the bottom — wait for the next near-bottom check
+    }
+    loadMoreHome();
+}
+
+// Re-check shortly after a render so short pages keep closing the gap toward a
+// filled viewport without ever waiting for a real scroll event.
+function scheduleHomeScrollCheck(){
+    if(window.requestAnimationFrame){
+        window.requestAnimationFrame(maybeLoadMoreHome);
+    }
+    else{
+        setTimeout(maybeLoadMoreHome, 0);
     }
 }
 
+function setupHomeScrollObserver(){
+    if(!homeScrollSentinel || !window.IntersectionObserver){
+        return;
+    }
+    const observer = new IntersectionObserver((entries) => {
+        for(const entry of entries){
+            if(entry.isIntersecting){
+                maybeLoadMoreHome();
+            }
+        }
+    }, { rootMargin: "800px 0px" });
+    observer.observe(homeScrollSentinel);
+}
+
+// Lightweight fallback for browsers without IntersectionObserver: a passive,
+// rAF-throttled scroll listener backed by the same near-bottom check.
+let homeScrollFallbackAttached = false;
+function setupHomeScrollFallback(){
+    if(window.IntersectionObserver || homeScrollFallbackAttached){
+        return;
+    }
+    homeScrollFallbackAttached = true;
+    let ticking = false;
+    const onScroll = () => {
+        if(ticking){
+            return;
+        }
+        ticking = true;
+        const run = () => {
+            ticking = false;
+            maybeLoadMoreHome();
+        };
+        if(window.requestAnimationFrame){
+            window.requestAnimationFrame(run);
+        }
+        else{
+            setTimeout(run, 0);
+        }
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+}
+
 async function loadMoreHome(){
-    if(homeLoadingMore || !homeNextToken){
+    if(homeLoadingMore || !homeNextToken || !homeFeedActive() || homeVideos.length === 0){
         return;
     }
     const client = ytClient();
@@ -429,17 +508,13 @@ async function loadMoreHome(){
         return;
     }
     const seq = homeSeq;
-    const btn = homeLoadMoreBtn;
 
     homeLoadingMore = true;
-    if(btn){
-        btn.disabled = true;
-        btn.textContent = "Loading...";
-    }
+    showStatus("Loading more videos...");
 
     try{
         const feed = await client.trending(12, false, homeNextToken);
-        if(seq !== homeSeq){
+        if(seq !== homeSeq || !homeFeedActive()){
             return;
         }
         const before = homeVideos.length;
@@ -453,21 +528,17 @@ async function loadMoreHome(){
         }
         renderVideoList(homeVideos);
         showStatus("");
+        scheduleHomeScrollCheck();
     }
     catch(e){
-        if(seq !== homeSeq){
+        if(seq !== homeSeq || !homeFeedActive()){
             return;
         }
         logHome("warn", "Home load more failed:", e);
-        showStatus("Could not load more videos. Please try again.");
+        showStatus("Could not load more videos. Keep scrolling to try again.");
     }
     finally{
         homeLoadingMore = false;
-        if(btn){
-            btn.disabled = false;
-            btn.textContent = "Load more";
-        }
-        homeUpdateLoadMore();
     }
 }
 
@@ -475,9 +546,11 @@ async function loadHomeFeed(fresh){
     const client = ytClient();
     const seq = ++homeSeq;
 
-    // Reset pagination state and any stale load-more button.
+    // Reset pagination state; bump searchSeq so an in-flight search request
+    // can't drop results onto the freshly reset home feed.
     homeNextToken = "";
     homeVideos = [];
+    searchSeq++;
     hideLoadMore();
     box.replaceChildren();
 
@@ -510,7 +583,7 @@ async function loadHomeFeed(fresh){
             showStatus("");
         }
         renderVideoList(homeVideos);
-        homeUpdateLoadMore();
+        scheduleHomeScrollCheck();
     }
     catch(e){
         if(seq !== homeSeq){
@@ -519,6 +592,7 @@ async function loadHomeFeed(fresh){
         logHome("warn", "Home feed failed:", e);
         showStatus("Could not load YouTube videos. Please try again.");
         box.replaceChildren();
+        scheduleHomeScrollCheck();
     }
 }
 
@@ -558,10 +632,6 @@ function hideLoadMore(){
     if(searchLoadMoreBtn){
         searchLoadMoreBtn.remove();
         searchLoadMoreBtn = null;
-    }
-    if(homeLoadMoreBtn){
-        homeLoadMoreBtn.remove();
-        homeLoadMoreBtn = null;
     }
 }
 
@@ -634,6 +704,11 @@ async function doDynamicSearch(){
     const client = ytClient();
     const term = searchTerm();
     const seq = ++searchSeq;
+
+    // Leaving the home feed: invalidate any in-flight home page request so it
+    // can't append old home videos onto the new search results.
+    homeSeq++;
+    homeNextToken = "";
 
     // Reset pagination state for this search.
     searchNextToken = "";
@@ -820,6 +895,8 @@ makeSideItemInteractive(sideLibrary, () => {
 (function init(){
     buildCategoryFilter();
     setSidebarActive("sideHome");
+    setupHomeScrollObserver();
+    setupHomeScrollFallback();
     renderMain();
 })();
 

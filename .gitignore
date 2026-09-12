@@ -15,3 +15,6 @@ videos/
 
 # Local backup files
 youtube-server/server.js.backup-*
+
+# Wrangler local state
+.wrangler/
