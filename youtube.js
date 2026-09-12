@@ -161,8 +161,8 @@ async function search(query, max, pageToken, signal){
   if(pageToken){
     params.pageToken = String(pageToken);
   }
-  const { videos, error, ok, nextPageToken } = await apiRequest("search", params, signal);
-  return { videos: videos || [], nextPageToken: nextPageToken || "", error: error || "", ok: ok };
+  const res = await apiRequest("search", params, signal);
+  return { videos: res.videos || [], nextPageToken: res.nextPageToken || "", error: res.error || "", ok: res.ok, status: res.status };
 }
 
 // Official YouTube trending / "most popular" feed. Preserves nextPageToken (so
@@ -172,8 +172,8 @@ async function trending(max, bustCache, pageToken){
   const params = { max: String(max || 20) };
   if(bustCache){ params._t = String(Date.now()); }
   if(pageToken){ params.pageToken = String(pageToken); }
-  const { videos, error, ok, nextPageToken } = await apiRequest("trending", params);
-  return { videos: videos || [], nextPageToken: nextPageToken || "", error: error || "", ok: ok };
+  const res = await apiRequest("trending", params);
+  return { videos: res.videos || [], nextPageToken: res.nextPageToken || "", error: res.error || "", ok: res.ok, status: res.status };
 }
 
 // Fetch a single YouTube video by its source id.

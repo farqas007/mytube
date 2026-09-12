@@ -189,6 +189,12 @@ No videos found 😕
 <div id="homeScrollSentinel" aria-hidden="true"></div>
 
 
+<!-- Search-results infinite scroll sentinel: also outside #videoList, so
+     renderVideoList()'s replaceChildren() can never delete it. Watched by the
+     same single IntersectionObserver to load the next search page. -->
+<div id="searchScrollSentinel" aria-hidden="true"></div>
+
+
 </div>
 
 
@@ -416,6 +422,7 @@ let homeLoadingMore = false;
 // It lives outside #videoList so renderVideoList()'s replaceChildren() can't
 // delete it, and a single IntersectionObserver (set up once in init()) reacts.
 const homeScrollSentinel = document.getElementById("homeScrollSentinel");
+const searchScrollSentinel = document.getElementById("searchScrollSentinel");
 
 // True only for the default/trending home feed — never for a search query or a
 // selected category chip, which own their own pagination.
@@ -436,8 +443,7 @@ function homeSentinelNearBottom(){
 function maybeLoadMoreHome(){
     if(!homeFeedActive() ||
        homeLoadingMore ||
-       !homeNextToken ||
-       homeVideos.length === 0){
+       !homeNextToken){
         return;
     }
     if(!homeSentinelNearBottom()){
@@ -457,28 +463,43 @@ function scheduleHomeScrollCheck(){
     }
 }
 
-function setupHomeScrollObserver(){
-    if(!homeScrollSentinel || !window.IntersectionObserver){
+// ONE stable IntersectionObserver drives BOTH scroll sentinels (home + search).
+// Both sentinels live outside #videoList, so renderVideoList()'s
+// replaceChildren() can never detach them and the observer never needs to be
+// recreated after a render. The guards inside each loader route the event.
+function setupScrollObserver(){
+    if(!window.IntersectionObserver){
         return;
     }
     const observer = new IntersectionObserver((entries) => {
         for(const entry of entries){
-            if(entry.isIntersecting){
+            if(!entry.isIntersecting){
+                continue;
+            }
+            if(entry.target === searchScrollSentinel){
+                maybeLoadMoreSearch();
+            }
+            else{
                 maybeLoadMoreHome();
             }
         }
     }, { rootMargin: "800px 0px" });
-    observer.observe(homeScrollSentinel);
+    if(homeScrollSentinel){
+        observer.observe(homeScrollSentinel);
+    }
+    if(searchScrollSentinel){
+        observer.observe(searchScrollSentinel);
+    }
 }
 
-// Lightweight fallback for browsers without IntersectionObserver: a passive,
-// rAF-throttled scroll listener backed by the same near-bottom check.
-let homeScrollFallbackAttached = false;
-function setupHomeScrollFallback(){
-    if(window.IntersectionObserver || homeScrollFallbackAttached){
+// ONE shared, rAF-throttled scroll fallback for browsers without
+// IntersectionObserver. It drives both feeds with the same near-bottom checks.
+let scrollFallbackAttached = false;
+function setupScrollFallback(){
+    if(window.IntersectionObserver || scrollFallbackAttached){
         return;
     }
-    homeScrollFallbackAttached = true;
+    scrollFallbackAttached = true;
     let ticking = false;
     const onScroll = () => {
         if(ticking){
@@ -488,6 +509,7 @@ function setupHomeScrollFallback(){
         const run = () => {
             ticking = false;
             maybeLoadMoreHome();
+            maybeLoadMoreSearch();
         };
         if(window.requestAnimationFrame){
             window.requestAnimationFrame(run);
@@ -500,7 +522,7 @@ function setupHomeScrollFallback(){
 }
 
 async function loadMoreHome(){
-    if(homeLoadingMore || !homeNextToken || !homeFeedActive() || homeVideos.length === 0){
+    if(homeLoadingMore || !homeNextToken || !homeFeedActive()){
         return;
     }
     const client = ytClient();
@@ -517,6 +539,22 @@ async function loadMoreHome(){
         if(seq !== homeSeq || !homeFeedActive()){
             return;
         }
+
+        // A failing page request (quota, rate limit, 5xx) resolves as a normal
+        // object here instead of throwing. Never let it wipe the pagination
+        // token — keep it alive so a later near-bottom check can retry. The
+        // token is only cleared for a 400 response (invalid/expired pageToken).
+        if(feed.ok === false && feed.error){
+            if(feed.status === 400){
+                homeNextToken = "";
+                showStatus("");
+            }
+            else{
+                showStatus("Could not load more videos. Keep scrolling to try again.");
+            }
+            return;
+        }
+
         const before = homeVideos.length;
         const seen = new Set(homeVideos.map(v => v.id));
         const page = (feed.videos || []).filter(v => v && v.id && !seen.has(v.id));
@@ -551,7 +589,6 @@ async function loadHomeFeed(fresh){
     homeNextToken = "";
     homeVideos = [];
     searchSeq++;
-    hideLoadMore();
     box.replaceChildren();
 
     if(!client){
@@ -605,7 +642,6 @@ let searchSeq = 0;
 let activeSearchController = null;
 let searchNextToken = "";
 let searchRemoteVideos = [];
-let searchLoadMoreBtn = null;
 let searchLoadingMore = false;
 
 // The effective search term: the typed query, or the selected category name
@@ -615,39 +651,42 @@ function searchTerm(){
     return currentQuery || (currentCategory !== "All" ? currentCategory : "");
 }
 
-// Shared pagination button builder. Search and home feeds keep their own button
-// instance + handler; hideLoadMore removes whatever is showing so switching
-// views never leaves a stale/competing "Load more" behind.
-function buildLoadMoreBtn(onClick, label){
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "load-more";
-    btn.textContent = label || "Load more";
-    btn.setAttribute("aria-label", "Load more YouTube videos");
-    btn.addEventListener("click", onClick);
-    return btn;
+function searchSentinelNearBottom(){
+    if(!searchScrollSentinel){
+        return false;
+    }
+    const rect = searchScrollSentinel.getBoundingClientRect();
+    const viewport = window.innerHeight || document.documentElement.clientHeight || 0;
+    // 800px matches the observer's rootMargin so both paths stay in sync.
+    return rect.top <= viewport + 800;
 }
 
-function hideLoadMore(){
-    if(searchLoadMoreBtn){
-        searchLoadMoreBtn.remove();
-        searchLoadMoreBtn = null;
+function maybeLoadMoreSearch(){
+    if(!searchTerm() || searchLoadingMore || !searchNextToken){
+        return;
+    }
+    if(!searchSentinelNearBottom()){
+        return; // far from the bottom — wait for the next near-bottom check
+    }
+    loadMoreSearchResults();
+}
+
+// Re-check shortly after a render so short result pages keep closing the gap
+// toward the viewport without waiting for a real scroll event.
+function scheduleSearchScrollCheck(){
+    if(window.requestAnimationFrame){
+        window.requestAnimationFrame(maybeLoadMoreSearch);
+    }
+    else{
+        setTimeout(maybeLoadMoreSearch, 0);
     }
 }
 
-function updateLoadMore(){
-    const hasMore = Boolean(searchNextToken) && searchRemoteVideos.length > 0;
-    if(hasMore && !(searchLoadMoreBtn && searchLoadMoreBtn.isConnected)){
-        searchLoadMoreBtn = buildLoadMoreBtn(loadMoreResults, "Load more");
-        box.after(searchLoadMoreBtn);
-    }
-    else if(!hasMore && searchLoadMoreBtn && searchLoadMoreBtn.isConnected){
-        searchLoadMoreBtn.remove();
-        searchLoadMoreBtn = null;
-    }
-}
-
-async function loadMoreResults(){
+// Load the next search page automatically as the sentinel approaches the
+// bottom. Preserves the current query, appends (deduplicated) results, carries
+// nextPageToken forward, and stays out of the way of the manual "Load more"
+// button that was removed from the search results UI.
+async function loadMoreSearchResults(){
     if(searchLoadingMore || !searchNextToken || !searchTerm()){
         return;
     }
@@ -657,19 +696,28 @@ async function loadMoreResults(){
     }
     const q = searchTerm();
     const seq = searchSeq;
-    const btn = searchLoadMoreBtn;
 
     searchLoadingMore = true;
-    if(btn){
-        btn.disabled = true;
-        btn.textContent = "Loading...";
-    }
+    showStatus("Loading more results...");
 
     try{
         const result = await client.search(q, 20, searchNextToken);
         // Bail if the user typed something new (or clicked a category) while
         // the page was loading.
         if(seq !== searchSeq || searchTerm() !== q){
+            return;
+        }
+        // A failing page request (quota, rate limit, 5xx) resolves as a normal
+        // object here instead of throwing. Keep the token so a later near-bottom
+        // check can retry; only a 400 (invalid/expired pageToken) ends search.
+        if(result.ok === false && result.error){
+            if(result.status === 400){
+                searchNextToken = "";
+                showStatus("");
+            }
+            else{
+                showStatus("Could not load more results. Keep scrolling to try again.");
+            }
             return;
         }
         const page = result.videos || [];
@@ -685,18 +733,14 @@ async function loadMoreResults(){
         }
         renderVideoList(searchRemoteVideos);
         showStatus("");
+        scheduleSearchScrollCheck();
     }
     catch(e){
         logHome("warn", "Load more failed:", e);
-        showStatus("Could not load more results. Please try again.");
+        showStatus("Could not load more results. Keep scrolling to try again.");
     }
     finally{
         searchLoadingMore = false;
-        if(btn){
-            btn.disabled = false;
-            btn.textContent = "Load more";
-        }
-        updateLoadMore();
     }
 }
 
@@ -713,7 +757,6 @@ async function doDynamicSearch(){
     // Reset pagination state for this search.
     searchNextToken = "";
     searchRemoteVideos = [];
-    hideLoadMore();
 
     // Cancel any in-flight YouTube API request from a previous keystroke/chip.
     if(activeSearchController){
@@ -775,7 +818,7 @@ async function doDynamicSearch(){
         showStatus("");
     }
     renderVideoList(searchRemoteVideos);
-    updateLoadMore();
+    scheduleSearchScrollCheck();
 }
 
 function logHome(level, msg, err){
@@ -895,8 +938,8 @@ makeSideItemInteractive(sideLibrary, () => {
 (function init(){
     buildCategoryFilter();
     setSidebarActive("sideHome");
-    setupHomeScrollObserver();
-    setupHomeScrollFallback();
+    setupScrollObserver();
+    setupScrollFallback();
     renderMain();
 })();
 

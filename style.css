@@ -1337,6 +1337,13 @@ header input{
 #homeScrollSentinel{
     height:1px;
 }
+
+/* Search-results infinite scroll sentinel: same invisible target at the bottom
+   of the search/category results, watched by the same IntersectionObserver. */
+
+#searchScrollSentinel{
+    height:1px;
+}
 /* =========================================================
    MyTube YouTube-style sidebar
    ========================================================= */
