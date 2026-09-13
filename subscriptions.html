@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Subscriptions - MyTube</title>
+
+<link rel="icon" type="image/png" href="mytube-icon.png">
+
+<link rel="stylesheet" href="style.css">
+
+<!-- Shared video dataset (single source of truth) -->
+<script src="videos.js"></script>
+
+</head>
+
+
+<body>
+
+
+<header>
+
+<div class="logo">
+MyTube 🔴
+</div>
+
+
+<input 
+id="search"
+placeholder="Search videos..."
+aria-label="Search videos"
+>
+
+
+<button type="button" class="voice-search-btn" aria-label="Search with your voice" aria-pressed="false" title="Search with your voice">
+<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"></path><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"></path></svg>
+</button>
+
+<button type="button" onclick="goHome()">
+Home
+</button>
+
+<button id="loginBtn" type="button">
+Login
+</button>
+
+<button id="logoutBtn" type="button" style="display:none;">
+Logout
+</button>
+
+</header>
+
+
+<div class="watch-container profile-container">
+
+
+<!-- LOGGED OUT STATE -->
+<div id="subsLoggedOut" class="state-panel" style="display:none;">
+<h2>Subscriptions</h2>
+<p>Log in to see your subscribed channels and their latest videos.</p>
+<button type="button" class="back-home" onclick="goLogin()">Log In</button>
+</div>
+
+
+<!-- LOADING STATE -->
+<div id="subsLoading" class="state-panel" style="display:none;">
+<div class="spinner"></div>
+<p>Loading subscriptions...</p>
+</div>
+
+
+<!-- EMPTY STATE -->
+<div id="subsEmpty" class="state-panel" style="display:none;">
+<h2>No Subscriptions Yet</h2>
+<p>Subscribe to channels on the watch page to see their latest videos here.</p>
+<button type="button" class="back-home" onclick="goHome()">Browse Videos</button>
+</div>
+
+
+<!-- ERROR STATE -->
+<div id="subsError" class="state-panel" style="display:none;">
+<h2>Something went wrong</h2>
+<p id="subsErrorText">Could not load subscriptions.</p>
+<button type="button" class="back-home" onclick="goHome()">Back to Home</button>
+</div>
+
+
+<!-- CONTENT -->
+<div id="subsContent" class="profile-content" style="display:none;">
+
+<div class="subs-toolbar">
+<h2>Your Subscriptions</h2>
+<button id="subsRefreshBtn" type="button" class="subs-refresh">
+Refresh
+</button>
+</div>
+
+<div id="channelSections" class="channel-sections"></div>
+
+</div>
+
+
+</div>
+
+
+<script>
+
+function goHome(){
+    window.location.href = "index.html";
+}
+
+function goLogin(){
+    window.location.href = "login.html";
+}
+
+function searchVideo(){
+    const raw = document.getElementById("search").value;
+    const query = raw.trim();
+    if(!query) return;
+    window.location.href = "index.html?q=" + encodeURIComponent(query);
+}
+
+document.getElementById("search")?.addEventListener("keydown",(e)=>{
+    if(e.key === "Enter"){
+        searchVideo();
+    }
+});
+
+</script>
+
+<script type="module" src="auth.js"></script>
+<script type="module" src="subscriptions.js"></script>
+
+<!-- Voice search (progressive enhancement; no-op where Speech Recognition is unsupported) -->
+<script src="voice-search.js"></script>
+
+
+</body>
+
+</html>

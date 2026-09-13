@@ -1,0 +1,20 @@
+# Secrets — never commit or serve these
+.env
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+videos/
+
+# Local backup files
+youtube-server/server.js.backup-*
+
+# Wrangler local state
+.wrangler/

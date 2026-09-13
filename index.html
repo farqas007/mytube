@@ -1,0 +1,1135 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<meta name="description" content="MyTube is a free video streaming site where you can search and watch trending videos, browse by category, subscribe to channels, and save favorites to your library.">
+<meta name="robots" content="index, follow">
+<meta name="google-site-verification" content="MkGNBfCywvS87WFk9ub7DvdkXGkkw2WA1kXQAc6QBvY" />
+
+<link rel="canonical" href="https://mytube.farqas007.workers.dev/">
+
+<meta property="og:site_name" content="MyTube">
+<meta property="og:type" content="website">
+<meta property="og:title" content="MyTube">
+<meta property="og:description" content="MyTube is a free video streaming site where you can search and watch trending videos, browse by category, subscribe to channels, and save favorites to your library.">
+<meta property="og:url" content="https://mytube.farqas007.workers.dev/">
+
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="MyTube">
+<meta name="twitter:description" content="MyTube is a free video streaming site where you can search and watch trending videos, browse by category, subscribe to channels, and save favorites to your library.">
+
+<title>MyTube</title>
+<link rel="icon" type="image/png" href="mytube-icon.png">
+
+<link rel="stylesheet" href="style.css">
+
+<!-- Shared video dataset (single source of truth) -->
+<script src="videos.js"></script>
+
+</head>
+
+
+<body>
+
+
+<header>
+
+
+<div class="logo">
+MyTube 🔴
+</div>
+
+
+
+<input 
+id="search"
+placeholder="Search videos..."
+aria-label="Search videos"
+role="searchbox"
+>
+
+
+<button type="button" class="voice-search-btn" aria-label="Search with your voice" aria-pressed="false" title="Search with your voice">
+<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"></path><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"></path></svg>
+</button>
+
+
+
+<button onclick="searchVideo()" aria-label="Search">
+Search
+</button>
+
+
+
+<button id="loginBtn">
+Login
+</button>
+
+
+
+<button id="logoutBtn" style="display:none;">
+Logout
+</button>
+
+
+</header>
+
+
+
+
+
+<div class="container">
+
+
+
+<aside class="sidebar" aria-label="Main navigation">
+
+    <nav class="sidebar-nav">
+
+        <p id="sideHome" class="sidebar-item active">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3 10.5 12 3l9 7.5"></path>
+                <path d="M5.5 9.5V21h13V9.5"></path>
+                <path d="M9.5 21v-6h5v6"></path>
+            </svg>
+            <span>Home</span>
+        </p>
+
+        <p id="sideTrending" class="sidebar-item">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M13.5 2.5c.5 4-1.2 5.8-3.2 7.5-1.4 1.2-2.8 2.4-2.8 5.1A4.5 4.5 0 0 0 12 19.5a4.5 4.5 0 0 0 4.5-4.5c0-2.2-1.1-4-2.5-5.5.1 2-1 3.1-2 3.8.2-2.7 1.8-5.2 1.5-10.8Z"></path>
+                <path d="M8.5 19.5A7 7 0 0 1 5 13c0-2.6 1.2-4.5 3.2-6.4"></path>
+            </svg>
+            <span>Trending</span>
+        </p>
+
+        <p id="sideSubs" class="sidebar-item sidebar-section-link">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="3" y="5" width="18" height="14" rx="2"></rect>
+                <path d="m10 9 5 3-5 3V9Z"></path>
+            </svg>
+            <span>Subscriptions</span>
+            <span class="sidebar-chevron">›</span>
+        </p>
+
+        <div id="sidebarSubscriptionsList" class="sidebar-subscriptions-list"></div>
+
+        <button id="sidebarShowMore" class="sidebar-show-more" type="button" hidden>
+            <span class="sidebar-show-more-icon">⌄</span>
+            <span>Show more</span>
+        </button>
+
+        <div class="sidebar-divider"></div>
+
+        <p class="sidebar-section-title">
+            <span>You</span>
+            <span class="sidebar-chevron">›</span>
+        </p>
+
+        <p id="sideLibrary" class="sidebar-item">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v17H6.5A2.5 2.5 0 0 0 4 22V5.5Z"></path>
+                <path d="M4 5.5V19a3 3 0 0 1 3-3h13"></path>
+            </svg>
+            <span>Library</span>
+        </p>
+
+        <p class="sidebar-item">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M6 4h12v16H6z"></path>
+                <path d="M9 8h6"></path>
+                <path d="M9 12h6"></path>
+                <path d="M9 16h4"></path>
+            </svg>
+            <span>History</span>
+        </p>
+
+        <p class="sidebar-item">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="4" y="4" width="16" height="16" rx="2"></rect>
+                <path d="m10 9 5 3-5 3V9Z"></path>
+            </svg>
+            <span>Your videos</span>
+        </p>
+
+        <p class="sidebar-item">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 4v10"></path>
+                <path d="m8 11 4 4 4-4"></path>
+                <path d="M5 20h14"></path>
+            </svg>
+            <span>Watch later</span>
+        </p>
+
+        <p class="sidebar-item">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9L12 3Z"></path>
+            </svg>
+            <span>Liked videos</span>
+        </p>
+
+    </nav>
+
+</aside>
+
+
+
+
+
+<div class="home-content">
+
+
+<div id="categoryFilter" class="category-filter" role="group" aria-label="Filter by category"></div>
+
+
+<main id="videoList">
+
+</main>
+
+
+<div id="noResults" class="no-results" style="display:none;">
+No videos found 😕
+</div>
+
+
+<div id="dynamicStatus" class="no-results" style="display:none;" role="status" aria-live="polite"></div>
+
+
+<!-- Infinite scroll sentinel: sits outside #videoList so renderVideoList()'s
+     replaceChildren() can never delete it. Watch it to load the next home page. -->
+<div id="homeScrollSentinel" aria-hidden="true"></div>
+
+
+<!-- Search-results infinite scroll sentinel: also outside #videoList, so
+     renderVideoList()'s replaceChildren() can never delete it. Watched by the
+     same single IntersectionObserver to load the next search page. -->
+<div id="searchScrollSentinel" aria-hidden="true"></div>
+
+
+</div>
+
+
+</div>
+
+
+
+
+
+<script>
+
+const categories = window.MyTubeCategories || [];
+
+const box = document.getElementById("videoList");
+const noResultsEl = document.getElementById("noResults");
+const searchInput = document.getElementById("search");
+const filterBar = document.getElementById("categoryFilter");
+
+
+// ================= STATE =================
+
+// currentQuery / currentCategory / trendingMode together define the visible set.
+let currentQuery = "";
+let currentCategory = "All";
+let trendingMode = false;
+
+
+function openVideo(id){
+    window.location.href = "watch.html?id=" + id;
+}
+
+
+// ================= RENDER =================
+
+function buildCard(v){
+    const card = document.createElement("div");
+    card.className = "card";
+    card.setAttribute("role", "link");
+    card.setAttribute("tabindex", "0");
+    card.setAttribute("aria-label", "Watch " + v.title);
+
+    const open = () => openVideo(v.id);
+    card.addEventListener("click", open);
+
+    // Keyboard activation: Enter or Space opens the video.
+    card.addEventListener("keydown", (e) => {
+        if(e.key === "Enter" || e.key === " "){
+            e.preventDefault();
+            open();
+        }
+    });
+
+    const thumb = document.createElement("div");
+    thumb.className = "thumb";
+
+    const img = document.createElement("img");
+    img.src = v.thumb;
+    img.alt = v.title;
+
+    const badge = document.createElement("span");
+    badge.textContent = v.time;
+
+    thumb.appendChild(img);
+    thumb.appendChild(badge);
+
+    const title = document.createElement("h3");
+    title.textContent = v.title;
+
+    const meta = document.createElement("p");
+    meta.textContent = cardMeta(v);
+
+    card.appendChild(thumb);
+    card.appendChild(title);
+    card.appendChild(meta);
+
+    return card;
+}
+
+
+// ================= CATEGORY FILTER =================
+
+function buildCategoryFilter(){
+    if(!filterBar){
+        return;
+    }
+
+    const options = ["All"].concat(categories);
+
+    options.forEach(cat => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "category-chip" + (cat === currentCategory ? " active" : "");
+        btn.textContent = cat;
+        btn.setAttribute("aria-pressed", cat === currentCategory ? "true" : "false");
+        btn.addEventListener("click", () => {
+            currentCategory = cat;
+            renderCategoryFilter();
+            renderMain();
+        });
+        filterBar.appendChild(btn);
+    });
+}
+
+
+function renderCategoryFilter(){
+    if(!filterBar){
+        return;
+    }
+    [...filterBar.children].forEach(child => {
+        const active = child.textContent === currentCategory;
+        child.classList.toggle("active", active);
+        child.setAttribute("aria-pressed", active ? "true" : "false");
+    });
+}
+
+
+// ================= SEARCH =================
+
+function searchVideo(){
+    // Voice search (voice-search.js) and the search button route through this
+    // same pipeline, which renders YouTube-only results (never local videos).
+    currentQuery = (searchInput ? searchInput.value : "").trim().toLowerCase();
+    renderMain();
+}
+
+
+// Lightweight debounce so typing doesn't re-render on every keystroke,
+// while keeping Enter/submit immediate and reliable.
+let searchTimer = null;
+function scheduleSearch(){
+    if(searchTimer){
+        clearTimeout(searchTimer);
+    }
+    searchTimer = setTimeout(searchVideo, 800);
+}
+
+
+if(searchInput){
+    searchInput.addEventListener("input", scheduleSearch);
+    searchInput.addEventListener("keydown", (e) => {
+        if(e.key === "Enter"){
+            e.preventDefault();
+            searchVideo();
+        }
+    });
+}
+
+
+// ================= DYNAMIC DISCOVERY (Phase 7) =================
+// YouTube results are requested through the backend proxy (youtube.js). If the
+// backend is unreachable / the API key is missing / quota is exceeded, we fall
+// back to the existing local videos. Dynamic results are marked type "youtube"
+// and their id is "yt:<videoId>" so the watch page knows to use the embed.
+
+const dynamicStatus = document.getElementById("dynamicStatus");
+
+function ytClient(){
+    // Exposed by the youtube.js module loaded at the end of this page.
+    return window.MyTubeYouTube || null;
+}
+
+// Run fn immediately if the YouTube module is ready, otherwise once the
+// deferred module script reports readiness. The module is loaded with
+// type="module" (always deferred), so the initial render below may run
+// before window.MyTubeYouTube exists — this lets us retry transparently
+// instead of silently falling back to local-only results.
+function whenYTReady(fn){
+    if(ytClient()){
+        fn();
+        return;
+    }
+    window.addEventListener("mytube-yt-ready", fn, { once: true });
+}
+
+function showStatus(text){
+    if(dynamicStatus){
+        dynamicStatus.style.display = text ? "block" : "none";
+        dynamicStatus.textContent = text || "";
+        dynamicStatus.setAttribute("aria-busy", text ? "true" : "false");
+    }
+}
+
+// Render a list of videos (local and/or youtube) into the grid.
+function renderVideoList(list){
+    box.replaceChildren();
+    list.forEach(v => {
+        box.appendChild(buildCard(v));
+    });
+    const activeFilter = Boolean(currentQuery) || currentCategory !== "All";
+    if(noResultsEl){
+        noResultsEl.style.display = (activeFilter && list.length === 0) ? "block" : "none";
+    }
+}
+
+// Build the card's meta text once (works for local and youtube cards).
+function cardMeta(v){
+    const parts = [v.channel];
+    if(v.views){
+        parts.push(v.views);
+    }
+    return parts.join(" • ");
+}
+
+// Determine which render path to use:
+//  - a query (or a selected category chip) triggers a YouTube-only search;
+//  - the plain homepage view renders the paginated YouTube home feed.
+function renderMain(){
+    if(currentQuery || currentCategory !== "All"){
+        doDynamicSearch();
+        return;
+    }
+    loadHomeFeed();
+}
+
+
+// Homepage feed: the default view renders ONLY the YouTube "most popular" feed.
+// Local videos are never rendered here — not as a base grid and not as an
+// API-failure fallback. Failures surface a user-facing status message instead.
+let homeSeq = 0;
+let homeNextToken = "";
+let homeVideos = [];
+let homeLoadingMore = false;
+
+// Infinite scroll: a static sentinel after the video list drives page loads.
+// It lives outside #videoList so renderVideoList()'s replaceChildren() can't
+// delete it, and a single IntersectionObserver (set up once in init()) reacts.
+const homeScrollSentinel = document.getElementById("homeScrollSentinel");
+const searchScrollSentinel = document.getElementById("searchScrollSentinel");
+
+// True only for the default/trending home feed — never for a search query or a
+// selected category chip, which own their own pagination.
+function homeFeedActive(){
+    return !currentQuery && currentCategory === "All";
+}
+
+function homeSentinelNearBottom(){
+    if(!homeScrollSentinel){
+        return false;
+    }
+    const rect = homeScrollSentinel.getBoundingClientRect();
+    const viewport = window.innerHeight || document.documentElement.clientHeight || 0;
+    // 800px matches the observer's rootMargin so both paths stay in sync.
+    return rect.top <= viewport + 800;
+}
+
+function maybeLoadMoreHome(){
+    if(!homeFeedActive() ||
+       homeLoadingMore ||
+       !homeNextToken){
+        return;
+    }
+    if(!homeSentinelNearBottom()){
+        return; // user is far from the bottom — wait for the next near-bottom check
+    }
+    loadMoreHome();
+}
+
+// Re-check shortly after a render so short pages keep closing the gap toward a
+// filled viewport without ever waiting for a real scroll event.
+function scheduleHomeScrollCheck(){
+    if(window.requestAnimationFrame){
+        window.requestAnimationFrame(maybeLoadMoreHome);
+    }
+    else{
+        setTimeout(maybeLoadMoreHome, 0);
+    }
+}
+
+// ONE stable IntersectionObserver drives BOTH scroll sentinels (home + search).
+// Both sentinels live outside #videoList, so renderVideoList()'s
+// replaceChildren() can never detach them and the observer never needs to be
+// recreated after a render. The guards inside each loader route the event.
+function setupScrollObserver(){
+    if(!window.IntersectionObserver){
+        return;
+    }
+    const observer = new IntersectionObserver((entries) => {
+        for(const entry of entries){
+            if(!entry.isIntersecting){
+                continue;
+            }
+            if(entry.target === searchScrollSentinel){
+                maybeLoadMoreSearch();
+            }
+            else{
+                maybeLoadMoreHome();
+            }
+        }
+    }, { rootMargin: "800px 0px" });
+    if(homeScrollSentinel){
+        observer.observe(homeScrollSentinel);
+    }
+    if(searchScrollSentinel){
+        observer.observe(searchScrollSentinel);
+    }
+}
+
+// ONE shared, rAF-throttled scroll fallback for browsers without
+// IntersectionObserver. It drives both feeds with the same near-bottom checks.
+let scrollFallbackAttached = false;
+function setupScrollFallback(){
+    if(window.IntersectionObserver || scrollFallbackAttached){
+        return;
+    }
+    scrollFallbackAttached = true;
+    let ticking = false;
+    const onScroll = () => {
+        if(ticking){
+            return;
+        }
+        ticking = true;
+        const run = () => {
+            ticking = false;
+            maybeLoadMoreHome();
+            maybeLoadMoreSearch();
+        };
+        if(window.requestAnimationFrame){
+            window.requestAnimationFrame(run);
+        }
+        else{
+            setTimeout(run, 0);
+        }
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+}
+
+async function loadMoreHome(){
+    if(homeLoadingMore || !homeNextToken || !homeFeedActive()){
+        return;
+    }
+    const client = ytClient();
+    if(!client){
+        return;
+    }
+    const seq = homeSeq;
+
+    homeLoadingMore = true;
+    showStatus("Loading more videos...");
+
+    try{
+        const feed = await client.trending(12, false, homeNextToken);
+        if(seq !== homeSeq || !homeFeedActive()){
+            return;
+        }
+
+        // A failing page request (quota, rate limit, 5xx) resolves as a normal
+        // object here instead of throwing. Never let it wipe the pagination
+        // token — keep it alive so a later near-bottom check can retry. The
+        // token is only cleared for a 400 response (invalid/expired pageToken).
+        if(feed.ok === false && feed.error){
+            if(feed.status === 400){
+                homeNextToken = "";
+                showStatus("");
+            }
+            else{
+                showStatus("Could not load more videos. Keep scrolling to try again.");
+            }
+            return;
+        }
+
+        const before = homeVideos.length;
+        const seen = new Set(homeVideos.map(v => v.id));
+        const page = (feed.videos || []).filter(v => v && v.id && !seen.has(v.id));
+        homeVideos = homeVideos.concat(page);
+        homeNextToken = feed.nextPageToken || "";
+        if(homeVideos.length === before){
+            // The next page contained no new unique videos — stop paginating.
+            homeNextToken = "";
+        }
+        renderVideoList(homeVideos);
+        showStatus("");
+        scheduleHomeScrollCheck();
+    }
+    catch(e){
+        if(seq !== homeSeq || !homeFeedActive()){
+            return;
+        }
+        logHome("warn", "Home load more failed:", e);
+        showStatus("Could not load more videos. Keep scrolling to try again.");
+    }
+    finally{
+        homeLoadingMore = false;
+    }
+}
+
+async function loadHomeFeed(fresh){
+    const client = ytClient();
+    const seq = ++homeSeq;
+
+    // Reset pagination state; bump searchSeq so an in-flight search request
+    // can't drop results onto the freshly reset home feed.
+    homeNextToken = "";
+    homeVideos = [];
+    searchSeq++;
+    box.replaceChildren();
+
+    if(!client){
+        // The YouTube module is deferred (type="module"), so it may not be ready
+        // yet — retry once it reports readiness.
+        whenYTReady(() => {
+            if(seq === homeSeq){
+                loadHomeFeed(fresh);
+            }
+        });
+        showStatus("Loading YouTube videos...");
+        return;
+    }
+
+    showStatus("Loading YouTube videos...");
+    try{
+        const feed = await client.trending(12, Boolean(fresh));
+        if(seq !== homeSeq){
+            return;
+        }
+        homeVideos = (feed.videos || []).filter(v => v && v.id);
+        homeNextToken = feed.nextPageToken || "";
+        if(!homeVideos.length){
+            showStatus(feed.error
+                ? ("Could not load YouTube videos: " + feed.error)
+                : "No YouTube videos available right now.");
+        }
+        else{
+            showStatus("");
+        }
+        renderVideoList(homeVideos);
+        scheduleHomeScrollCheck();
+    }
+    catch(e){
+        if(seq !== homeSeq){
+            return;
+        }
+        logHome("warn", "Home feed failed:", e);
+        showStatus("Could not load YouTube videos. Please try again.");
+        box.replaceChildren();
+        scheduleHomeScrollCheck();
+    }
+}
+
+
+// Perform a dynamic YouTube search for the current query (or, when a category
+// chip is active with no query, the category name) and render the results.
+// Results are YouTube-only — local videos never appear here, even when the
+// YouTube API is unreachable.
+let searchSeq = 0;
+let activeSearchController = null;
+let searchNextToken = "";
+let searchRemoteVideos = [];
+let searchLoadingMore = false;
+
+// The effective search term: the typed query, or the selected category name
+// when browsing a category chip without a query. "" on the plain homepage view
+// (which renders the home feed instead).
+function searchTerm(){
+    return currentQuery || (currentCategory !== "All" ? currentCategory : "");
+}
+
+function searchSentinelNearBottom(){
+    if(!searchScrollSentinel){
+        return false;
+    }
+    const rect = searchScrollSentinel.getBoundingClientRect();
+    const viewport = window.innerHeight || document.documentElement.clientHeight || 0;
+    // 800px matches the observer's rootMargin so both paths stay in sync.
+    return rect.top <= viewport + 800;
+}
+
+function maybeLoadMoreSearch(){
+    if(!searchTerm() || searchLoadingMore || !searchNextToken){
+        return;
+    }
+    if(!searchSentinelNearBottom()){
+        return; // far from the bottom — wait for the next near-bottom check
+    }
+    loadMoreSearchResults();
+}
+
+// Re-check shortly after a render so short result pages keep closing the gap
+// toward the viewport without waiting for a real scroll event.
+function scheduleSearchScrollCheck(){
+    if(window.requestAnimationFrame){
+        window.requestAnimationFrame(maybeLoadMoreSearch);
+    }
+    else{
+        setTimeout(maybeLoadMoreSearch, 0);
+    }
+}
+
+// Load the next search page automatically as the sentinel approaches the
+// bottom. Preserves the current query, appends (deduplicated) results, carries
+// nextPageToken forward, and stays out of the way of the manual "Load more"
+// button that was removed from the search results UI.
+async function loadMoreSearchResults(){
+    if(searchLoadingMore || !searchNextToken || !searchTerm()){
+        return;
+    }
+    const client = ytClient();
+    if(!client){
+        return;
+    }
+    const q = searchTerm();
+    const seq = searchSeq;
+
+    searchLoadingMore = true;
+    showStatus("Loading more results...");
+
+    try{
+        const result = await client.search(q, 20, searchNextToken);
+        // Bail if the user typed something new (or clicked a category) while
+        // the page was loading.
+        if(seq !== searchSeq || searchTerm() !== q){
+            return;
+        }
+        // A failing page request (quota, rate limit, 5xx) resolves as a normal
+        // object here instead of throwing. Keep the token so a later near-bottom
+        // check can retry; only a 400 (invalid/expired pageToken) ends search.
+        if(result.ok === false && result.error){
+            if(result.status === 400){
+                searchNextToken = "";
+                showStatus("");
+            }
+            else{
+                showStatus("Could not load more results. Keep scrolling to try again.");
+            }
+            return;
+        }
+        const page = result.videos || [];
+        const before = searchRemoteVideos.length;
+        const seen = new Set(searchRemoteVideos.map(v => v.id));
+        searchRemoteVideos = searchRemoteVideos.concat(
+            page.filter(v => v && v.id && !seen.has(v.id))
+        );
+        searchNextToken = result.nextPageToken || "";
+        if(searchRemoteVideos.length === before){
+            // This page added no new unique videos — stop paginating.
+            searchNextToken = "";
+        }
+        renderVideoList(searchRemoteVideos);
+        showStatus("");
+        scheduleSearchScrollCheck();
+    }
+    catch(e){
+        logHome("warn", "Load more failed:", e);
+        showStatus("Could not load more results. Keep scrolling to try again.");
+    }
+    finally{
+        searchLoadingMore = false;
+    }
+}
+
+async function doDynamicSearch(){
+    const client = ytClient();
+    const term = searchTerm();
+    const seq = ++searchSeq;
+
+    // Leaving the home feed: invalidate any in-flight home page request so it
+    // can't append old home videos onto the new search results.
+    homeSeq++;
+    homeNextToken = "";
+
+    // Reset pagination state for this search.
+    searchNextToken = "";
+    searchRemoteVideos = [];
+
+    // Cancel any in-flight YouTube API request from a previous keystroke/chip.
+    if(activeSearchController){
+        activeSearchController.abort();
+        activeSearchController = null;
+    }
+
+    if(!client){
+        // Deferred module not loaded yet. Retry once it reports readiness —
+        // do NOT render local videos meanwhile.
+        whenYTReady(() => {
+            if(seq === searchSeq && searchTerm() === term){
+                doDynamicSearch();
+            }
+        });
+        showStatus("Searching YouTube...");
+        return;
+    }
+
+    // Require at least 2 characters before hitting the YouTube API.
+    if(term.length < 2){
+        box.replaceChildren();
+        showStatus(currentQuery ? "Type at least 2 characters to search YouTube." : "");
+        return;
+    }
+
+    const controller = new AbortController();
+    activeSearchController = controller;
+
+    showStatus("Searching YouTube...");
+    let remote = [];
+    let apiError = "";
+    try{
+        const result = await client.search(term, 20, "", controller.signal);
+        remote = result.videos || [];
+        searchNextToken = result.nextPageToken || "";
+        apiError = result.error || "";
+    }
+    catch(e){
+        if(e && e.name === "AbortError"){
+            return; // superseded by a newer search — do not render
+        }
+        apiError = "Search failed.";
+        logHome("warn", "Dynamic search failed:", e);
+    }
+
+    if(seq !== searchSeq){
+        return; // a newer search superseded this one
+    }
+
+    searchRemoteVideos = remote.slice(0, 30);
+    if(!searchRemoteVideos.length){
+        searchNextToken = "";
+        showStatus(apiError
+            ? ("Could not search YouTube: " + apiError)
+            : "No YouTube videos found for this search.");
+    }
+    else{
+        showStatus("");
+    }
+    renderVideoList(searchRemoteVideos);
+    scheduleSearchScrollCheck();
+}
+
+function logHome(level, msg, err){
+    if(window.console && typeof window.console[level] === "function"){
+        window.console[level](msg, err || "");
+    }
+}
+
+
+// Restore ?q= from the URL on load (watch page search uses index.html?q=...).
+(function initSearchFromUrl(){
+    const params = new URLSearchParams(window.location.search);
+    const q = (params.get("q") || "").trim();
+    currentQuery = q.toLowerCase();
+    if(searchInput){
+        searchInput.value = q;
+    }
+})();
+
+
+// ================= SIDEBAR =================
+
+// Make a sidebar item keyboard accessible (Enter/Space activate).
+function makeSideItemInteractive(el, onClick){
+    if(!el){
+        return;
+    }
+    el.setAttribute("role", "button");
+    el.setAttribute("tabindex", "0");
+    el.addEventListener("click", onClick);
+    el.addEventListener("keydown", (e) => {
+        if(e.key === "Enter" || e.key === " "){
+            e.preventDefault();
+            onClick();
+        }
+    });
+}
+
+
+function clearSidebarActive(){
+    ["sideHome", "sideTrending", "sideSubs", "sideLibrary"].forEach(id => {
+        const el = document.getElementById(id);
+        if(el){
+            el.classList.remove("active");
+            el.setAttribute("aria-current", "false");
+        }
+    });
+}
+
+
+function setSidebarActive(id){
+    clearSidebarActive();
+    const el = document.getElementById(id);
+    if(el){
+        el.classList.add("active");
+        el.setAttribute("aria-current", "true");
+    }
+}
+
+
+function showSidebarMsg(text){
+    let msgBox = document.getElementById("sidebarMsg");
+    if(!msgBox){
+        msgBox = document.createElement("div");
+        msgBox.id = "sidebarMsg";
+        msgBox.textContent = "";
+        document.body.appendChild(msgBox);
+    }
+    msgBox.textContent = text;
+    setTimeout(() => {
+        msgBox.textContent = "";
+    }, 2500);
+}
+
+
+const sideHome = document.getElementById("sideHome");
+const sideTrending = document.getElementById("sideTrending");
+const sideSubs = document.getElementById("sideSubs");
+const sideLibrary = document.getElementById("sideLibrary");
+
+
+makeSideItemInteractive(sideHome, () => {
+    window.location.href = "index.html";
+});
+
+
+makeSideItemInteractive(sideTrending, () => {
+    trendingMode = !trendingMode;
+    currentCategory = "All";
+    currentQuery = "";
+    if(searchInput){ searchInput.value = ""; }
+    searchSeq++;
+    renderCategoryFilter();
+    if(trendingMode){
+        setSidebarActive("sideTrending");
+        loadHomeFeed(true);
+    }
+    else{
+        setSidebarActive("sideHome");
+        loadHomeFeed();
+    }
+});
+
+
+makeSideItemInteractive(sideSubs, () => {
+    window.location.href = "subscriptions.html";
+});
+
+
+makeSideItemInteractive(sideLibrary, () => {
+    window.location.href = "library.html";
+});
+
+
+// ================= INIT =================
+
+(function init(){
+    buildCategoryFilter();
+    setSidebarActive("sideHome");
+    setupScrollObserver();
+    setupScrollFallback();
+    renderMain();
+})();
+
+
+</script>
+
+
+
+
+<!-- Firebase Auth -->
+
+<script type="module" src="auth.js"></script>
+
+
+<!-- Phase 7: YouTube dynamic discovery (backend proxy client) -->
+<script type="module">
+import { search, trending } from "./youtube.js";
+// Expose the client on window so the inline homepage script can call it.
+window.MyTubeYouTube = { search: search, trending: trending };
+// Signal readiness. This module is deferred, so the inline homepage script may
+// have already run its initial render before this executes; it listens for this
+// event to retry dynamic loading (search + home discovery) with the client set.
+window.dispatchEvent(new Event("mytube-yt-ready"));
+</script>
+
+
+<!-- MyTube sidebar subscriptions -->
+<script type="module">
+import { getSubscriptions } from "./data.js";
+import { auth } from "./firebase.js";
+
+const sidebarList = document.getElementById("sidebarSubscriptionsList");
+const showMoreBtn = document.getElementById("sidebarShowMore");
+
+let sidebarSubscriptions = [];
+let sidebarExpanded = false;
+
+function getSubscriptionTime(item){
+    const value = item?.subscribedAt;
+
+    if(value && typeof value.toMillis === "function"){
+        return value.toMillis();
+    }
+
+    if(value?.seconds){
+        return Number(value.seconds) * 1000;
+    }
+
+    const time = Date.parse(value || "");
+    return Number.isFinite(time) ? time : 0;
+}
+
+function clearSidebarSubscriptions(){
+    sidebarSubscriptions = [];
+    sidebarExpanded = false;
+
+    if(sidebarList){
+        sidebarList.replaceChildren();
+    }
+
+    if(showMoreBtn){
+        showMoreBtn.hidden = true;
+    }
+}
+
+function createSubscriptionRow(subscription){
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "sidebar-subscription";
+
+    const avatar = document.createElement("img");
+    avatar.className = "sidebar-subscription-avatar";
+    avatar.alt = "";
+    avatar.loading = "lazy";
+
+    const name = String(
+        subscription.channelName ||
+        subscription.id ||
+        "Channel"
+    );
+
+    if(subscription.channelThumb){
+        avatar.src = subscription.channelThumb;
+        avatar.onerror = () => {
+            avatar.removeAttribute("src");
+        };
+    }
+
+    const label = document.createElement("span");
+    label.className = "sidebar-subscription-name";
+    label.textContent = name;
+
+    button.append(avatar, label);
+
+    button.addEventListener("click", () => {
+        window.location.href = "subscriptions.html";
+    });
+
+    return button;
+}
+
+function renderSidebarSubscriptions(){
+    if(!sidebarList || !showMoreBtn){
+        return;
+    }
+
+    sidebarList.replaceChildren();
+
+    const visible = sidebarExpanded
+        ? sidebarSubscriptions
+        : sidebarSubscriptions.slice(0, 7);
+
+    visible.forEach(subscription => {
+        sidebarList.appendChild(createSubscriptionRow(subscription));
+    });
+
+    showMoreBtn.hidden = sidebarSubscriptions.length <= 7;
+
+    const icon = showMoreBtn.querySelector(".sidebar-show-more-icon");
+    const text = showMoreBtn.querySelector("span:last-child");
+
+    if(icon){
+        icon.textContent = sidebarExpanded ? "⌃" : "⌄";
+    }
+
+    if(text){
+        text.textContent = sidebarExpanded ? "Show less" : "Show more";
+    }
+}
+
+async function loadSidebarSubscriptions(user){
+    if(!user){
+        clearSidebarSubscriptions();
+        return;
+    }
+
+    try{
+        const subscriptions = await getSubscriptions(user.uid);
+
+        sidebarSubscriptions = Array.isArray(subscriptions)
+            ? subscriptions.slice().sort(
+                (a, b) => getSubscriptionTime(b) - getSubscriptionTime(a)
+            )
+            : [];
+
+        renderSidebarSubscriptions();
+    }
+    catch(error){
+        console.warn(
+            "Could not load sidebar subscriptions:",
+            error
+        );
+        clearSidebarSubscriptions();
+    }
+}
+
+if(showMoreBtn){
+    showMoreBtn.addEventListener("click", () => {
+        sidebarExpanded = !sidebarExpanded;
+        renderSidebarSubscriptions();
+    });
+}
+
+window.addEventListener("mytube-auth-change", () => {
+    loadSidebarSubscriptions(auth.currentUser);
+});
+
+loadSidebarSubscriptions(auth.currentUser);
+</script>
+
+<!-- Voice search (progressive enhancement; no-op where Speech Recognition is unsupported) -->
+<script src="voice-search.js"></script>
+
+
+</body>
+
+</html>

@@ -1,0 +1,1643 @@
+/* ================= GLOBAL ================= */
+
+*{
+    box-sizing:border-box;
+}
+
+body{
+
+    margin:0;
+    background:#0f0f0f;
+    color:white;
+    font-family:Arial, Helvetica, sans-serif;
+
+}
+
+
+/* ================= HEADER ================= */
+
+header{
+
+    height:60px;
+
+    background:#202020;
+
+    display:flex;
+    align-items:center;
+    gap:20px;
+
+    padding:0 20px;
+
+    position:sticky;
+    top:0;
+    z-index:1000;
+
+}
+
+
+.logo{
+
+    color:red;
+    font-size:26px;
+    font-weight:bold;
+
+}
+
+
+
+header input{
+
+    width:45%;
+
+    padding:12px 20px;
+
+    background:#121212;
+
+    color:white;
+
+    border:1px solid #333;
+
+    border-radius:25px;
+
+    outline:none;
+
+}
+
+
+
+button{
+
+    background:red;
+
+    color:white;
+
+    border:none;
+
+    padding:10px 18px;
+
+    border-radius:20px;
+
+    cursor:pointer;
+
+}
+
+
+
+button:hover{
+
+    background:#b00000;
+
+}
+
+
+
+/* ================= VOICE SEARCH ================= */
+
+.voice-search-btn{
+    background:none;
+    color:#aaa;
+    border:none;
+    width:40px;
+    height:40px;
+    padding:0;
+    border-radius:50%;
+    cursor:pointer;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    flex-shrink:0;
+    transition:background .2s,color .2s;
+}
+
+.voice-search-btn:hover{
+    background:#333;
+    color:white;
+}
+
+.voice-search-btn.listening{
+    background:red;
+    color:white;
+    animation:voice-pulse 1.2s ease-in-out infinite;
+}
+
+.voice-search-btn:focus-visible{
+    outline:2px solid red;
+    outline-offset:2px;
+}
+
+@keyframes voice-pulse{
+    0%,100%{box-shadow:0 0 0 0 rgba(255,0,0,.4)}
+    50%{box-shadow:0 0 0 8px rgba(255,0,0,0)}
+}
+
+
+/* ================= HOME PAGE ================= */
+
+
+.container{
+
+    display:flex;
+
+}
+
+
+
+.sidebar{
+
+    width:200px;
+
+    background:#181818;
+
+    min-height:100vh;
+
+    padding:20px;
+
+}
+
+
+.sidebar p{
+
+    padding:10px;
+
+    cursor:pointer;
+
+}
+
+
+.sidebar p:hover{
+
+    background:#333;
+
+}
+
+
+#sidebarMsg{
+
+    position:fixed;
+
+    bottom:20px;
+
+    left:50%;
+
+    transform:translateX(-50%);
+
+    background:#333;
+
+    color:white;
+
+    padding:12px 20px;
+
+    border-radius:25px;
+
+    z-index:2000;
+
+    font-size:14px;
+
+}
+
+
+
+/* VIDEO GRID */
+
+
+#videoList{
+
+    flex:1;
+
+    display:grid;
+
+    grid-template-columns:
+    repeat(auto-fill,minmax(260px,1fr));
+
+    gap:20px;
+
+    padding:20px;
+
+}
+
+
+.no-results{
+
+    flex:1;
+
+    padding:40px 20px;
+
+    text-align:center;
+
+    color:#999;
+
+    font-size:18px;
+
+}
+
+
+
+/* VIDEO CARD */
+
+
+.card{
+
+    background:#222;
+
+    padding:10px;
+
+    border-radius:10px;
+
+    cursor:pointer;
+
+    transition:.3s;
+
+}
+
+
+.card:hover{
+
+    transform:scale(1.03);
+
+}
+
+
+.thumb{
+
+    position:relative;
+
+}
+
+
+
+.thumb img{
+
+    width:100%;
+
+    height:150px;
+
+    object-fit:cover;
+
+    border-radius:10px;
+
+}
+
+
+
+.thumb span{
+
+    position:absolute;
+
+    right:8px;
+
+    bottom:8px;
+
+    background:black;
+
+    padding:5px;
+
+    border-radius:5px;
+
+    font-size:12px;
+
+}
+
+
+
+
+
+/* ================= WATCH PAGE ================= */
+
+
+.watch-container{
+
+    display:flex;
+
+    gap:25px;
+
+    padding:20px;
+
+}
+
+
+
+.main-video{
+
+    width:70%;
+
+}
+
+
+
+.video-box{
+
+    background:black;
+
+    border-radius:12px;
+
+    overflow:hidden;
+
+}
+
+
+
+.video-box video{
+
+    width:100%;
+
+    aspect-ratio:16/9;
+
+    object-fit:contain;
+
+}
+
+
+
+
+
+/* CONTROLS */
+
+
+.controls{
+
+    display:flex;
+
+    align-items:center;
+
+    gap:10px;
+
+    padding:10px;
+
+    background:#181818;
+
+}
+
+
+
+.controls button{
+
+    background:none;
+
+    font-size:20px;
+
+}
+
+
+
+#progress{
+
+    flex:1;
+
+    accent-color:red;
+
+}
+
+
+#volume{
+
+    width:100px;
+
+}
+
+
+
+#speed{
+
+    background:#222;
+
+    color:white;
+
+    padding:6px;
+
+}
+
+
+
+
+
+/* ACTIONS */
+
+
+.actions{
+
+    display:flex;
+
+    gap:10px;
+
+    margin:15px 0;
+
+}
+
+
+
+.actions button{
+
+    background:#272727;
+
+}
+
+
+
+
+/* CHANNEL */
+
+
+.channel{
+
+    display:flex;
+
+    align-items:center;
+
+    gap:15px;
+
+    border-top:1px solid #333;
+
+    border-bottom:1px solid #333;
+
+    padding:15px 0;
+
+}
+
+
+.channel img{
+
+    width:50px;
+
+    height:50px;
+
+    border-radius:50%;
+
+}
+
+
+.channel button{
+
+    margin-left:auto;
+
+}
+
+
+
+
+/* DESCRIPTION */
+
+
+#description{
+
+    background:#222;
+
+    padding:15px;
+
+    border-radius:10px;
+
+}
+
+
+
+
+
+/* SUGGESTED */
+
+
+.suggested{
+
+    width:30%;
+
+}
+
+
+.suggest-video{
+
+    display:flex;
+
+    gap:10px;
+
+    margin-bottom:15px;
+
+    cursor:pointer;
+
+}
+
+
+.suggest-video img{
+
+    width:170px;
+
+    height:95px;
+
+    object-fit:cover;
+
+    border-radius:8px;
+
+}
+
+
+
+
+
+
+/* ================= LOGIN SIGNUP ================= */
+
+
+.login-box{
+
+    width:350px;
+
+    max-width:90%;
+
+    margin:100px auto;
+
+    background:#181818;
+
+    padding:30px;
+
+    border-radius:15px;
+
+    text-align:center;
+
+}
+
+
+
+.login-box h1{
+
+    color:red;
+
+    font-size:35px;
+
+}
+
+
+
+.login-box input{
+
+    width:90%;
+
+    padding:12px;
+
+    margin:10px;
+
+    background:#222;
+
+    border:none;
+
+    border-radius:8px;
+
+    color:white;
+
+}
+
+
+
+.login-box button{
+
+    width:95%;
+
+    margin-top:15px;
+
+}
+
+
+
+.login-box a{
+
+    color:red;
+
+    text-decoration:none;
+
+}
+
+
+
+
+
+
+/* ================= MOBILE ================= */
+
+
+@media(max-width:900px){
+
+
+.container{
+
+    flex-direction:column;
+
+    align-items:stretch;
+
+}
+
+
+/* Keep the sidebar navigation visible on mobile instead of hiding it:
+   turn it into a horizontal, swipeable strip above the content so Home,
+   Trending, Subscriptions and Library all stay reachable by touch. */
+.sidebar{
+
+    display:flex;
+
+    flex-wrap:nowrap;
+
+    overflow-x:auto;
+
+    -webkit-overflow-scrolling:touch;
+
+    width:100%;
+
+    min-height:0;
+
+    padding:8px 10px;
+
+    gap:8px;
+
+    flex-shrink:0;
+
+}
+
+
+.sidebar p{
+
+    white-space:nowrap;
+
+    margin:0;
+
+    padding:8px 14px;
+
+}
+
+
+
+.watch-container{
+
+    flex-direction:column;
+
+}
+
+
+
+.main-video,
+.suggested{
+
+    width:100%;
+
+}
+
+
+
+header input{
+
+    width:35%;
+
+}
+
+
+}
+
+
+
+@media(max-width:600px){
+
+
+header{
+
+    flex-wrap:wrap;
+
+    height:auto;
+
+    padding:10px;
+
+    gap:8px;
+
+}
+
+
+.logo{
+
+    font-size:20px;
+
+}
+
+
+/* Full-width, touch-friendly search box on its own row so it stays usable
+   on tiny screens (320px+) instead of being squeezed into a narrow column. The
+   voice-search button shares this row so it stays thumb-reachable. */
+header input{
+
+    width:auto;
+
+    flex:1 1 0;
+
+    order:5;
+
+}
+
+
+.voice-search-btn{
+
+    order:5;
+
+}
+
+
+.actions{
+
+    flex-wrap:wrap;
+
+}
+
+
+}
+
+
+/* ================= PHASE 6 ================= */
+
+
+/* Home content column (holds category filter + grid) */
+
+.home-content{
+    flex:1;
+    min-width:0;
+}
+
+
+/* Category filter */
+
+.category-filter{
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px;
+    padding:14px 20px 0;
+}
+
+.category-chip{
+    background:#272727;
+    color:white;
+    border:none;
+    border-radius:25px;
+    padding:8px 16px;
+    cursor:pointer;
+}
+
+.category-chip:hover{
+    background:#444;
+}
+
+.category-chip.active{
+    background:red;
+    color:white;
+}
+
+.category-chip:focus-visible{
+    outline:2px solid red;
+    outline-offset:2px;
+}
+
+
+/* Sidebar active state (e.g. Trending) */
+
+.sidebar p.active{
+    background:red;
+    color:white;
+}
+
+
+/* Accessible focus states for cards + sidebar */
+
+.card:focus-visible{
+    outline:2px solid red;
+    outline-offset:2px;
+}
+
+.sidebar p:focus-visible{
+    outline:2px solid red;
+    outline-offset:2px;
+}
+
+
+/* ================= PROFILE ================= */
+
+.profile-container{
+    max-width:900px;
+    margin:0 auto;
+}
+
+.profile-content{
+    flex:1;
+    min-width:0;
+}
+
+.profile-card{
+    display:flex;
+    align-items:center;
+    gap:20px;
+    padding:25px;
+    background:#181818;
+    border-radius:15px;
+    margin-bottom:20px;
+}
+
+.profile-avatar{
+    width:64px;
+    height:64px;
+    border-radius:50%;
+    background:red;
+    color:white;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:26px;
+    font-weight:bold;
+    flex-shrink:0;
+    user-select:none;
+}
+
+.profile-section{
+    background:#181818;
+    padding:20px;
+    border-radius:15px;
+    margin-bottom:20px;
+}
+
+.profile-section h3{
+    margin-top:0;
+    margin-bottom:15px;
+}
+
+.profile-list{
+    display:flex;
+    flex-direction:column;
+    gap:12px;
+}
+
+.profile-video{
+    display:flex;
+    gap:12px;
+    align-items:center;
+    background:#202020;
+    padding:10px;
+    border-radius:10px;
+    text-decoration:none;
+    color:white;
+}
+
+.profile-video:hover{
+    background:#2a2a2a;
+}
+
+.profile-video:focus-visible{
+    outline:2px solid red;
+    outline-offset:2px;
+}
+
+.profile-video img{
+    width:120px;
+    height:68px;
+    object-fit:cover;
+    border-radius:8px;
+    flex-shrink:0;
+}
+
+.profile-video-info h4{
+    margin:0;
+    font-size:15px;
+}
+
+.profile-video-info p{
+    margin:4px 0 0;
+    font-size:13px;
+    color:#aaa;
+}
+
+.profile-channel{
+    display:flex;
+    align-items:center;
+    gap:14px;
+    background:#202020;
+    padding:12px;
+    border-radius:10px;
+}
+
+.profile-channel .channel-avatar{
+    width:44px;
+    height:44px;
+    font-size:18px;
+}
+
+.profile-empty{
+    color:#999;
+    font-size:14px;
+}
+
+
+/* ================= SUBSCRIPTIONS ================= */
+
+.channel-sections{
+    display:flex;
+    flex-direction:column;
+    gap:24px;
+}
+
+.channel-section{
+    background:#181818;
+    padding:20px;
+    border-radius:15px;
+    margin-bottom:20px;
+}
+
+.channel-section-header{
+    display:flex;
+    align-items:center;
+    gap:15px;
+    margin-bottom:15px;
+}
+
+.channel-section-info{
+    flex:1;
+    min-width:0;
+}
+
+.channel-section-info h3{
+    margin:0;
+    font-size:18px;
+}
+
+.channel-section-subs{
+    margin:4px 0 0;
+    color:#aaa;
+    font-size:13px;
+}
+
+.channel-section-unsub{
+    background:#272727;
+    color:white;
+    border:none;
+    padding:10px 18px;
+    border-radius:25px;
+    cursor:pointer;
+    font-size:14px;
+}
+
+.channel-section-unsub:hover{
+    background:#444;
+}
+
+.channel-section-unsub:disabled{
+    opacity:0.6;
+    cursor:default;
+}
+
+.channel-section-grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fill,minmax(180px,1fr));
+    gap:15px;
+}
+
+.channel-section-grid .card p{
+    font-size:13px;
+    color:#aaa;
+    margin:6px 0 0;
+}
+
+
+/* ================= LIBRARY ================= */
+
+.lib-tabs{
+    display:flex;
+    gap:8px;
+    margin-bottom:20px;
+    flex-wrap:wrap;
+}
+
+.lib-tab{
+    background:#272727;
+    color:white;
+    border:none;
+    padding:10px 18px;
+    border-radius:25px;
+    cursor:pointer;
+    font-size:14px;
+}
+
+.lib-tab:hover{
+    background:#444;
+}
+
+.lib-tab.active{
+    background:red;
+}
+
+.lib-tab:focus-visible{
+    outline:2px solid red;
+    outline-offset:2px;
+}
+
+.lib-section-header{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:10px;
+    flex-wrap:wrap;
+}
+
+.lib-clear-btn{
+    background:none;
+    color:#3ea6ff;
+    border:none;
+    cursor:pointer;
+    font-size:13px;
+    padding:4px 8px;
+}
+
+.lib-clear-btn:hover{
+    text-decoration:underline;
+}
+
+.lib-clear-btn:disabled{
+    opacity:0.6;
+    cursor:default;
+}
+
+.lib-remove-btn{
+    background:none;
+    color:#f33;
+    border:none;
+    cursor:pointer;
+    font-size:13px;
+    padding:4px 8px;
+    margin-left:auto;
+    flex-shrink:0;
+}
+
+.lib-remove-btn:hover{
+    text-decoration:underline;
+}
+
+.lib-remove-btn:disabled{
+    opacity:0.6;
+    cursor:default;
+}
+
+.profile-video > .lib-remove-btn{
+    align-self:center;
+}
+
+
+@media(max-width:600px){
+
+    .channel-section-grid{
+        grid-template-columns:repeat(auto-fill,minmax(140px,1fr));
+    }
+
+    .channel-section-header{
+        flex-wrap:wrap;
+    }
+
+    .profile-video{
+        flex-wrap:wrap;
+    }
+
+    .lib-remove-btn{
+        margin-left:0;
+    }
+
+}
+
+
+
+@media(max-width:600px){
+
+.profile-card{
+    flex-direction:column;
+    text-align:center;
+}
+
+.profile-video{
+    flex-direction:column;
+    align-items:flex-start;
+}
+
+.profile-video img{
+    width:100%;
+    height:auto;
+    aspect-ratio:16/9;
+}
+
+}
+
+
+/* ================= SHARED STATE / PLAYLISTS ================= */
+/* These state styles live in player.css on the watch page, but Library and
+   Subscriptions only load style.css — so they're mirrored here to keep each
+   page self-contained. */
+
+.state-panel{
+    width:100%;
+    text-align:center;
+    padding:60px 20px;
+    color:#ccc;
+}
+
+.back-home{
+    background:red;
+    color:white;
+    border:none;
+    padding:12px 24px;
+    border-radius:25px;
+    cursor:pointer;
+    margin-top:10px;
+}
+
+.back-home:hover{
+    background:#e30000;
+}
+
+.back-home:focus-visible{
+    outline:2px solid white;
+    outline-offset:2px;
+}
+
+#pageError h2{
+    color:white;
+}
+
+.spinner{
+    width:40px;
+    height:40px;
+    margin:0 auto 15px;
+    border:4px solid #333;
+    border-top-color:red;
+    border-radius:50%;
+    animation:spin 1s linear infinite;
+}
+
+@keyframes spin{
+    to{ transform:rotate(360deg); }
+}
+
+.comment-empty{
+    color:#999;
+    font-size:14px;
+}
+
+.comment-submit{
+    background:red;
+    color:white;
+    border:none;
+    padding:10px 18px;
+    border-radius:20px;
+    cursor:pointer;
+}
+
+.comment-submit:hover{
+    background:#e30000;
+}
+
+.comment-submit:focus-visible{
+    outline:2px solid white;
+    outline-offset:2px;
+}
+
+.channel-avatar{
+    width:50px;
+    height:50px;
+    border-radius:50%;
+    background:red;
+    color:white;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-weight:bold;
+    font-size:20px;
+    flex-shrink:0;
+    user-select:none;
+}
+
+.playlist-new-row{
+    display:flex;
+    gap:8px;
+    margin:10px 0 15px;
+}
+
+.playlist-new-row input{
+    flex:1;
+    min-width:0;
+    background:#121212;
+    color:white;
+    border:1px solid #333;
+    border-radius:10px;
+    padding:10px;
+    outline:none;
+    font-family:inherit;
+}
+
+.playlist-new-row input:focus-visible{
+    border-color:red;
+    outline:2px solid red;
+    outline-offset:1px;
+}
+
+.playlist-card{
+    display:flex;
+    align-items:center;
+    gap:12px;
+    background:#202020;
+    padding:12px;
+    border-radius:10px;
+}
+
+.playlist-card-info{
+    flex:1;
+    min-width:0;
+}
+
+.playlist-card-info h4{
+    margin:0;
+    font-size:15px;
+}
+
+.playlist-card-info p{
+    margin:4px 0 0;
+    font-size:13px;
+    color:#aaa;
+}
+
+@media(max-width:600px){
+    .playlist-card{
+        flex-wrap:wrap;
+    }
+}
+
+/* ================= SUBSCRIPTIONS TOOLBAR ================= */
+
+.subs-toolbar{
+    display:flex;
+    align-items:center;
+    gap:16px;
+    justify-content:space-between;
+    margin-bottom:16px;
+    flex-wrap:wrap;
+}
+
+.subs-toolbar h2{
+    margin:0;
+}
+
+.subs-refresh{
+    background:transparent;
+    border:1px solid red;
+    color:#fff;
+    padding:8px 20px;
+    border-radius:999px;
+    font-size:13px;
+    font-weight:600;
+    cursor:pointer;
+    font-family:inherit;
+}
+
+.subs-refresh:hover{
+    background:rgba(255, 0, 0, 0.12);
+}
+
+.subs-refresh:focus-visible{
+    outline:2px solid white;
+    outline-offset:2px;
+}
+
+.subs-refresh:disabled{
+    opacity:0.6;
+    cursor:default;
+}
+
+/* ================= LOAD MORE ================= */
+
+.load-more{
+    display:block;
+    margin:24px auto;
+    padding:10px 28px;
+    background:red;
+    color:#fff;
+    font-size:14px;
+    font-weight:600;
+    border:none;
+    border-radius:999px;
+    cursor:pointer;
+    font-family:inherit;
+}
+
+.load-more:hover{
+    background:#dc0000;
+}
+
+.load-more:focus-visible{
+    outline:2px solid white;
+    outline-offset:2px;
+}
+
+.load-more:disabled{
+    opacity:0.6;
+    cursor:default;
+}
+
+/* Infinite scroll sentinel: near-invisible target at the bottom of the home
+   feed that drives automatic page loading via IntersectionObserver. */
+
+#homeScrollSentinel{
+    height:1px;
+}
+
+/* Search-results infinite scroll sentinel: same invisible target at the bottom
+   of the search/category results, watched by the same IntersectionObserver. */
+
+#searchScrollSentinel{
+    height:1px;
+}
+/* =========================================================
+   MyTube YouTube-style sidebar
+   ========================================================= */
+
+.container{
+    display:flex;
+    align-items:flex-start;
+}
+
+.sidebar{
+    box-sizing:border-box;
+    width:240px;
+    min-width:240px;
+    min-height:100vh;
+    padding:12px 12px 24px;
+    background:#0f0f0f;
+    color:#f1f1f1;
+    border:0;
+    position:sticky;
+    top:0;
+    align-self:flex-start;
+    overflow-y:auto;
+}
+
+.sidebar-top{
+    height:56px;
+    display:flex;
+    align-items:center;
+    gap:10px;
+    padding:0 8px;
+    margin-bottom:8px;
+}
+
+.sidebar-menu-btn{
+    width:40px;
+    height:40px;
+    padding:0;
+    border:0;
+    border-radius:50%;
+    background:transparent;
+    color:#f1f1f1;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    cursor:pointer;
+}
+
+.sidebar-menu-btn:hover{
+    background:#272727;
+}
+
+.sidebar-brand{
+    display:flex;
+    align-items:center;
+    gap:7px;
+    font-size:20px;
+    font-weight:700;
+    letter-spacing:-0.4px;
+}
+
+.sidebar-brand-icon{
+    width:28px;
+    height:20px;
+    border-radius:6px;
+    background:#ff0000;
+    color:#fff;
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    font-size:11px;
+    line-height:1;
+}
+
+.sidebar-nav{
+    display:flex;
+    flex-direction:column;
+    gap:2px;
+}
+
+.sidebar-item,
+.sidebar-section-title{
+    box-sizing:border-box;
+    width:100%;
+    min-height:40px;
+    margin:0;
+    padding:0 12px;
+    border-radius:10px;
+    display:flex;
+    align-items:center;
+    gap:20px;
+    color:#f1f1f1;
+    cursor:pointer;
+    font-size:14px;
+    font-weight:500;
+}
+
+.sidebar-item:hover,
+.sidebar-section-title:hover{
+    background:#272727;
+}
+
+.sidebar-item.active{
+    background:#272727;
+    color:#fff;
+    font-weight:600;
+}
+
+.sidebar-icon{
+    width:24px;
+    height:24px;
+    flex:0 0 24px;
+    display:block;
+    fill:none;
+    stroke:currentColor;
+    stroke-width:1.8;
+    stroke-linecap:round;
+    stroke-linejoin:round;
+}
+
+.sidebar-item span:not(.sidebar-chevron),
+.sidebar-section-title span:first-child{
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+}
+
+.sidebar-chevron{
+    margin-left:auto;
+    font-size:25px;
+    line-height:1;
+    font-weight:300;
+}
+
+.sidebar-section-link{
+    margin-top:4px;
+}
+
+.sidebar-subscriptions-list{
+    display:flex;
+    flex-direction:column;
+    gap:2px;
+    margin-top:2px;
+}
+
+.sidebar-subscription{
+    width:100%;
+    min-height:40px;
+    padding:0 12px;
+    border:0;
+    border-radius:10px;
+    background:transparent;
+    color:#f1f1f1;
+    display:flex;
+    align-items:center;
+    gap:12px;
+    text-align:left;
+    cursor:pointer;
+    font:inherit;
+}
+
+.sidebar-subscription:hover{
+    background:#272727;
+}
+
+.sidebar-subscription-avatar{
+    width:24px;
+    height:24px;
+    flex:0 0 24px;
+    border-radius:50%;
+    object-fit:cover;
+    background:#272727;
+}
+
+.sidebar-subscription-name{
+    min-width:0;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+    font-size:14px;
+}
+
+.sidebar-subscription-dot{
+    width:6px;
+    height:6px;
+    flex:0 0 6px;
+    margin-left:auto;
+    border-radius:50%;
+    background:#3ea6ff;
+}
+
+.sidebar-show-more{
+    width:100%;
+    min-height:40px;
+    margin:2px 0 0;
+    padding:0 12px;
+    border:0;
+    border-radius:10px;
+    background:transparent;
+    color:#f1f1f1;
+    display:flex;
+    align-items:center;
+    gap:20px;
+    cursor:pointer;
+    font:inherit;
+    font-size:14px;
+    font-weight:500;
+    text-align:left;
+}
+
+.sidebar-show-more:hover{
+    background:#272727;
+}
+
+.sidebar-show-more-icon{
+    width:24px;
+    flex:0 0 24px;
+    text-align:center;
+    font-size:22px;
+    line-height:1;
+}
+
+.sidebar-divider{
+    height:1px;
+    margin:12px 0;
+    background:#3f3f3f;
+}
+
+.sidebar-section-title{
+    font-size:16px;
+    font-weight:600;
+    cursor:pointer;
+}
+
+.sidebar-item:focus-visible,
+.sidebar-section-title:focus-visible,
+.sidebar-show-more:focus-visible,
+.sidebar-menu-btn:focus-visible,
+.sidebar-subscription:focus-visible{
+    outline:2px solid #3ea6ff;
+    outline-offset:2px;
+}
+
+@media (max-width:900px){
+    .sidebar{
+        width:200px;
+        min-width:200px;
+    }
+
+    .sidebar-item,
+    .sidebar-section-title{
+        gap:14px;
+    }
+}
+
+@media (max-width:700px){
+    .container{
+        flex-direction:column;
+        align-items:stretch;
+    }
+
+    .sidebar{
+        position:relative;
+        width:100%;
+        min-width:0;
+        min-height:0;
+        max-height:none;
+        padding:8px;
+        overflow-x:auto;
+        overflow-y:hidden;
+    }
+
+    .sidebar-top{
+        display:none;
+    }
+
+    .sidebar-nav{
+        flex-direction:row;
+        align-items:center;
+        width:max-content;
+        gap:4px;
+    }
+
+    .sidebar-item,
+    .sidebar-section-title{
+        width:auto;
+        min-width:max-content;
+        padding:0 14px;
+    }
+
+    .sidebar-subscriptions-list,
+    .sidebar-show-more,
+    .sidebar-divider,
+    .sidebar-section-title{
+        display:none;
+    }
+}
+

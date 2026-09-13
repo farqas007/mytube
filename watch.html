@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Watch - MyTube</title>
+
+<link rel="icon" type="image/png" href="mytube-icon.png">
+
+<link rel="stylesheet" href="player.css?v=3">
+
+<!-- Shared video dataset (single source of truth) -->
+<script src="videos.js"></script>
+
+</head>
+
+
+<body>
+
+<header>
+
+<div class="logo">
+MyTube 🔴
+</div>
+
+
+<input 
+id="search"
+placeholder="Search videos..."
+aria-label="Search videos"
+>
+
+
+<button type="button" class="voice-search-btn" aria-label="Search with your voice" aria-pressed="false" title="Search with your voice">
+<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"></path><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"></path></svg>
+</button>
+
+
+<button 
+type="button"
+onclick="searchVideo()">
+Search
+</button>
+
+
+<button 
+type="button"
+onclick="goHome()">
+Home
+</button>
+
+
+<button id="loginBtn" type="button">
+Login
+</button>
+
+
+<button id="logoutBtn" type="button" style="display:none;">
+Logout
+</button>
+
+
+</header>
+
+
+<div class="watch-container">
+
+
+<!-- LOADING STATE -->
+<div id="pageLoading" class="state-panel" style="display:none;">
+<div class="spinner"></div>
+<p>Loading video...</p>
+</div>
+
+
+<!-- ERROR STATE (invalid id) -->
+<div id="pageError" class="state-panel" style="display:none;">
+<h2 id="pageErrorTitle">Video not found 😕</h2>
+<p id="pageErrorText">The video you're looking for doesn't exist.</p>
+<button type="button" class="back-home" onclick="goHome()">Back to Home</button>
+</div>
+
+
+<!-- CONTENT -->
+<div id="pageContent" style="display:none;">
+
+
+<div class="main-video">
+
+
+<div class="video-box">
+
+
+<video 
+id="videoPlayer"
+preload="metadata"
+playsinline
+aria-label="Video player">
+
+</video>
+
+
+<!-- Phase 7: YouTube iframe embed (used for yt: videos) -->
+<div id="ytPlayerWrap" class="yt-player-wrap" style="display:none;">
+<iframe 
+id="ytPlayer"
+src="about:blank"
+title="YouTube video player"
+frameborder="0"
+allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+allowfullscreen
+></iframe>
+</div>
+
+
+<!-- Phase 7.1: honest fallback when the uploader disabled third-party embedding -->
+<div id="ytEmbedFallback" class="yt-embed-fallback" style="display:none;" role="alert" aria-live="assertive">
+<span class="yt-fallback-icon" aria-hidden="true">▶</span>
+<h3 class="yt-fallback-title">This video</h3>
+<p>This video cannot be played inside MyTube because the uploader has disabled embedding on YouTube.</p>
+<a id="ytWatchOnYoutube" class="watch-on-youtube" href="#" target="_blank" rel="noopener noreferrer">Watch on YouTube ↗</a>
+</div>
+
+
+<div id="videoErrorMsg" class="video-error" role="alert" style="display:none;">
+Unable to load this video.
+</div>
+
+
+<div id="bufferingIndicator" class="video-loading" role="status" aria-live="polite" style="display:none;">
+<div class="spinner"></div>
+<p>Buffering...</p>
+</div>
+
+
+
+<div class="controls">
+
+
+<button 
+id="prevBtn"
+type="button"
+onclick="prevVideo()"
+aria-label="Previous video">
+⏮
+</button>
+
+
+<button 
+id="playBtn"
+type="button"
+onclick="playPause()"
+aria-label="Play"
+aria-pressed="false">
+▶
+</button>
+
+
+<button 
+id="nextBtn"
+type="button"
+onclick="nextVideo()"
+aria-label="Next video">
+⏭
+</button>
+
+
+
+<input 
+type="range"
+id="progress"
+min="0"
+max="100"
+value="0"
+aria-label="Video progress"
+>
+
+
+
+
+<button
+id="muteBtn"
+type="button"
+onclick="muteVideo()"
+aria-label="Mute or unmute"
+aria-pressed="false">
+🔊
+</button>
+
+
+
+
+<input 
+type="range"
+id="volume"
+min="0"
+max="1"
+step="0.1"
+value="1"
+aria-label="Volume"
+>
+
+
+
+
+<select id="speed" aria-label="Playback speed">
+
+<option value="1">
+1x
+</option>
+
+<option value="1.25">
+1.25x
+</option>
+
+<option value="1.5">
+1.5x
+</option>
+
+<option value="2">
+2x
+</option>
+
+
+</select>
+
+
+<span id="timeDisplay" class="time-display" aria-live="off">0:00 / 0:00</span>
+
+
+
+
+<button
+type="button"
+onclick="fullscreen()"
+aria-label="Toggle fullscreen">
+⛶ Full
+</button>
+
+
+</div>
+
+
+
+</div>
+
+
+
+
+<h2 id="videoTitle">
+Loading...
+</h2>
+
+
+<p id="videoMeta" class="video-meta"></p>
+
+
+
+
+<div class="actions">
+
+
+<button 
+id="likeBtn"
+type="button"
+aria-label="Like video"
+aria-pressed="false">
+👍 Like
+</button>
+
+
+
+<button 
+id="dislikeBtn"
+type="button"
+aria-label="Dislike video"
+aria-pressed="false">
+👎 Dislike
+</button>
+
+
+
+<button 
+id="shareBtn"
+type="button"
+aria-label="Share video">
+↗ Share
+</button>
+
+
+
+<button 
+id="saveBtn"
+type="button"
+aria-label="Save video"
+aria-pressed="false">
+💾 Save
+</button>
+
+
+
+<button id="playlistBtn" type="button" aria-label="Add video to a playlist" aria-haspopup="dialog" aria-expanded="false">
+📁 Playlist
+</button>
+
+<span id="actionMsg" class="action-msg" role="status" aria-live="polite"></span>
+
+</div>
+
+<div id="playlistPopover" class="playlist-popover" style="display:none;" role="dialog" aria-label="Add to playlist">
+
+<h4 id="playlistPopoverTitle">Add to playlist</h4>
+
+<div id="playlistChoices" class="playlist-choices">
+
+<p class="comment-empty">Loading playlists...</p>
+
+</div>
+
+<div class="playlist-new-row">
+
+<input id="playlistNewName" type="text" placeholder="New playlist name" aria-label="New playlist name" maxlength="80">
+
+<button id="playlistCreateBtn" type="button" class="comment-submit">
+Create
+</button>
+
+</div>
+
+<p id="playlistMsg" class="action-msg" role="status" aria-live="polite"></p>
+
+</div>
+
+<div class="channel">
+
+
+
+<div id="channelAvatar" class="channel-avatar" aria-hidden="true"></div>
+
+
+<div>
+
+<h3 id="channelName">
+Loading channel...
+</h3>
+
+<p id="channelSubs">
+&nbsp;
+</p>
+
+<a id="ytChannelLink" class="yt-channel-link" href="#" target="_blank" rel="noopener noreferrer" style="display:none;">
+Open channel on YouTube ↗
+</a>
+
+</div>
+
+
+
+<button 
+id="subscribeBtn"
+type="button"
+aria-label="Subscribe to channel"
+aria-pressed="false">
+Subscribe
+</button>
+
+
+
+</div>
+
+
+
+
+<div id="descriptionBox" class="description-box">
+
+<div id="descriptionText" class="description-text">
+Loading description...
+</div>
+
+<button 
+id="descToggle"
+type="button"
+class="desc-toggle"
+aria-expanded="false"
+style="display:none;">
+Show more
+</button>
+
+</div>
+
+
+
+
+<h3 id="commentCount">
+Comments (0)
+</h3>
+
+
+<form id="commentForm" class="comment-form" novalidate>
+
+<label for="commentInput" class="visually-hidden">Add a comment</label>
+
+<textarea 
+id="commentInput"
+rows="2"
+placeholder="Add a comment..."
+aria-label="Add a comment"
+maxlength="2000"
+></textarea>
+
+<button type="submit" class="comment-submit">Comment</button>
+
+</form>
+
+
+<p id="commentAuthMsg" class="comment-auth-msg"></p>
+
+
+<div id="comments" class="comments-list">
+
+</div>
+
+
+
+
+</div>
+
+
+
+
+<aside class="suggested" aria-label="Up Next">
+
+
+<h3>
+Up Next
+</h3>
+
+
+<div id="relatedList">
+
+</div>
+
+
+
+</aside>
+
+
+</div><!-- /pageContent -->
+
+
+</div>
+
+
+
+
+
+<script>
+
+function goHome(){
+
+window.location.href="index.html";
+
+}
+
+
+function searchVideo(){
+
+
+const raw =
+document
+.getElementById("search")
+.value;
+
+const query = raw.trim();
+
+if(!query)
+    return;
+
+
+window.location.href =
+"index.html?q=" + encodeURIComponent(query);
+
+
+}
+
+
+
+
+document.getElementById("search")?.addEventListener("keydown",(e)=>{
+
+    if(e.key === "Enter"){
+
+        searchVideo();
+
+    }
+
+});
+
+
+</script>
+
+
+<script type="module" src="auth.js"></script>
+
+<script type="module" src="watch.js"></script>
+
+<!-- Voice search (progressive enhancement; no-op where Speech Recognition is unsupported) -->
+<script src="voice-search.js"></script>
+
+
+
+</body>
+
+</html>

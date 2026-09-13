@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://mytube.farqas007.workers.dev/sitemap.xml
