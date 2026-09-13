@@ -36,11 +36,26 @@ Login
 
 
 
+<label for="email">
+Email Address
+</label>
+
+
+
+
 <input 
 id="email"
 type="email"
 placeholder="Email Address"
+autocomplete="email"
 >
+
+
+
+
+<label for="password">
+Password
+</label>
 
 
 
@@ -49,6 +64,7 @@ placeholder="Email Address"
 id="password"
 type="password"
 placeholder="Password"
+autocomplete="current-password"
 >
 
 
@@ -73,11 +89,80 @@ Login
 
 
 <p>
+<a href="#" id="forgotLink">
+Forgot password?
+</a>
+</p>
+
+
+
+
+<p>
 New user?
 <a href="signup.html">
 Create Account
 </a>
 </p>
+
+
+
+
+<div id="resetBox" style="display:none;">
+
+
+<h2>
+Reset Password
+</h2>
+
+
+<form id="resetForm" novalidate>
+
+
+<label for="resetEmail">
+Enter Email
+</label>
+
+
+
+
+<input
+id="resetEmail"
+type="email"
+placeholder="Enter Email"
+required
+autocomplete="email"
+>
+
+
+
+
+<button
+id="resetBtn"
+type="submit">
+Send Reset Email
+</button>
+
+
+
+
+<p id="resetMsg"></p>
+
+
+</form>
+
+
+
+
+<p>
+<a href="#" id="cancelReset">
+Back to Login
+</a>
+</p>
+
+
+
+
+</div>
 
 
 

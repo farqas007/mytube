@@ -28,9 +28,6 @@
 
 <link rel="stylesheet" href="style.css">
 
-<!-- Shared video dataset (single source of truth) -->
-<script src="videos.js"></script>
-
 </head>
 
 
@@ -139,7 +136,7 @@ Logout
             <span>Library</span>
         </p>
 
-        <p class="sidebar-item">
+        <p id="sideHistory" class="sidebar-item">
             <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M6 4h12v16H6z"></path>
                 <path d="M9 8h6"></path>
@@ -149,15 +146,7 @@ Logout
             <span>History</span>
         </p>
 
-        <p class="sidebar-item">
-            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
-                <rect x="4" y="4" width="16" height="16" rx="2"></rect>
-                <path d="m10 9 5 3-5 3V9Z"></path>
-            </svg>
-            <span>Your videos</span>
-        </p>
-
-        <p class="sidebar-item">
+        <p id="sideWatchLater" class="sidebar-item">
             <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M12 4v10"></path>
                 <path d="m8 11 4 4 4-4"></path>
@@ -166,7 +155,7 @@ Logout
             <span>Watch later</span>
         </p>
 
-        <p class="sidebar-item">
+        <p id="sideLikedVideos" class="sidebar-item">
             <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
                 <path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9L12 3Z"></path>
             </svg>
@@ -221,8 +210,6 @@ No videos found 😕
 
 
 <script>
-
-const categories = window.MyTubeCategories || [];
 
 const box = document.getElementById("videoList");
 const noResultsEl = document.getElementById("noResults");
@@ -297,7 +284,9 @@ function buildCategoryFilter(){
         return;
     }
 
-    const options = ["All"].concat(categories);
+    // MyTube category browsing routes through the same YouTube-only search
+    // pipeline as typed queries (see doDynamicSearch).
+    const options = ["All"];
 
     options.forEach(cat => {
         const btn = document.createElement("button");
@@ -361,9 +350,10 @@ if(searchInput){
 
 // ================= DYNAMIC DISCOVERY (Phase 7) =================
 // YouTube results are requested through the backend proxy (youtube.js). If the
-// backend is unreachable / the API key is missing / quota is exceeded, we fall
-// back to the existing local videos. Dynamic results are marked type "youtube"
-// and their id is "yt:<videoId>" so the watch page knows to use the embed.
+// backend is unreachable / the API key is missing / quota is exceeded, a
+// user-facing status message is shown instead of stale/fabricated content.
+// Dynamic results are marked type "youtube" and their id is "yt:<videoId>" so
+// the watch page knows to use the embed.
 
 const dynamicStatus = document.getElementById("dynamicStatus");
 
@@ -393,7 +383,7 @@ function showStatus(text){
     }
 }
 
-// Render a list of videos (local and/or youtube) into the grid.
+// Render a list of videos into the grid.
 function renderVideoList(list){
     box.replaceChildren();
     list.forEach(v => {
@@ -914,6 +904,9 @@ const sideHome = document.getElementById("sideHome");
 const sideTrending = document.getElementById("sideTrending");
 const sideSubs = document.getElementById("sideSubs");
 const sideLibrary = document.getElementById("sideLibrary");
+const sideHistory = document.getElementById("sideHistory");
+const sideWatchLater = document.getElementById("sideWatchLater");
+const sideLikedVideos = document.getElementById("sideLikedVideos");
 
 
 makeSideItemInteractive(sideHome, () => {
@@ -946,6 +939,20 @@ makeSideItemInteractive(sideSubs, () => {
 
 makeSideItemInteractive(sideLibrary, () => {
     window.location.href = "library.html";
+});
+
+
+// "You" section: deep-link straight into the matching library tab.
+makeSideItemInteractive(sideHistory, () => {
+    window.location.href = "library.html?tab=history";
+});
+
+makeSideItemInteractive(sideWatchLater, () => {
+    window.location.href = "library.html?tab=saved";
+});
+
+makeSideItemInteractive(sideLikedVideos, () => {
+    window.location.href = "library.html?tab=liked";
 });
 
 

@@ -10,9 +10,6 @@ from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 import { getSaved, getSubscriptions } from "./data.js";
 
 
-const videos = window.MyTubeVideos || [];
-
-
 const loggedOutEl = document.getElementById("profileLoggedOut");
 const contentEl = document.getElementById("profileContent");
 const avatarEl = document.getElementById("profileAvatar");
@@ -44,34 +41,14 @@ function safeDisplayName(user){
 }
 
 
-function getSavedVideosLocal(){
-    return videos.filter(v => {
-        try{
-            return localStorage.getItem("mytube_saved_" + v.id) === "1";
-        }
-        catch(error){
-            console.warn("Could not read saved state:", error);
-            return false;
-        }
-    });
-}
+// ================= YOUTUBE-ONLY FILTER =================
 
-
-function getSubscribedChannelsLocal(){
-    const subscribed = [];
-    videos.forEach(v => {
-        try{
-            if(localStorage.getItem("mytube_subscribed_" + v.channel) === "1"){
-                if(!subscribed.includes(v.channel)){
-                    subscribed.push(v.channel);
-                }
-            }
-        }
-        catch(error){
-            console.warn("Could not read subscription state:", error);
-        }
-    });
-    return subscribed;
+// Only YouTube-hosted records are renderable. Old records from the legacy local
+// MP4 dataset have videoId like "ghajini" (and type "local"), which would
+// resolve to broken watch links, so they are silently skipped.
+function isYouTubeVideo(item){
+    const id = String(item.videoId || item.id || "");
+    return id.indexOf("yt:") === 0 || item.type === "youtube";
 }
 
 
@@ -124,29 +101,22 @@ async function renderSavedVideos(){
 
     let savedItems = [];
 
-    // Logged in: prefer Firestore.
+    // Logged in: read from Firestore.
     if(user){
         try{
             const fsSaved = await getSaved(user.uid);
-            savedItems = fsSaved.map(s => ({
-                id: s.videoId || s.id,
-                title: s.title || "",
-                thumb: s.thumb || "",
-                channel: s.channel || "",
-                views: s.views || ""
-            }));
+            savedItems = fsSaved
+                .map(s => ({
+                    id: s.videoId || s.id,
+                    title: s.title || "",
+                    thumb: s.thumb || "",
+                    channel: s.channel || "",
+                    views: s.views || ""
+                }))
+                .filter(isYouTubeVideo);
         }
         catch(error){
             console.warn("Could not load saved from Firestore:", error);
-        }
-    }
-
-    // Fall back to localStorage if Firestore gave nothing.
-    if(savedItems.length === 0){
-        const localSaved = getSavedVideosLocal();
-        if(localSaved.length > 0){
-            renderSavedList(localSaved);
-            return;
         }
     }
 
@@ -164,22 +134,20 @@ async function renderSubscribedChannels(){
 
     let channels = [];
 
-    // Logged in: prefer Firestore.
+    // Logged in: read subscriptions from Firestore. Only records with a real
+    // YouTube channelId are shown — legacy local-channel subscriptions from the
+    // old dataset carried no channelId and are skipped.
     if(user){
         try{
             const subs = await getSubscriptions(user.uid);
             channels = subs
+                .filter(s => Boolean(s.channelId))
                 .map(s => s.channelName || s.id)
                 .filter(Boolean);
         }
         catch(error){
             console.warn("Could not load subscriptions from Firestore:", error);
         }
-    }
-
-    // Fall back to localStorage if Firestore gave nothing.
-    if(channels.length === 0){
-        channels = getSubscribedChannelsLocal();
     }
 
     if(channels.length === 0){

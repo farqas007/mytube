@@ -16,9 +16,6 @@ youtube-server/**
 moreringset
 moreringset/**
 
-server
-server/**
-
 *.backup*
 *.log
 
@@ -32,3 +29,6 @@ worker.js
 worker-normalize.js
 .wrangler
 .wrangler/**
+
+.sst
+.sst/**

@@ -5,10 +5,7 @@
 import { auth } from "./firebase.js";
 import { onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 import { getSubscriptions, removeSubscription } from "./data.js";
-import { channelVideos } from "./youtube.js";
-
-
-const videos = window.MyTubeVideos || [];
+import { channelVideos, channel } from "./youtube.js";
 
 
 // ================= ELEMENTS =================
@@ -283,10 +280,6 @@ async function loadChannelVideos(sub, forceRefresh){
             return [];
         }
     }
-    // Local channel: filter the local dataset.
-    if(sub.channelName){
-        return videos.filter(v => v.channel === sub.channelName).slice(0, 6);
-    }
     return [];
 }
 
@@ -318,6 +311,14 @@ async function loadSubscriptions(uid, forceRefresh){
         return;
     }
 
+    // Legacy local subscriptions (no channelId) were skipped at the data
+    // layer; if none remain, show the empty state.
+    const withChannel = subs.filter(s => s.channelId);
+    if(withChannel.length === 0){
+        showState("empty");
+        return;
+    }
+
     showState("content");
     if(sectionsEl){
         sectionsEl.replaceChildren();
@@ -325,7 +326,7 @@ async function loadSubscriptions(uid, forceRefresh){
 
     // Load videos for each channel sequentially to avoid request storms.
     // Limit to 12 channels max.
-    const limited = subs.slice(0, 12);
+    const limited = withChannel.slice(0, 12);
     for(const sub of limited){
         const channelVids = await loadChannelVideos(sub, forceRefresh);
         if(sectionsEl){

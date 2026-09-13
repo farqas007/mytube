@@ -7,21 +7,12 @@ import { getVideo, related, channel, comments } from "./youtube.js";
 // ================= FIRESTORE DATA LAYER =================
 import {
     getSubscriptions, addSubscription, removeSubscription, isSubscribedByChannel,
-    addToHistory, getHistory,
+    addToHistory,
     getSaved as fsGetSaved, addToSaved, removeFromSaved, isSavedVideo,
     getLiked as fsGetLiked, addToLiked, removeFromLiked, isLikedVideo,
     getPlaylists, createPlaylist, addToPlaylist, removeFromPlaylist, getPlaylistItems,
     subscribeComments, addCommentToStore, removeCommentById
 } from "./data.js";
-
-
-// ================= VIDEO DATABASE =================
-// Single source of truth shared with the homepage (see videos.js).
-// Stable string ids are used for watch.html?id=<id>.
-// Legacy numeric ids (?id=0,1,2...) are still supported by array index.
-// YouTube video ids use the namespaced form "yt:<videoId>".
-
-const videos = window.MyTubeVideos || [];
 
 
 // ================= HELPERS =================
@@ -41,32 +32,6 @@ function isYouTubeId(raw){
 function ytSourceId(raw){
     const str = String(raw || "");
     return str.startsWith("yt:") ? str.slice(3) : "";
-}
-
-
-function getVideoById(raw){
-    // missing id defaults to the first video
-    if(raw === null || raw === undefined || raw === ""){
-        return videos[0] || null;
-    }
-    const str = String(raw);
-    // 1) stable string id
-    const byStr = videos.find(v => v.id === str);
-    if(byStr){
-        return byStr;
-    }
-    // 2) legacy numeric index (backward compatibility with watch.html?id=<n>)
-    const n = Number(str);
-    if(!Number.isNaN(n) && Number.isInteger(n) && n >= 0 && n < videos.length){
-        return videos[n];
-    }
-    return null;
-}
-
-
-function getIndexById(raw){
-    const v = getVideoById(raw);
-    return v ? videos.indexOf(v) : -1;
 }
 
 
@@ -117,14 +82,16 @@ function currentUserName(){
 
 
 const rawId = getRawId();
-const current = getVideoById(rawId);
-// stable storage key derived from the resolved video's stable string id.
-// Fully safe: never dereferences .id on undefined.
-const videoKey = current ? current.id : (videos[0] ? videos[0].id : "video");
+// MyTube is YouTube-only: no local dataset exists, so a non-"yt:" id never
+// resolves to a playable video. `current` stays null and `renderers` read the
+// asynchronously-populated `active` object (see loadYouTubeVideo).
+const current = null;
+// Fallback storage key used until a YouTube video's metadata loads.
+const videoKey = "video";
 
-// Phase 7: an actively-rendered video. For local MP4s this equals `current`.
-// For yt: ids `current` is null and `active` is populated asynchronously from
-// the YouTube API backend. Renderers read `active`, never `current`, directly.
+// Phase 7: the actively-rendered video. For "yt:" ids `active` is populated
+// asynchronously from the YouTube API backend. Renderers read `active`, never
+// `current`, directly.
 const isYt = isYouTubeId(rawId);
 let active = current;
 // Key used for localStorage-backed state (likes/saves/comments/etc). For
@@ -133,7 +100,7 @@ let activeKey = videoKey;
 
 // Resolve the storage key that should be used right now. For YouTube videos
 // `activeKey` is set once the video metadata loads; before that we fall back to
-// the resolved local key so nothing ever dereferences undefined.
+// the safe placeholder key so nothing ever dereferences undefined.
 function storageKey(){
     return activeKey || videoKey;
 }
@@ -245,59 +212,11 @@ function loadVideo(){
         return;
     }
 
-    if(!current){
-        renderErrorState();
-        return;
-    }
-
-    renderContentState();
-
-    const v = current;
-
-    if(video){
-        video.src = v.file;
-        video.poster = v.thumb;
-        video.load();
-        video.addEventListener("error", () => {
-            console.log("Video file load failed:", v.file);
-            showVideoError(true, "This video isn't available right now — missing file: " + (v.file || "?") + ". Add the file to the videos/ folder to enable playback.");
-            showBuffering(false);
-        });
-        video.addEventListener("waiting", () => {
-            showBuffering(true);
-        });
-        video.addEventListener("playing", () => {
-            showVideoError(false);
-            showBuffering(false);
-        });
-        video.addEventListener("canplay", () => {
-            showBuffering(false);
-        });
-        video.addEventListener("pause", () => {
-            showVideoError(false);
-            showBuffering(false);
-        });
-        video.addEventListener("loadedmetadata", () => {
-            showBuffering(false);
-            renderTimeDisplay();
-            maybeResumePlayback();
-        });
-        video.addEventListener("timeupdate", () => {
-            renderTimeDisplay();
-        });
-    }
-
-    const titleEl = document.getElementById("videoTitle");
-    if(titleEl){
-        titleEl.textContent = v.title;
-    }
-
-    renderVideoDetails();
-    renderChannel();
-    renderDescription();
-    renderRelatedSection();
-    renderComments();
-    syncFirestoreComments();
+    // MyTube is YouTube-only: the legacy local MP4 dataset is gone, so a
+    // non-"yt:" id (e.g. an old direct link or stored local-video record) can
+    // never resolve to a playable video. Show the clean "not found" panel
+    // instead of attempting to load a nonexistent /videos/*.mp4 file.
+    renderErrorState();
 }
 
 
@@ -319,9 +238,16 @@ function setupYtEmbed(sourceId){
     if(wrap){
         wrap.style.display = "block";
     }
+    ytEmbedEnabled = true;
+    ytTargetSourceId = sourceId;
     if(frame){
+        // enablejsapi + origin lets the IFrame Player API upgrade this embed so
+        // YouTube videos get the same auto-advance and keyboard support as local
+        // videos. The embed still plays on its own if the API never loads.
         frame.src = "https://www.youtube-nocookie.com/embed/" +
-            encodeURIComponent(sourceId) + "?rel=0&modestbranding=1&enablejsapi=0";
+            encodeURIComponent(sourceId) +
+            "?rel=0&modestbranding=1&enablejsapi=1&origin=" +
+            encodeURIComponent(window.location.origin);
     }
     if(fallback){
         fallback.style.display = "none";
@@ -339,6 +265,8 @@ function setupYtEmbed(sourceId){
     }
     showVideoError(false);
     showBuffering(false);
+    // Upgrade to the IFrame Player API for auto-advance and keyboard control.
+    loadYouTubeIframeApi();
 }
 
 
@@ -346,6 +274,8 @@ function setupYtEmbed(sourceId){
 // is only invoked when the backend reported embeddable === false, so it never
 // fires for every iframe error — only when YouTube tells us embedding is off.
 function showYtEmbedFallback(sourceId){
+    // Cancel the IFrame Player API upgrade; the plain embed takes over.
+    teardownYtPlayer();
     const wrap = document.getElementById("ytPlayerWrap");
     const frame = document.getElementById("ytPlayer");
     const fallback = document.getElementById("ytEmbedFallback");
@@ -382,6 +312,7 @@ function showYtEmbedFallback(sourceId){
 
 
 function teardownYtEmbed(){
+    teardownYtPlayer();
     const wrap = document.getElementById("ytPlayerWrap");
     const frame = document.getElementById("ytPlayer");
     if(frame){
@@ -397,6 +328,122 @@ function teardownYtEmbed(){
     if(controls){
         controls.style.display = "";
     }
+}
+
+
+// ================= YOUTUBE IFRAME PLAYER API =================
+// Upgrades the embed with the official IFrame Player API so YouTube videos get
+// the same auto-advance and keyboard behavior as local videos. The plain embed
+// (already set in setupYtEmbed) keeps playing if the API script cannot load.
+
+let relatedItems = [];
+let ytTargetSourceId = "";
+let ytEmbedEnabled = false;
+let ytPlayer = null;
+let ytPlayerReady = false;
+let ytApiScriptLoading = false;
+
+
+// Keyboard/auto-advance shortcuts should only touch the YouTube player when it
+// is actually present and ready; otherwise they fall through to the native
+// <video> path (or no-op).
+function ytKeyControlAvailable(){
+    return isYt && ytPlayer && ytPlayerReady;
+}
+
+
+// Destroy any active API player and reset the embed-upgrade state.
+function teardownYtPlayer(){
+    if(ytPlayer){
+        try{
+            ytPlayer.destroy();
+        }
+        catch(error){
+            console.warn("Could not destroy YouTube player:", error);
+        }
+        ytPlayer = null;
+    }
+    ytPlayerReady = false;
+    ytEmbedEnabled = false;
+    ytTargetSourceId = "";
+}
+
+
+// Create the API player on the existing <iframe id="ytPlayer">. Called only for
+// the currently active YouTube embed (the page shows one video at a time).
+function initYtApiPlayer(sourceId){
+    if(!isYt || !ytEmbedEnabled || !sourceId){
+        return;
+    }
+    if(ytSourceId(rawId) !== sourceId){
+        return; // stale API callback for a replaced embed.
+    }
+    const frame = document.getElementById("ytPlayer");
+    if(!frame || typeof YT === "undefined" || !YT.Player){
+        return;
+    }
+    if(ytPlayer){
+        return; // already upgraded.
+    }
+    try{
+        ytPlayer = new YT.Player(frame, {
+            videoId: sourceId,
+            playerVars: {
+                rel: 0,
+                modestbranding: 1,
+                origin: window.location.origin
+            },
+            events: {
+                onReady: function(){
+                    ytPlayerReady = true;
+                },
+                onStateChange: handleYtPlayerState
+            }
+        });
+    }
+    catch(error){
+        console.warn("YouTube IFrame API could not initialize:", error);
+        ytPlayer = null;
+        ytPlayerReady = false;
+    }
+}
+
+
+// Inject the IFrame Player API script exactly once. Appending a script tag is
+// required for the API to attach to the ready callback on a static page.
+function loadYouTubeIframeApi(){
+    if(typeof YT !== "undefined" && YT && YT.Player){
+        initYtApiPlayer(ytTargetSourceId);
+        return;
+    }
+    if(ytApiScriptLoading){
+        return;
+    }
+    ytApiScriptLoading = true;
+    window.onYouTubeIframeAPIReady = function(){
+        ytApiScriptLoading = false;
+        initYtApiPlayer(ytTargetSourceId);
+    };
+    const tag = document.createElement("script");
+    tag.src = "https://www.youtube.com/iframe_api";
+    tag.async = true;
+    tag.onerror = function(){
+        // API failed to load (e.g. network/CSP) — the plain embed still plays.
+        ytApiScriptLoading = false;
+    };
+    document.head.appendChild(tag);
+}
+
+
+// Auto-advance: when a YouTube video ends, trigger the existing next-video flow.
+function handleYtPlayerState(event){
+    if(!isYt || !ytEmbedEnabled || !ytPlayerReady){
+        return;
+    }
+    if(!(event && typeof event.data === "number" && event.data === YT.PlayerState.ENDED)){
+        return;
+    }
+    nextVideo();
 }
 
 
@@ -498,11 +545,23 @@ async function loadYouTubeVideo(){
 // Render the title and all metadata sub-views for the currently-active YouTube
 // video (or the clean fallback object on metadata failure). Shared by both the
 // success and the failure paths so neither leaves "Loading..." placeholders.
+function setPageMetaDescription(v){
+    const descEl = document.querySelector('meta[name="description"]');
+    if(!descEl){
+        return;
+    }
+    const text = v && v.description ? v.description : "Watch videos on MyTube";
+    descEl.setAttribute("content", text.slice(0, 160));
+}
+
+
 function renderYtSubViews(v){
     const titleEl = document.getElementById("videoTitle");
     if(titleEl){
         titleEl.textContent = v.title;
     }
+    document.title = (v && v.title ? v.title : "Watch") + " - MyTube";
+    setPageMetaDescription(v);
 
     renderVideoDetails();
     renderChannel();
@@ -912,22 +971,6 @@ function setupDescriptionToggle(){
 // ================= RELATED VIDEOS + UP NEXT =================
 
 
-function pickRelated(max = 6){
-    const v = active || current;
-    if(!v){
-        return [];
-    }
-
-    const sameCategory = videos.filter(x => x.id !== v.id && x.category === v.category);
-
-    const fallback = videos.filter(x => x.id !== v.id && x.category !== v.category);
-
-    const all = sameCategory.concat(fallback);
-
-    return all.slice(0, max);
-}
-
-
 // Build one suggested-video list item.
 function buildSuggestedItem(v){
     const item = document.createElement("div");
@@ -980,39 +1023,40 @@ function renderSuggestedList(items){
     if(!listEl){
         return;
     }
+    relatedItems = Array.isArray(items) ? items.slice() : [];
     listEl.replaceChildren();
     items.forEach(v => {
         listEl.appendChild(buildSuggestedItem(v));
     });
+    // YouTube Next/auto-advance depends on this list; refresh its button state.
+    if(isYt){
+        renderPrevNext();
+    }
 }
 
 
-// For local videos: same-category-then-fallback ranking (existing behavior).
 function renderRelatedSection(){
     const listEl = document.getElementById("relatedList");
     if(!listEl){
         return;
     }
 
-    if(isYt){
-        // Fetch genuinely related YouTube videos via the backend.
-        const sourceId = ytSourceId(rawId);
-        listEl.replaceChildren();
-        const loading = document.createElement("p");
-        loading.className = "comment-empty";
-        loading.textContent = "Loading related videos...";
-        listEl.appendChild(loading);
-        loadRelatedFromYouTube(sourceId, listEl);
+    if(!isYt){
         return;
     }
 
-    const related = pickRelated(6);
-    renderSuggestedList(related);
+    // Fetch genuinely related YouTube videos via the backend.
+    const sourceId = ytSourceId(rawId);
+    listEl.replaceChildren();
+    const loading = document.createElement("p");
+    loading.className = "comment-empty";
+    loading.textContent = "Loading related videos...";
+    listEl.appendChild(loading);
+    loadRelatedFromYouTube(sourceId, listEl);
 }
 
 
 // Phase 7: use the official YouTube API to suggest related/up-next videos.
-// On any failure we fall back to the existing local suggestions.
 async function loadRelatedFromYouTube(sourceId, listEl){
     let remote = [];
     let apiError = "";
@@ -1036,18 +1080,11 @@ async function loadRelatedFromYouTube(sourceId, listEl){
         return;
     }
 
-    // Fallback to local suggestions (existing behavior).
-    const local = pickRelated(6);
-    if(local.length){
-        renderSuggestedList(local);
-    }
-    else{
-        listEl.replaceChildren();
-        const empty = document.createElement("p");
-        empty.className = "comment-empty";
-        empty.textContent = apiError ? ("Related unavailable: " + apiError) : "No related videos.";
-        listEl.appendChild(empty);
-    }
+    listEl.replaceChildren();
+    const empty = document.createElement("p");
+    empty.className = "comment-empty";
+    empty.textContent = apiError ? ("Related unavailable: " + apiError) : "No related videos.";
+    listEl.appendChild(empty);
 }
 
 
@@ -1059,13 +1096,27 @@ function navigateToVideo(videoId){
 // ================= PREVIOUS / NEXT VIDEO =================
 
 
+// The first "Up Next" suggestion is the next video for YouTube videos.
+function getUpNextVideoId(){
+    const first = relatedItems[0];
+    return first && first.id ? first.id : "";
+}
+
+
 function renderPrevNext(){
     const prevBtn = document.getElementById("prevBtn");
     const nextBtn = document.getElementById("nextBtn");
 
-    const idx = getIndexById(rawId);
-    const hasPrev = idx > 0;
-    const hasNext = idx >= 0 && idx < videos.length - 1;
+    let hasPrev = false;
+    let hasNext = false;
+
+    if(isYt){
+        // YouTube videos have no bounded play order on this page, so Previous
+        // stays disabled. Next maps to the first Up Next suggestion and also
+        // drives auto-advance.
+        hasPrev = false;
+        hasNext = Boolean(getUpNextVideoId());
+    }
 
     if(prevBtn){
         prevBtn.disabled = !hasPrev;
@@ -1079,17 +1130,18 @@ function renderPrevNext(){
 
 
 window.prevVideo = function(){
-    const idx = getIndexById(rawId);
-    if(idx > 0){
-        navigateToVideo(videos[idx - 1].id);
-    }
+    // YouTube-only: Previous is disabled on every video (no bounded play order).
+    return;
 };
 
 
 window.nextVideo = function(){
-    const idx = getIndexById(rawId);
-    if(idx >= 0 && idx < videos.length - 1){
-        navigateToVideo(videos[idx + 1].id);
+    if(!isYt){
+        return;
+    }
+    const upNextId = getUpNextVideoId();
+    if(upNextId){
+        navigateToVideo(upNextId);
     }
 };
 
@@ -1205,31 +1257,7 @@ function renderComments(){
 
     // For YouTube videos, public comments (async) and MyTube comments are shown
     // together in this one section, clearly distinguished by sub-headings.
-    if(isYt){
-        renderMergedComments(container, countEl);
-        return;
-    }
-
-    // --- local/MyTube path (local MP4 videos) ---
-    const sorted = getCommentsSource().sort((a, b) => b.timestamp - a.timestamp);
-
-    if(countEl){
-        countEl.textContent = `Comments (${sorted.length})`;
-    }
-
-    container.replaceChildren();
-
-    if(sorted.length === 0){
-        const empty = document.createElement("p");
-        empty.className = "comment-empty";
-        empty.textContent = "No comments yet. Be the first to comment!";
-        container.appendChild(empty);
-        return;
-    }
-
-    sorted.forEach(comment => {
-        container.appendChild(buildLocalCommentNode(comment));
-    });
+    renderMergedComments(container, countEl);
 }
 
 
@@ -1542,42 +1570,6 @@ function syncPlayButton(){
 }
 
 
-// Restore playback position from watch history (stored as a 0-100 percentage)
-// for local videos. YouTube embeds are not resumed (no JS API wired).
-async function maybeResumePlayback(){
-    if(isYt || !video || !video.duration || video.dataset.resumeDone === "1"){
-        return;
-    }
-    const uid = uidOrNull();
-    if(!uid){
-        return;
-    }
-    const videoId = (current && current.id) || storageKey();
-    try{
-        const items = await getHistory(uid, 25);
-        const entry = items.find(i =>
-            i.videoId === videoId &&
-            typeof i.progress === "number" &&
-            i.progress > 1
-        );
-        if(!entry){
-            return;
-        }
-        // Never resume at the very end of a video — treat "finished" as done.
-        const pct = Math.min(entry.progress, 98);
-        const target = (pct / 100) * video.duration;
-        if(isFinite(target) && target > 1){
-            video.dataset.resumeDone = "1";
-            video.currentTime = target;
-            renderTimeDisplay();
-        }
-    }
-    catch(e){
-        console.warn("Resume lookup failed:", e);
-    }
-}
-
-
 function setupPlayerControls(){
     if(!video){
         return;
@@ -1591,14 +1583,6 @@ function setupPlayerControls(){
 
     video.addEventListener("play", syncPlayButton);
     video.addEventListener("pause", syncPlayButton);
-
-    // Auto-advance to the next local video when the current one ends.
-    video.addEventListener("ended", () => {
-        const idx = getIndexById(rawId);
-        if(idx >= 0 && idx < videos.length - 1){
-            navigateToVideo(videos[idx + 1].id);
-        }
-    });
 
     video.addEventListener("timeupdate", () => {
         if(progress && video.duration){
@@ -1654,6 +1638,15 @@ window.playPause = function(){
 
 
 window.muteVideo = function(){
+    if(ytKeyControlAvailable()){
+        if(ytPlayer.isMuted()){
+            ytPlayer.unMute();
+        }
+        else{
+            ytPlayer.mute();
+        }
+        return;
+    }
     if(!video){
         return;
     }
@@ -1749,6 +1742,15 @@ function handlePlayerKeydown(e){
 
 
 function toggleShortcut(){
+    if(ytKeyControlAvailable()){
+        if(ytPlayer.getPlayerState() === YT.PlayerState.PLAYING){
+            ytPlayer.pauseVideo();
+        }
+        else{
+            ytPlayer.playVideo();
+        }
+        return;
+    }
     if(!video){
         return;
     }
@@ -1765,6 +1767,15 @@ function toggleShortcut(){
 
 
 function seekShortcut(amount){
+    if(ytKeyControlAvailable()){
+        const duration = ytPlayer.getDuration();
+        if(!duration || !isFinite(duration)){
+            return;
+        }
+        const next = Math.min(Math.max(ytPlayer.getCurrentTime() + amount, 0), duration);
+        ytPlayer.seekTo(next, true);
+        return;
+    }
     if(!video){
         return;
     }
@@ -1891,23 +1902,18 @@ function formatCount(n){
 
 
 function renderLikeDislike(){
-    // For YouTube videos the Like button shows the real public like count
-    // (statistics.likeCount) from the API — no invented count and no duplicate
-    // stats row. Local videos keep their existing counts.
+    // The Like button shows the real public like count (statistics.likeCount)
+    // from the API — no invented count and no duplicate stats row. YouTube's
+    // public Data API does not expose dislike counts, so the Dislike control is
+    // shown truthfully with no fake number.
     if(likeBtn){
         likeBtn.classList.toggle("active", isLiked);
-        likeBtn.textContent = isYt
-            ? "👍 " + (isLiked ? "Liked" : "Like") + ytLikeCountSuffix()
-            : "👍 " + (isLiked ? "Liked" : "Like") + " " + formatCount(storedLikeCount);
+        likeBtn.textContent = "👍 " + (isLiked ? "Liked" : "Like") + ytLikeCountSuffix();
         likeBtn.setAttribute("aria-pressed", isLiked ? "true" : "false");
     }
     if(dislikeBtn){
         dislikeBtn.classList.toggle("active", isDisliked);
-        // YouTube's public Data API does not expose dislike counts, so the
-        // Dislike control is shown truthfully with no fake number.
-        dislikeBtn.textContent = isYt
-            ? "👎 " + (isDisliked ? "Disliked" : "Dislike")
-            : "👎 " + (isDisliked ? "Disliked" : "Dislike") + " " + formatCount(storedDislikeCount);
+        dislikeBtn.textContent = "👎 " + (isDisliked ? "Disliked" : "Dislike");
         dislikeBtn.setAttribute("aria-pressed", isDisliked ? "true" : "false");
     }
 }
@@ -2373,7 +2379,8 @@ function setupPlaylistUI(){
 // ================= WATCH HISTORY =================
 // Records video views to Firestore when logged in. Debounced to avoid
 // excessive writes — a new record is created or updated at most once per
-// 30-second window. Progress is tracked for local videos.
+// 30-second window. YouTube embeds don't expose playback progress, so the
+// percentage is always recorded as 0.
 
 let historyTimer = null;
 const HISTORY_DEBOUNCE_MS = 30000;
@@ -2389,9 +2396,7 @@ function recordHistory(){
     }
     clearTimeout(historyTimer);
     historyTimer = setTimeout(() => {
-        const progress = (!isYt && video && video.duration)
-            ? Math.round((video.currentTime / video.duration) * 100)
-            : 0;
+        const progress = 0;
         addToHistory(uid, {
             videoId: v.id || storageKey(),
             type: isYt ? "youtube" : "local",

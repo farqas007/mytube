@@ -7,11 +7,38 @@ import { auth } from "./firebase.js";
 
 import {
     createUserWithEmailAndPassword,
+    onAuthStateChanged,
+    sendPasswordResetEmail,
     signInWithEmailAndPassword,
-    signOut,
-    onAuthStateChanged
+    signOut
 }
 from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+
+
+
+// ================= SAFE ERROR MAPPING =================
+// Firebase error messages can reveal whether an account exists or leak
+// internal implementation detailsches. Map to safe, generic messages and
+// never surface raw Firebase error.message/error.code in the UI.
+
+const FRIENDLY_AUTH_ERRORS = {
+    "auth/email-already-in-use": "An account with this email already exists.",
+    "auth/invalid-email":        "Please enter a valid email address.",
+    "auth/weak-password":        "Password does not meet the required security rules.",
+    "auth/user-not-found":       "Invalid email or password.",
+    "auth/wrong-password":       "Invalid email or password.",
+    "auth/invalid-credential":   "Invalid email or password.",
+    "auth/too-many-requests":    "Too many attempts. Please try again later.",
+    "auth/network-request-failed": "Network error. Please check your connection and try again."
+};
+
+
+function friendlyAuthError(error){
+    // Prefer a generic message for known codes; otherwise fall back to a safe
+    // generic message. Never expose the raw Firebase error.message to users.
+    const rawCode = error && error.code ? String(error.code) : "";
+    return FRIENDLY_AUTH_ERRORS[rawCode] || "Something went wrong. Please try again.";
+}
 
 
 
@@ -39,7 +66,7 @@ window.signup = async function(){
 
     if(!email || !password){
 
-        msg.innerHTML="Email and Password required ❌";
+        msg.textContent="Email and Password required ❌";
         return;
 
     }
@@ -56,28 +83,28 @@ window.signup = async function(){
         );
 
 
-        msg.innerHTML="Account Created ✅";
+        msg.textContent="Account Created ✅";
 
 
         setTimeout(()=>{
 
-            window.location.href="login.html";
+            window.location.href="index.html";
 
         },1500);
 
 
 
     }
-
-
     catch(error){
+
 
         console.log(error.code);
 
-        msg.innerHTML=error.message;
+
+        msg.textContent=friendlyAuthError(error);
+
 
     }
-
 
 };
 
@@ -117,7 +144,7 @@ window.loginUser = async function(){
 
     if(!email || !password){
 
-        msg.innerHTML="Email and Password required ❌";
+        msg.textContent="Email and Password required ❌";
 
         return;
 
@@ -138,7 +165,7 @@ window.loginUser = async function(){
 
 
 
-        msg.innerHTML="Login Successful ✅";
+        msg.textContent="Login Successful ✅";
 
 
 
@@ -159,7 +186,7 @@ window.loginUser = async function(){
         console.log(error.code);
 
 
-        msg.innerHTML=error.message;
+        msg.textContent=friendlyAuthError(error);
 
 
     }
@@ -207,6 +234,74 @@ window.logoutUser = async function(){
 
 
 
+
+
+
+
+// ================= FORGOT PASSWORD =================
+
+
+window.resetPassword = async function(){
+
+
+    const email = document
+    .getElementById("resetEmail")
+    .value
+    .trim();
+
+
+    const msg = document.getElementById("resetMsg");
+
+
+
+    if(!email){
+
+        msg.textContent="Email is required ❌";
+        return;
+
+    }
+
+
+
+    const validEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    if(!validEmail.test(email)){
+
+        msg.textContent="Please enter a valid email address ❌";
+        return;
+
+    }
+
+
+
+    try{
+
+
+        await sendPasswordResetEmail(auth, email);
+
+
+        msg.textContent="If that account exists, a password reset email has been sent ✅";
+
+
+        document.getElementById("resetEmail").value="";
+
+
+    }
+
+
+    catch(error){
+
+
+        console.log(error.code);
+
+
+        msg.textContent="Could not send the reset email. Please try again later ❌";
+
+
+    }
+
+
+};
 
 
 
@@ -271,7 +366,7 @@ onAuthStateChanged(auth,(user)=>{
 
         if(isHeaderLoginBtn){
 
-            loginBtn.innerHTML="Logged In ✅";
+            loginBtn.textContent="Logged In ✅";
 
             loginBtn.onclick=function(){
 
@@ -304,7 +399,7 @@ onAuthStateChanged(auth,(user)=>{
 
         if(isHeaderLoginBtn){
 
-            loginBtn.innerHTML="Login";
+            loginBtn.textContent="Login";
 
             loginBtn.onclick=function(){
 
@@ -365,6 +460,78 @@ if(signupForm){
         e.preventDefault();
 
         signup();
+
+    });
+
+}
+
+
+
+
+const resetForm =
+document.getElementById("resetForm");
+
+if(resetForm){
+
+    resetForm.addEventListener("submit",(e)=>{
+
+        e.preventDefault();
+
+        resetPassword();
+
+    });
+
+}
+
+
+const forgotLink =
+document.getElementById("forgotLink");
+
+if(forgotLink){
+
+    forgotLink.addEventListener("click",(e)=>{
+
+        e.preventDefault();
+
+        const resetBox =
+        document.getElementById("resetBox");
+
+        if(!resetBox) return;
+
+        resetBox.style.display="block";
+
+        const resetEmail =
+        document.getElementById("resetEmail");
+
+        if(resetEmail){
+            resetEmail.focus();
+        }
+
+        resetBox.scrollIntoView({
+            behavior: "smooth",
+            block: "nearest"
+        });
+
+    });
+
+}
+
+
+const cancelReset =
+document.getElementById("cancelReset");
+
+if(cancelReset){
+
+    cancelReset.addEventListener("click",(e)=>{
+
+        e.preventDefault();
+
+        const resetBox =
+        document.getElementById("resetBox");
+
+        if(resetBox){
+            resetBox.style.display="none";
+        }
 
     });
 

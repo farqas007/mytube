@@ -320,7 +320,7 @@ async function handleTrending(req, res, params){
   }
 
   const maxResults = Math.min(Math.max(parseInt(params.get("max") || "20", 10) || 20, 1), 50);
-  const region = (params.get("region") || "US").toString().toUpperCase().slice(0, 2);
+  const region = (params.get("region") || "PK").toString().toUpperCase().slice(0, 2);
   const pageToken = (params.get("pageToken") || "").trim();
   const cacheKey = "trending:" + region + ":" + maxResults + ":" + pageToken;
 

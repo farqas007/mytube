@@ -13,9 +13,6 @@ import {
 } from "./data.js";
 
 
-const videos = window.MyTubeVideos || [];
-
-
 // ================= ELEMENTS =================
 
 const loggedOutEl = document.getElementById("libLoggedOut");
@@ -167,12 +164,20 @@ async function renderHistory(){
         console.warn("Failed to load history:", e);
     }
 
+    const before = items.length;
+    items = items.filter(isYouTubeVideo);
+
     if(clearHistoryBtn){
         clearHistoryBtn.style.display = items.length > 0 ? "" : "none";
     }
 
     if(items.length === 0){
-        renderEmptyMessage(historyListEl, "No watch history yet. Start watching videos!");
+        renderEmptyMessage(
+            historyListEl,
+            before === 0
+                ? "No watch history yet. Start watching videos!"
+                : "Older local videos are no longer available. Only YouTube videos are kept here."
+        );
         return;
     }
 
@@ -204,15 +209,7 @@ async function renderSaved(){
     savedListEl.replaceChildren();
 
     if(!currentUid){
-        // Fall back to localStorage.
-        const localSaved = getLocalSaved();
-        if(localSaved.length === 0){
-            renderEmptyMessage(savedListEl, "No saved videos. Tap Save on any video to add it here.");
-            return;
-        }
-        localSaved.forEach(v => {
-            savedListEl.appendChild(buildVideoItem(v));
-        });
+        renderEmptyMessage(savedListEl, "Log in to see your saved videos.");
         return;
     }
 
@@ -224,8 +221,16 @@ async function renderSaved(){
         console.warn("Failed to load saved:", e);
     }
 
+    const before = items.length;
+    items = items.filter(isYouTubeVideo);
+
     if(items.length === 0){
-        renderEmptyMessage(savedListEl, "No saved videos. Tap Save on any video to add it here.");
+        renderEmptyMessage(
+            savedListEl,
+            before === 0
+                ? "No saved videos. Tap Save on any video to add it here."
+                : "Older local videos are no longer available. Only YouTube videos are kept here."
+        );
         return;
     }
 
@@ -262,15 +267,7 @@ async function renderLiked(){
     likedListEl.replaceChildren();
 
     if(!currentUid){
-        // Fall back to localStorage.
-        const localLiked = getLocalLiked();
-        if(localLiked.length === 0){
-            renderEmptyMessage(likedListEl, "No liked videos. Like a video to add it here.");
-            return;
-        }
-        localLiked.forEach(v => {
-            likedListEl.appendChild(buildVideoItem(v));
-        });
+        renderEmptyMessage(likedListEl, "Log in to see your liked videos.");
         return;
     }
 
@@ -282,8 +279,16 @@ async function renderLiked(){
         console.warn("Failed to load liked:", e);
     }
 
+    const before = items.length;
+    items = items.filter(isYouTubeVideo);
+
     if(items.length === 0){
-        renderEmptyMessage(likedListEl, "No liked videos. Like a video to add it here.");
+        renderEmptyMessage(
+            likedListEl,
+            before === 0
+                ? "No liked videos. Like a video to add it here."
+                : "Older local videos are no longer available. Only YouTube videos are kept here."
+        );
         return;
     }
 
@@ -427,8 +432,15 @@ async function openPlaylistDetail(playlistId, playlistName){
     if(!playlistDetailItems){
         return;
     }
+    const before = items.length;
+    items = items.filter(isYouTubeVideo);
     if(items.length === 0){
-        renderEmptyMessage(playlistDetailItems, "This playlist is empty. Use the Playlist button on any video to add it here.");
+        renderEmptyMessage(
+            playlistDetailItems,
+            before === 0
+                ? "This playlist is empty. Use the Playlist button on any video to add it here."
+                : "Older local videos are no longer available. Only YouTube videos are kept here."
+        );
         return;
     }
 
@@ -466,30 +478,14 @@ function closePlaylistDetail(){
 }
 
 
-// ================= LOCAL STORAGE FALLBACK =================
+// ================= YOUTUBE-ONLY FILTER =================
 
-function getLocalSaved(){
-    return videos.filter(v => {
-        try{
-            return localStorage.getItem("mytube_saved_" + v.id) === "1";
-        }
-        catch(e){
-            return false;
-        }
-    });
-}
-
-
-function getLocalLiked(){
-    return videos.filter(v => {
-        try{
-            const state = localStorage.getItem("mytube_like_state_" + v.id);
-            return state === "1";
-        }
-        catch(e){
-            return false;
-        }
-    });
+// Only YouTube-hosted records are renderable. Old records from the legacy local
+// MP4 dataset have videoId like "ghajini" (and type "local"), which would
+// resolve to broken watch links, so they are silently skipped.
+function isYouTubeVideo(item){
+    const id = String(item.videoId || item.id || "");
+    return id.indexOf("yt:") === 0 || item.type === "youtube";
 }
 
 
@@ -512,6 +508,16 @@ function renderCurrentTab(){
 
 
 // ================= INIT =================
+
+// Deep-link support: the homepage sidebar links here with ?tab=history|saved|
+// liked|playlists. Apply it before wiring the tab buttons so the correct tab is
+// shown (and later rendered) on load.
+(function applyTabFromUrl(){
+    const tab = new URLSearchParams(window.location.search).get("tab");
+    if(tab === "history" || tab === "saved" || tab === "liked" || tab === "playlists"){
+        switchTab(tab);
+    }
+})();
 
 tabs.forEach(tab => {
     tab.addEventListener("click", () => {

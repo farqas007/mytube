@@ -19,6 +19,43 @@ function originAllowed(request) {
   return ALLOWED_ORIGINS.has(request?.headers?.get("Origin") || "");
 }
 
+const CSP_DIRECTIVES = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-inline' https://www.gstatic.com https://www.youtube.com",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: https://i.ytimg.com https://yt3.ggpht.com",
+  "font-src 'self' data:",
+  "connect-src 'self' https://www.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firestore.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com",
+  "frame-src https://www.youtube.com https://www.youtube-nocookie.com",
+  "media-src 'self'",
+  "object-src 'none'",
+  "worker-src 'self' blob:",
+  "base-uri 'self'",
+  "frame-ancestors 'self'"
+].join("; ");
+
+const SECURITY_HEADERS = {
+  "Content-Security-Policy": CSP_DIRECTIVES,
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "SAMEORIGIN",
+  "Referrer-Policy": "strict-origin-when-cross-origin",
+  "Strict-Transport-Security": "max-age=31536000; includeSubDomains"
+};
+
+function withSecurityHeaders(response) {
+  const headers = new Headers(response.headers);
+
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
+    headers.set(name, value);
+  }
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
 // -----------------------------------------------------------------------------
 // Simple per-IP sliding-window rate limit. Uses the Cloudflare-provided client
 // IP when available. In-memory per-isolate, so it is best-effort (not durable),
@@ -144,8 +181,11 @@ function normalizeError(error, status = 500) {
     };
   }
 
+  // Catch-all: never echo the upstream/API error.message back to the client.
+  // Return a safe, generic message. (Server can still log error?.message
+  // server-side if desired; it is never sent to the client.)
   return {
-    error: error?.message || "YouTube API request failed.",
+    error: "Something went wrong while contacting the video service. Please try again later.",
     code: "API_ERROR"
   };
 }
@@ -725,6 +765,19 @@ async function handleAPI(request, env) {
         apiKey
       );
 
+      // YouTube returns an empty list (not an error) for a video id that has
+      // been removed or never existed. Translate that into a clean 404 — the
+      // watch page treats HTTP 404 as the "video unavailable" state.
+      if (!item) {
+        return json(
+          {
+            video: null
+          },
+          404,
+          request
+        );
+      }
+
       return json(
         {
           video: normalizeVideoItem(item)
@@ -857,10 +910,10 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (url.pathname.startsWith("/api/")) {
-      return handleAPI(request, env);
-    }
+    const response = url.pathname.startsWith("/api/")
+      ? await handleAPI(request, env)
+      : await env.ASSETS.fetch(request);
 
-    return env.ASSETS.fetch(request);
+    return withSecurityHeaders(response);
   }
 };
