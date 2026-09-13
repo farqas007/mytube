@@ -1,0 +1,6 @@
+{
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260911.1",
+    "sst": "^4.17.1"
+  }
+}
