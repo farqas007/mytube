@@ -26,6 +26,21 @@ import fs from "node:fs";
 import path from "node:path";
 import { URL, fileURLToPath } from "node:url";
 import * as normalize from "../shared/normalize.js";
+import {
+  FEED_POOL_TTL_MS,
+  FEED_POOL_REGIONS,
+  FEED_POOL_PAGE_SIZE,
+  availableTopics,
+  buildFeedPage,
+  decodeFeedCursor,
+  topicFromTags
+} from "../shared/feed.js";
+import {
+  dedupeSearchResults,
+  normalizeQuery,
+  resolveSearchFilters,
+  resolveSearchMax
+} from "../shared/search.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -127,6 +142,37 @@ function rateLimitAllowed(req){
   }
 
   return bucket.count <= RATE_MAX_PER_WINDOW;
+}
+
+// Dedicated budget for search.list, which costs a flat 100 quota units per call
+// (versus 1 unit for videos.list). Mirrors searchRateLimitAllowed in worker.js so
+// both backends behave identically.
+const SEARCH_RATE_WINDOW_MS = 5 * 60 * 1000;
+const SEARCH_RATE_MAX_PER_WINDOW = 40;
+const searchRateBuckets = new Map();
+
+function searchRateLimitAllowed(req){
+  const ip = req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+  const bucket = searchRateBuckets.get(ip) || { count: 0, windowStart: now };
+
+  if(now - bucket.windowStart >= SEARCH_RATE_WINDOW_MS){
+    bucket.count = 0;
+    bucket.windowStart = now;
+  }
+
+  bucket.count++;
+  searchRateBuckets.set(ip, bucket);
+
+  if(searchRateBuckets.size > 5000){
+    for(const [key, entry] of searchRateBuckets){
+      if(now - entry.windowStart >= SEARCH_RATE_WINDOW_MS){
+        searchRateBuckets.delete(key);
+      }
+    }
+  }
+
+  return bucket.count <= SEARCH_RATE_MAX_PER_WINDOW;
 }
 
 function sendJSON(res, status, obj){
@@ -739,9 +785,116 @@ function handlePing(req, res){
   return sendJSON(res, 200, { ok: true, service: "mytube-youtube-api", configured: Boolean(API_KEY) });
 }
 
-// GET /api/trending?max=<n>&region=<code>
-// Uses the official YouTube Data API "videos?chart=mostPopular" endpoint, which
-// is the closest official equivalent to a YouTube "Trending" / homepage feed.
+// GET /api/trending?max=<n>&seed=<s>&topic=<t>&region=<code>&pageToken=<cursor>
+//
+// Contract is unchanged: `{ videos, nextPageToken }`.
+//
+// YouTube's `videos.list?chart=mostPopular` is one static, region-scoped list of
+// roughly 200 videos whose first page never changes, and it accepts no ordering,
+// shuffle or seed parameter. So the homepage pool below collects the same official
+// chart for several regions (1 quota unit each, verified disjoint in production)
+// and shared/feed.js orders that pool with a per-refresh seed. One pool build
+// serves every visitor for FEED_POOL_TTL_MS, and each refresh reshuffles real
+// videos at zero extra quota.
+//
+//   seed=""  -> deterministic pool order (sitemap generator / legacy callers)
+//   seed="x" -> seeded permutation, i.e. a different real feed per refresh
+//
+// `_t` is accepted as a legacy alias for `seed`. It never reached YouTube before
+// (the upstream cache key is built from the YouTube URL), so the old cache-buster
+// did nothing; it now genuinely changes the feed and still costs nothing.
+const FEED_POOL_CACHE_KEY = "mytube:feed:pool";
+let feedPoolEntry = null;
+let feedPoolInflight = null;
+
+function getCachedFeedPool(){
+  if(!feedPoolEntry){
+    return null;
+  }
+  if(Date.now() - feedPoolEntry.at > FEED_POOL_TTL_MS){
+    feedPoolEntry = null;
+    return null;
+  }
+  return feedPoolEntry.value;
+}
+
+async function fetchFeedRegion(region){
+  const url = YT_API_BASE + "/videos?part=" + VIDEO_PARTS_FULL +
+    "&chart=mostPopular&regionCode=" + encodeURIComponent(region) +
+    "&maxResults=" + FEED_POOL_PAGE_SIZE;
+  const data = await ytFetch("feedregion:" + region, url);
+  const videos = [];
+  const ids = new Set();
+
+  for(const item of (data.items || [])){
+    const video = normalize.normalizeVideoItem(item);
+    if(!video || ids.has(video.sourceId)){
+      continue;
+    }
+    ids.add(video.sourceId);
+    videos.push({
+      ...video,
+      topic: topicFromTags(item && item.snippet ? item.snippet.tags : null)
+    });
+  }
+
+  return { region, videos, ids };
+}
+
+async function buildFeedPool(){
+  const regions = await Promise.all(
+    FEED_POOL_REGIONS.map(region =>
+      fetchFeedRegion(region).catch(() => ({ region, videos: [], ids: new Set() }))
+    )
+  );
+
+  const items = [];
+  const seen = new Set();
+  const regionIds = {};
+
+  for(const entry of regions){
+    regionIds[entry.region] = entry.ids;
+    for(const video of entry.videos){
+      if(seen.has(video.sourceId)){
+        continue;
+      }
+      seen.add(video.sourceId);
+      items.push(video);
+    }
+  }
+
+  if(!items.length){
+    const primary = FEED_POOL_REGIONS[0] || "US";
+    const fallback = await fetchFeedRegion(primary).catch(() => ({ videos: [], ids: new Set() }));
+    regionIds[primary] = fallback.ids;
+    items.push(...fallback.videos);
+  }
+
+  return { items, regionIds, topics: availableTopics(items) };
+}
+
+// One shared build for all concurrent callers, so a burst of page loads cannot
+// each spend FEED_POOL_REGIONS.length quota units.
+async function getFeedPool(){
+  const cached = getCachedFeedPool();
+  if(cached){
+    return cached;
+  }
+
+  if(!feedPoolInflight){
+    feedPoolInflight = buildFeedPool()
+      .then(pool => {
+        feedPoolEntry = { at: Date.now(), value: pool };
+        return pool;
+      })
+      .finally(() => {
+        feedPoolInflight = null;
+      });
+  }
+
+  return feedPoolInflight;
+}
+
 async function handleTrending(req, res, params){
   if(!API_KEY){
     return sendJSON(res, 503, {
@@ -750,20 +903,48 @@ async function handleTrending(req, res, params){
     });
   }
 
-  const maxResults = Math.min(Math.max(parseInt(params.get("max") || "20", 10) || 20, 1), 50);
-  const region = (params.get("region") || "PK").toString().toUpperCase().slice(0, 2);
+  const maxResults = Math.min(Math.max(parseInt(params.get("max") || "12", 10) || 12, 1), 50);
+  const region = (params.get("region") || "").toString().toUpperCase().slice(0, 2);
   const pageToken = (params.get("pageToken") || "").trim();
-  const cacheKey = "trending:" + region + ":" + maxResults + ":" + pageToken;
+  const rawSeed = params.get("seed") || params.get("_t") || "";
+  const topic = (params.get("topic") || "").trim();
 
   try{
-    let url = YT_API_BASE + "/videos?part=" + VIDEO_PARTS_FULL + "&chart=mostPopular" +
-      "&regionCode=" + encodeURIComponent(region) + "&maxResults=" + maxResults;
-    if(pageToken){
-      url += "&pageToken=" + encodeURIComponent(pageToken);
+    const pool = await getFeedPool();
+    const cursor = decodeFeedCursor(pageToken);
+
+    let items = pool.items;
+    let requestedRegion = region;
+
+    if(requestedRegion && !pool.regionIds[requestedRegion]){
+      requestedRegion = "";
     }
-    const data = await ytFetch(cacheKey, url);
-    const { videos } = normalize.normalizeVideosResponse(data);
-    return sendJSON(res, 200, { videos, nextPageToken: data.nextPageToken || "" });
+
+    // `region` keeps its original meaning: restrict the feed to one region's
+    // chart, exactly like the previous single-chart implementation. With no
+    // region the feed spans the whole pool, which is the point of the pool.
+    if(requestedRegion && !cursor){
+      const ids = pool.regionIds[requestedRegion] || new Set();
+      items = items.filter(video => ids.has(video.sourceId));
+    }
+
+    const seed = rawSeed ? String(rawSeed) : (cursor ? cursor.seed : "");
+    const effectiveTopic = topic || (cursor ? cursor.topic : "");
+    const offset = cursor ? cursor.offset : 0;
+
+    const page = buildFeedPage(items, {
+      seed,
+      topic: effectiveTopic,
+      offset,
+      size: maxResults
+    });
+
+    return sendJSON(res, 200, {
+      ...page,
+      topics: pool.topics,
+      regions: Object.keys(pool.regionIds).filter(code => pool.regionIds[code] && pool.regionIds[code].size),
+      requestedRegion: requestedRegion || ""
+    });
   }
   catch(err){
     logYouTubeError(err);
@@ -774,10 +955,15 @@ async function handleTrending(req, res, params){
   }
 }
 
-// GET /api/search?q=<query>&max=<n>
-// Returns an array of normalized video objects.
+// GET /api/search?q=<query>&max=<n>[&order&duration&uploadDate&categoryId&region
+//                     &relevanceLanguage&safeSearch&videoEmbeddable][&pageToken]
+//
+// Returns { videos, nextPageToken } plus additive metadata (query, appliedFilters,
+// filteredCount, duplicatesRemoved, totalResultsEstimate).
 async function handleSearch(req, res, params){
-  const q = (params.get("q") || "").trim();
+  // Normalize server-side: collapse whitespace, strip invisible marks, cap length.
+  // Casing is preserved for YouTube; the normalized form is the cache key.
+  const q = normalizeQuery(params.get("q"));
   if(!q){
     return sendJSON(res, 400, { error: "Missing query", videos: [] });
   }
@@ -788,16 +974,29 @@ async function handleSearch(req, res, params){
     });
   }
 
-  const maxResults = Math.min(Math.max(parseInt(params.get("max") || "20", 10) || 20, 1), 50);
+  // search.list costs a flat 100 quota units per call regardless of maxResults,
+  // so a full 50-result page is the cheapest way to return results.
+  const maxResults = resolveSearchMax(params.get("max") || "50");
   const pageToken = (params.get("pageToken") || "").trim();
-  const cacheKey = "search:" + q.toLowerCase() + ":" + maxResults + ":" + pageToken;
+  const { searchParams, applied } = resolveSearchFilters(params);
+
+  // Every filter that can change the result set must be part of the cache key,
+  // or "Most viewed" could be served from a cached "Relevance" response.
+  const cacheKey = "search:" + q.toLowerCase() + ":" + maxResults + ":" + pageToken +
+    ":" + JSON.stringify(applied);
 
   try{
     let url = YT_API_BASE + "/search?part=snippet&type=video&maxResults=" + maxResults +
       "&q=" + encodeURIComponent(q);
+
+    for(const [key, value] of Object.entries(searchParams)){
+      url += "&" + key + "=" + encodeURIComponent(String(value));
+    }
+
     if(pageToken){
       url += "&pageToken=" + encodeURIComponent(pageToken);
     }
+
     const data = await ytFetch(cacheKey, url);
     const videos = normalize.normalizeSearchResponse(data).videos;
 
@@ -809,7 +1008,21 @@ async function handleSearch(req, res, params){
       // Non-fatal: we can still return results without stats/durations.
     }
 
-    return sendJSON(res, 200, { videos, nextPageToken: data.nextPageToken || "" });
+    // Drop ids YouTube repeats across pages and videos reporting
+    // `status.embeddable === false`, which MyTube can never play in an iframe.
+    const cleaned = dedupeSearchResults(videos);
+
+    return sendJSON(res, 200, {
+      videos: cleaned.videos,
+      nextPageToken: data.nextPageToken || "",
+      query: q,
+      appliedFilters: applied,
+      totalResultsEstimate: Number(
+        data && data.pageInfo ? Number(data.pageInfo.totalResults || 0) : 0
+      ),
+      duplicatesRemoved: cleaned.duplicatesRemoved,
+      filteredCount: cleaned.filteredCount
+    });
   }
   catch(err){
     logYouTubeError(err);
@@ -839,7 +1052,9 @@ async function handleVideo(req, res, params){
     // letting the watch page show an honest fallback for non-embeddable videos.
     const url = YT_API_BASE + "/videos?part=" + VIDEO_PARTS_FULL + "&id=" + encodeURIComponent(id);
     const data = await ytFetch(cacheKey, url);
-    const videos = normalize.normalizeVideosResponse(data);
+    // normalizeVideosResponse returns { videos, nextPageToken } like its sibling
+    // normalizers — read .videos instead of treating the result as an array.
+    const videos = normalize.normalizeVideosResponse(data).videos;
     if(!videos.length){
       return sendJSON(res, 404, { error: "Video unavailable or removed.", video: null });
     }
@@ -1139,7 +1354,9 @@ async function enrichWithStats(videos){
   if(!ids){
     return;
   }
-  const url = YT_API_BASE + "/videos?part=contentDetails,statistics&id=" + encodeURIComponent(ids) +
+  // "status" is fetched too (like the Worker) so embeddable is identical in both
+  // backends and the non-embeddable filter below actually has something to read.
+  const url = YT_API_BASE + "/videos?part=contentDetails,statistics,status&id=" + encodeURIComponent(ids) +
     "&maxResults=50";
   const data = await ytFetch("stats:" + ids, url);
   const byId = {};
@@ -1155,6 +1372,8 @@ async function enrichWithStats(videos){
     }
     const stats = item.statistics || {};
     const details = item.contentDetails || {};
+    // Mirrors normalize.js: only an explicit false means "cannot be embedded".
+    v.embeddable = (item.status || {}).embeddable !== false;
     const viewCountInt = parseInt(stats.viewCount, 10);
     if(Number.isFinite(viewCountInt)){
       v.viewCount = viewCountInt;
@@ -1388,6 +1607,15 @@ const server = http.createServer(async (req, res) => {
         return await handleTrending(req, res, url.searchParams);
       }
       if(route.startsWith("search")){
+        // search.list costs a flat 100 quota units per call, so it is metered
+        // separately from the general limiter (mirrors worker.js).
+        if(!searchRateLimitAllowed(req)){
+          return sendJSON(res, 429, {
+            videos: [],
+            code: "SEARCH_RATE_LIMITED",
+            error: "Too many searches. Please wait a moment and try again."
+          });
+        }
         return await handleSearch(req, res, url.searchParams);
       }
       if(route.startsWith("video")){

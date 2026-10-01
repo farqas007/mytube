@@ -8,6 +8,21 @@ import {
   normalizeLiveChatResponse,
   readLiveState
 } from "./shared/normalize.js";
+import {
+  FEED_POOL_TTL_MS,
+  FEED_POOL_REGIONS,
+  FEED_POOL_PAGE_SIZE,
+  availableTopics,
+  buildFeedPage,
+  decodeFeedCursor,
+  topicFromTags
+} from "./shared/feed.js";
+import {
+  dedupeSearchResults,
+  normalizeQuery,
+  resolveSearchFilters,
+  resolveSearchMax
+} from "./shared/search.js";
 
 const YT_API_BASE = "https://www.googleapis.com/youtube/v3";
 
@@ -114,6 +129,45 @@ function rateLimitAllowed(request) {
   }
 
   return bucket.count <= RATE_MAX_PER_WINDOW;
+}
+
+// -----------------------------------------------------------------------------
+// Dedicated budget for `search.list`.
+//
+// search.list costs a FLAT 100 quota units per call regardless of maxResults,
+// versus 1 unit for videos.list. The general limiter (120 requests / 5 min)
+// therefore allowed a single caller to spend 12,000 units in five minutes —
+// more than YouTube's entire default daily quota. Search therefore gets its own,
+// much tighter bucket so an accidental loop or a scraper cannot starve the rest
+// of the site (home feed, comments, related videos) of quota.
+// -----------------------------------------------------------------------------
+
+const SEARCH_RATE_WINDOW_MS = 5 * 60 * 1000;
+const SEARCH_RATE_MAX_PER_WINDOW = 40;
+const searchRateBuckets = new Map();
+
+function searchRateLimitAllowed(request) {
+  const ip = clientIp(request);
+  const now = Date.now();
+  const bucket = searchRateBuckets.get(ip) || { count: 0, windowStart: now };
+
+  if (now - bucket.windowStart >= SEARCH_RATE_WINDOW_MS) {
+    bucket.count = 0;
+    bucket.windowStart = now;
+  }
+
+  bucket.count++;
+  searchRateBuckets.set(ip, bucket);
+
+  if (searchRateBuckets.size > 5000) {
+    for (const [key, entry] of searchRateBuckets) {
+      if (now - entry.windowStart >= SEARCH_RATE_WINDOW_MS) {
+        searchRateBuckets.delete(key);
+      }
+    }
+  }
+
+  return bucket.count <= SEARCH_RATE_MAX_PER_WINDOW;
 }
 
 const CACHE_TTL = 10 * 60 * 1000;
@@ -437,12 +491,16 @@ async function getVideoDetails(videoId, apiKey) {
   return result.data?.items?.[0] || null;
 }
 
-async function searchYouTube(query, max, apiKey, pageToken) {
+async function searchYouTube(query, max, apiKey, pageToken, options = {}) {
+  const filters = options.filters || {};
+  const maxResults = resolveSearchMax(max);
+
   const params = {
     part: "snippet",
     type: "video",
     q: query,
-    maxResults: Math.min(Math.max(Number(max) || 20, 1), 50)
+    maxResults,
+    ...filters
   };
 
   if (pageToken) {
@@ -480,7 +538,7 @@ async function searchYouTube(query, max, apiKey, pageToken) {
     }
   }
 
-  const videos = [];
+  const normalized = [];
 
   for (const item of searchData?.items || []) {
     const id = item?.id?.videoId;
@@ -493,30 +551,239 @@ async function searchYouTube(query, max, apiKey, pageToken) {
     );
 
     if (video) {
-      videos.push(video);
+      normalized.push(video);
     }
   }
 
+  // Real-data hygiene only: drop ids YouTube repeats across pages, and drop
+  // videos that report `status.embeddable === false` because MyTube plays them in
+  // an iframe and they could never start. No result is re-ordered here, so the
+  // relevance YouTube returned is preserved exactly.
+  const { videos, duplicatesRemoved, filteredCount } =
+    dedupeSearchResults(normalized);
+
   return {
     videos,
-    nextPageToken: searchData?.nextPageToken || ""
+    nextPageToken: searchData?.nextPageToken || "",
+    // Additive metadata. Existing consumers ignore unknown fields.
+    query,
+    appliedFilters: filters,
+    totalResultsEstimate: Number(searchData?.pageInfo?.totalResults || 0),
+    duplicatesRemoved,
+    filteredCount
   };
 }
 
-async function getTrending(max, region, apiKey, pageToken) {
+// =============================================================================
+// HOMEPAGE FEED POOL
+// =============================================================================
+// The stock `videos.list?chart=mostPopular` is one static, region-scoped list of
+// roughly 200 videos whose first page never changes — which is why refreshing
+// MyTube used to show the same screenful every time. YouTube's chart API has no
+// ordering, shuffle or seed parameter, so the variety has to come from MyTube.
+//
+// The pool below collects the same official chart for SEVERAL regions
+// (1 quota unit each, verified disjoint in production) and the feed engine in
+// shared/feed.js orders that pool with a per-refresh seed. Consequences:
+//   * one pool build serves every visitor for FEED_POOL_TTL_MS,
+//   * every refresh reshuffles real videos at zero extra quota,
+//   * cursors walk a fixed permutation, so pages cannot overlap.
+const FEED_POOL_CACHE_KEY = "mytube:feed:pool";
+let feedPoolEntry = null;
+let feedPoolInflight = null;
+
+function pruneFeedPool() {
+  const now = Date.now();
+
+  for (const [key, value] of memoryCache) {
+    if (key !== FEED_POOL_CACHE_KEY && now - value.time > CACHE_TTL) {
+      memoryCache.delete(key);
+    }
+  }
+}
+
+function getCachedFeedPool() {
+  const entry = feedPoolEntry;
+
+  if (!entry) {
+    return null;
+  }
+
+  if (Date.now() - entry.at > FEED_POOL_TTL_MS) {
+    feedPoolEntry = null;
+    return null;
+  }
+
+  return entry.value;
+}
+
+// Fetch one region's chart page and normalize it, keeping the raw tags so a real
+// topic label can be derived for each video (free — already in the response).
+async function fetchFeedRegion(apiKey, region) {
   const result = await ytFetch(
     "videos",
     {
       part: VIDEO_PARTS_FULL,
       chart: "mostPopular",
-      regionCode: region || "PK",
-      maxResults: Math.min(Math.max(Number(max) || 12, 1), 50),
-      ...(pageToken ? { pageToken } : {})
+      regionCode: region,
+      maxResults: FEED_POOL_PAGE_SIZE
     },
     apiKey
   );
 
-  return normalizeVideosResponse(result.data);
+  const videos = [];
+  const ids = new Set();
+
+  for (const item of result.data?.items || []) {
+    const video = normalizeVideoItem(item);
+
+    if (!video || ids.has(video.sourceId)) {
+      continue;
+    }
+
+    ids.add(video.sourceId);
+    videos.push({
+      ...video,
+      topic: topicFromTags(item?.snippet?.tags)
+    });
+  }
+
+  return { region, videos, ids };
+}
+
+async function buildFeedPool(apiKey) {
+  const regions = await Promise.all(
+    FEED_POOL_REGIONS.map(region =>
+      fetchFeedRegion(apiKey, region).catch(() => ({
+        region,
+        videos: [],
+        ids: new Set()
+      }))
+    )
+  );
+
+  const items = [];
+  const seen = new Set();
+  const regionIds = {};
+
+  for (const entry of regions) {
+    regionIds[entry.region] = entry.ids;
+
+    for (const video of entry.videos) {
+      if (seen.has(video.sourceId)) {
+        continue;
+      }
+
+      seen.add(video.sourceId);
+      items.push(video);
+    }
+  }
+
+  // Never hand back an empty feed: fall back to the primary region alone if every
+  // multi-region build somehow failed.
+  if (!items.length) {
+    const fallback = await fetchFeedRegion(
+      apiKey,
+      FEED_POOL_REGIONS[0] || "US"
+    ).catch(() => ({ videos: [], ids: new Set() }));
+
+    regionIds[FEED_POOL_REGIONS[0] || "US"] = fallback.ids;
+    items.push(...fallback.videos);
+  }
+
+  return {
+    items,
+    regionIds,
+    topics: availableTopics(items)
+  };
+}
+
+// One shared build for all concurrent callers: without this, a burst of page
+// loads would each spend 8 quota units.
+async function getFeedPool(apiKey) {
+  const cached = getCachedFeedPool();
+
+  if (cached) {
+    return cached;
+  }
+
+  if (!feedPoolInflight) {
+    feedPoolInflight = buildFeedPool(apiKey)
+      .then(pool => {
+        feedPoolEntry = { at: Date.now(), value: pool };
+        pruneFeedPool();
+        return pool;
+      })
+      .finally(() => {
+        feedPoolInflight = null;
+      });
+  }
+
+  return feedPoolInflight;
+}
+
+// GET /api/trending  (?max&seed&topic&region&pageToken)
+//
+// Contract is unchanged: `{ videos, nextPageToken }`. `pageToken` stays an opaque
+// continuation string; it now carries the seed, offset, topic and pool version.
+//
+//   seed=""    deterministic pool order (what the sitemap generator and any
+//              pre-existing caller sees — unchanged behaviour)
+//   seed="..." seeded permutation, i.e. a different real feed per refresh
+//
+// `_t` is accepted as an alias for `seed`: MyTube's existing cache-buster. It
+// never reached YouTube before (the upstream cache key is built from the YouTube
+// URL), so the "bust the cache" button silently did nothing. It now genuinely
+// changes the feed, and costs nothing.
+async function getTrending(max, region, apiKey, pageToken, options = {}) {
+  const pool = await getFeedPool(apiKey);
+
+  let items = pool.items;
+  const cursor = decodeFeedCursor(pageToken);
+
+  // `region` keeps its original meaning — restrict the feed to one region's
+  // chart, exactly like the previous single-chart implementation. It is optional:
+  // with no region the feed spans the whole pool, which is the point of the pool.
+  let requestedRegion = String(region || "").toUpperCase();
+
+  if (requestedRegion && !pool.regionIds[requestedRegion]) {
+    requestedRegion = "";
+  }
+
+  if (requestedRegion && !cursor) {
+    const ids = pool.regionIds[requestedRegion] || new Set();
+    items = items.filter(video => ids.has(video.sourceId));
+  }
+
+  const seed = options.seed !== undefined && options.seed !== null
+    ? String(options.seed)
+    : (cursor ? cursor.seed : "");
+
+  const topic = options.topic !== undefined && options.topic !== null
+    ? String(options.topic)
+    : (cursor ? cursor.topic : "");
+
+  const offset = cursor
+    ? cursor.offset
+    : Math.max(0, Number(options.offset) || 0);
+
+  const page = buildFeedPage(items, {
+    seed,
+    topic,
+    offset,
+    size: Math.min(Math.max(Number(max) || 12, 1), 50)
+  });
+
+  return {
+    ...page,
+    // The topics actually present in this pool, most common first, so the
+    // category bar shows real data instead of a hard-coded list.
+    topics: pool.topics,
+    regions: pool.regionIds
+      ? Object.keys(pool.regionIds).filter(code => pool.regionIds[code]?.size)
+      : [],
+    requestedRegion: requestedRegion || ""
+  };
 }
 
 async function getChannel(channelId, apiKey) {
@@ -1229,7 +1496,12 @@ async function handleAPI(request, env) {
     }
 
     if (route === "search") {
-      const q = url.searchParams.get("q")?.trim();
+      const rawQuery = url.searchParams.get("q");
+      // Normalize once, server-side: collapse whitespace/strip invisible marks and
+      // cap the length. Casing is preserved — that is what YouTube should receive.
+      // The normalized form is also the cache key, so trivial variations of the
+      // same query reuse one cached response instead of spending 100 units twice.
+      const q = normalizeQuery(rawQuery);
 
       if (!q) {
         return json(
@@ -1242,29 +1514,56 @@ async function handleAPI(request, env) {
         );
       }
 
-      const max = url.searchParams.get("max") || "20";
+      const max = url.searchParams.get("max") || "50";
       const pageToken = url.searchParams.get("pageToken") || "";
+
+      // search.list is 100 units per call, so it is metered separately from the
+      // general limiter (see searchRateLimitAllowed).
+      if (!searchRateLimitAllowed(request)) {
+        return json(
+          {
+            videos: [],
+            code: "SEARCH_RATE_LIMITED",
+            error: "Too many searches. Please wait a moment and try again."
+          },
+          429,
+          request
+        );
+      }
+
+      // Optional real YouTube filters (sort / duration / upload date / category /
+      // region / language / safeSearch / embeddable). Unsupported values are
+      // dropped rather than forwarded, since YouTube answers HTTP 400 for those.
+      const { searchParams, applied } = resolveSearchFilters(url.searchParams);
 
       const result = await searchYouTube(
         q,
         max,
         apiKey,
-        pageToken
+        pageToken,
+        { filters: searchParams }
       );
 
-      return json(result, 200, request);
+      return json({ ...result, appliedFilters: applied }, 200, request);
     }
 
     if (route === "trending") {
       const max = url.searchParams.get("max") || "12";
-      const region = url.searchParams.get("region") || "PK";
+      // Optional: only set when a caller explicitly wants one region's chart.
+      const region = url.searchParams.get("region") || "";
       const pageToken = url.searchParams.get("pageToken") || "";
+      // `seed` (or the legacy `_t` alias) picks one ordering of the pool. A fresh
+      // seed per page load is what makes consecutive refreshes show different
+      // real videos; omitting it keeps the previous deterministic behaviour.
+      const rawSeed = url.searchParams.get("seed") || url.searchParams.get("_t");
+      const topic = url.searchParams.get("topic") || "";
 
       const result = await getTrending(
         max,
         region,
         apiKey,
-        pageToken
+        pageToken,
+        { seed: rawSeed, topic }
       );
 
       return json(result, 200, request);

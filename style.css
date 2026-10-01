@@ -820,6 +820,57 @@ header input{
 }
 
 
+/* Search filters (sort / length / upload date / category / playable only) */
+
+.search-filters{
+    display:flex;
+    flex-wrap:wrap;
+    align-items:center;
+    gap:10px;
+    padding:12px 20px 0;
+}
+
+.search-filters[hidden]{
+    display:none;
+}
+
+.search-filter{
+    display:flex;
+    align-items:center;
+    gap:6px;
+    font-size:13px;
+    color:#f1f1f1;
+}
+
+.search-filter-label{
+    color:#aaa;
+}
+
+.search-filter-select{
+    background:#272727;
+    color:white;
+    border:1px solid #3f3f3f;
+    border-radius:6px;
+    padding:6px 8px;
+    font-size:13px;
+    cursor:pointer;
+}
+
+.search-filter-select:focus-visible{
+    outline:2px solid red;
+    outline-offset:2px;
+}
+
+.search-filter-toggle{
+    cursor:pointer;
+}
+
+.search-filter-toggle input{
+    cursor:pointer;
+    accent-color:red;
+}
+
+
 /* Sidebar active state (e.g. Trending) */
 
 .sidebar p.active{

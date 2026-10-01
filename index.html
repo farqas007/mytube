@@ -191,6 +191,13 @@ Logout
 <div id="categoryFilter" class="category-filter" role="group" aria-label="Filter by category"></div>
 
 
+<!-- Search filters: sort / length / upload date / category / playable-only.
+     Each control maps onto a parameter the official YouTube search.list resource
+     supports, so changing one re-queries YouTube instead of filtering locally.
+     Hidden until a search is active. -->
+<div id="searchFilters" class="search-filters" role="group" aria-label="Search filters" hidden></div>
+
+
 <main id="videoList">
 
 </main>
@@ -234,9 +241,12 @@ const filterBar = document.getElementById("categoryFilter");
 
 // ================= STATE =================
 
-// currentQuery / currentCategory / trendingMode together define the visible set.
+// currentQuery / currentTopic together define the visible set:
+//   * a non-empty currentQuery  -> YouTube search results with the search filters
+//   * otherwise                 -> the paginated homepage feed, optionally
+//                                  narrowed to one topic by the category bar
 let currentQuery = "";
-let currentCategory = "All";
+let currentTopic = "All";
 let trendingMode = false;
 
 
@@ -301,40 +311,184 @@ function buildCard(v){
 
 // ================= CATEGORY FILTER =================
 
-function buildCategoryFilter(){
-    if(!filterBar){
-        return;
-    }
+// The homepage category bar is driven by REAL data: the backend reports which
+// topics actually occur in the current feed pool (derived from each video's
+// YouTube tags), and only those are rendered. Before this it always rendered a
+// single dead "All" chip.
+const FEED_ALL_TOPIC = "All";
 
-    // MyTube category browsing routes through the same YouTube-only search
-    // pipeline as typed queries (see doDynamicSearch).
-    const options = ["All"];
+// Fallback list, used only until the first feed response reports its own
+// topics. Keep in sync with shared/categories.js.
+let availableFeedTopics = [];
+let searchFilterOptions = {
+  orders: [],
+  durations: [],
+  uploadDates: [],
+  categories: []
+};
 
-    options.forEach(cat => {
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "category-chip" + (cat === currentCategory ? " active" : "");
-        btn.textContent = cat;
-        btn.setAttribute("aria-pressed", cat === currentCategory ? "true" : "false");
-        btn.addEventListener("click", () => {
-            currentCategory = cat;
-            renderCategoryFilter();
-            renderMain();
-        });
-        filterBar.appendChild(btn);
-    });
+function setSearchFilterOptions(options){
+  searchFilterOptions = {
+    orders: (options && Array.isArray(options.orders)) ? options.orders : [],
+    durations: (options && Array.isArray(options.durations)) ? options.durations : [],
+    uploadDates: (options && Array.isArray(options.uploadDates)) ? options.uploadDates : [],
+    categories: (options && Array.isArray(options.categories)) ? options.categories : []
+  };
 }
-
 
 function renderCategoryFilter(){
     if(!filterBar){
         return;
     }
-    [...filterBar.children].forEach(child => {
-        const active = child.textContent === currentCategory;
-        child.classList.toggle("active", active);
-        child.setAttribute("aria-pressed", active ? "true" : "false");
+    const topics = [FEED_ALL_TOPIC].concat(
+        availableFeedTopics.filter(t => t && t !== FEED_ALL_TOPIC)
+    );
+
+    // Rebuild only when the set actually changed, so an unrelated re-render never
+    // resets focus or steals a click mid-interaction.
+    const signature = topics.join("|") + "::" + currentTopic;
+    if(filterBar.dataset.signature === signature){
+        return;
+    }
+    filterBar.dataset.signature = signature;
+
+    filterBar.replaceChildren();
+
+    topics.forEach(topic => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "category-chip" + (topic === currentTopic ? " active" : "");
+        btn.textContent = topic;
+        btn.setAttribute("aria-pressed", topic === currentTopic ? "true" : "false");
+        btn.addEventListener("click", () => {
+            currentTopic = topic;
+            renderCategoryFilter();
+            if(currentQuery){
+                // Topics only shape the home feed. With a search active the chip
+                // is just a UI affordance, so nothing is re-queried — re-running
+                // an identical search would burn 101 quota units for nothing.
+                return;
+            }
+            loadHomeFeed();
+        });
+        filterBar.appendChild(btn);
     });
+}
+
+// ================= SEARCH FILTERS =================
+
+// Every control here maps onto a parameter the official YouTube search.list
+// resource supports, so each one changes real results rather than filtering the
+// current page locally.
+const searchFilters = {
+    order: "relevance",
+    duration: "any",
+    uploadDate: "any",
+    categoryId: ""
+};
+
+const searchFilterBar = document.getElementById("searchFilters");
+
+function buildSearchFilterSelect(label, key, options, fallbackTitle){
+    const wrap = document.createElement("label");
+    wrap.className = "search-filter";
+
+    const caption = document.createElement("span");
+    caption.className = "search-filter-label";
+    caption.textContent = label;
+
+    const select = document.createElement("select");
+    select.className = "search-filter-select";
+    select.dataset.filter = key;
+
+    const list = (options && options.length)
+        ? options
+        : [{ id: "any", title: fallbackTitle }];
+
+    list.forEach(option => {
+        const opt = document.createElement("option");
+        opt.value = option.id;
+        opt.textContent = option.title;
+        select.appendChild(opt);
+    });
+
+    select.value = searchFilters[key];
+    select.addEventListener("change", () => {
+        searchFilters[key] = select.value;
+        runSearchNow();
+    });
+
+    wrap.appendChild(caption);
+    wrap.appendChild(select);
+
+    return wrap;
+}
+
+function buildSearchFilters(){
+    if(!searchFilterBar){
+        return;
+    }
+
+    if(searchFilterBar.dataset.built === "1"){
+        return;
+    }
+
+    searchFilterBar.dataset.built = "1";
+
+    // "Only playable videos" — MyTube plays results in an iframe, so a video
+    // that reports status.embeddable === false can never start. This asks YouTube
+    // for embeddable videos up front.
+    const playableLabel = document.createElement("label");
+    playableLabel.className = "search-filter search-filter-toggle";
+
+    const playableInput = document.createElement("input");
+    playableInput.type = "checkbox";
+    playableInput.checked = true;
+    playableInput.addEventListener("change", () => {
+        searchFilters.playableOnly = playableInput.checked;
+        runSearchNow();
+    });
+    searchFilters.playableOnly = true;
+
+    const playableText = document.createElement("span");
+    playableText.textContent = "Playable only";
+
+    playableLabel.appendChild(playableInput);
+    playableLabel.appendChild(playableText);
+
+    searchFilterBar.appendChild(
+        buildSearchFilterSelect("Sort", "order", searchFilterOptions.orders, "Relevance")
+    );
+    searchFilterBar.appendChild(
+        buildSearchFilterSelect("Length", "duration", searchFilterOptions.durations, "Any length")
+    );
+    searchFilterBar.appendChild(
+        buildSearchFilterSelect("Uploaded", "uploadDate", searchFilterOptions.uploadDates, "Any time")
+    );
+    searchFilterBar.appendChild(
+        buildSearchFilterSelect("Category", "categoryId", searchFilterOptions.categories, "All categories")
+    );
+    searchFilterBar.appendChild(playableLabel);
+}
+
+// Build the params object for one search request from the current controls.
+function currentSearchFilters(){
+    const params = {
+        order: searchFilters.order,
+        duration: searchFilters.duration,
+        uploadDate: searchFilters.uploadDate,
+        videoEmbeddable: searchFilters.playableOnly ? "1" : ""
+    };
+    if(searchFilters.categoryId && searchFilters.categoryId !== "any"){
+        params.categoryId = searchFilters.categoryId;
+    }
+    return params;
+}
+
+function showSearchFilters(visible){
+    if(searchFilterBar){
+        searchFilterBar.hidden = !visible;
+    }
 }
 
 
@@ -343,13 +497,20 @@ function renderCategoryFilter(){
 function searchVideo(){
     // Voice search (voice-search.js) and the search button route through this
     // same pipeline, which renders YouTube-only results (never local videos).
-    currentQuery = (searchInput ? searchInput.value : "").trim().toLowerCase();
+    // Casing is deliberately preserved: YouTube gets the query the user typed.
+    currentQuery = (searchInput ? searchInput.value : "").trim();
+    runSearchNow();
+}
+
+function runSearchNow(){
+    showSearchFilters(Boolean(currentQuery));
     renderMain();
 }
 
 
 // Lightweight debounce so typing doesn't re-render on every keystroke,
-// while keeping Enter/submit immediate and reliable.
+// while keeping Enter/submit immediate and reliable. 800ms of quiet typing is
+// long enough that a normal search costs one API call, not one per letter.
 let searchTimer = null;
 function scheduleSearch(){
     if(searchTimer){
@@ -411,7 +572,7 @@ function renderVideoList(list){
     list.forEach(v => {
         box.appendChild(buildCard(v));
     });
-    const activeFilter = Boolean(currentQuery) || currentCategory !== "All";
+    const activeFilter = Boolean(currentQuery);
     if(noResultsEl){
         noResultsEl.style.display = (activeFilter && list.length === 0) ? "block" : "none";
     }
@@ -423,14 +584,17 @@ function cardMeta(v){
     if(v.views){
         parts.push(v.views);
     }
+    if(v.topic){
+        parts.push(v.topic);
+    }
     return parts.join(" • ");
 }
 
 // Determine which render path to use:
-//  - a query (or a selected category chip) triggers a YouTube-only search;
+//  - a query triggers a YouTube-only search (with the search filters applied);
 //  - the plain homepage view renders the paginated YouTube home feed.
 function renderMain(){
-    if(currentQuery || currentCategory !== "All"){
+    if(currentQuery){
         doDynamicSearch();
         return;
     }
@@ -452,10 +616,11 @@ let homeLoadingMore = false;
 const homeScrollSentinel = document.getElementById("homeScrollSentinel");
 const searchScrollSentinel = document.getElementById("searchScrollSentinel");
 
-// True only for the default/trending home feed — never for a search query or a
-// selected category chip, which own their own pagination.
+// True only for the homepage feed — never for a search query, which owns its own
+// pagination. A topic chip is part of the home feed (the server filters the pool
+// by it), so it does NOT make the home feed inactive.
 function homeFeedActive(){
-    return !currentQuery && currentCategory === "All";
+    return !currentQuery;
 }
 
 function homeSentinelNearBottom(){
@@ -563,7 +728,9 @@ async function loadMoreHome(){
     showStatus("Loading more videos...");
 
     try{
-        const feed = await client.trending(12, false, homeNextToken);
+        // The continuation cursor is opaque and already carries the seed and
+        // offset, so paging never re-sends them (and can never desynchronize).
+        const feed = await client.trending(12, homeNextToken);
         if(seq !== homeSeq || !homeFeedActive()){
             return;
         }
@@ -608,7 +775,7 @@ async function loadMoreHome(){
     }
 }
 
-async function loadHomeFeed(fresh){
+async function loadHomeFeed(){
     const client = ytClient();
     const seq = ++homeSeq;
 
@@ -624,7 +791,7 @@ async function loadHomeFeed(fresh){
         // yet — retry once it reports readiness.
         whenYTReady(() => {
             if(seq === homeSeq){
-                loadHomeFeed(fresh);
+                loadHomeFeed();
             }
         });
         showStatus("Loading YouTube videos...");
@@ -633,12 +800,26 @@ async function loadHomeFeed(fresh){
 
     showStatus("Loading YouTube videos...");
     try{
-        const feed = await client.trending(12, Boolean(fresh));
+        // A fresh seed per page load / per topic change is what makes every
+        // refresh show a different screenful of real videos. The server permutes
+        // videos it has already fetched, so this costs no extra quota.
+        const feed = await client.trending(12, "", {
+            seed: client.newFeedSeed ? client.newFeedSeed() : String(Date.now()),
+            topic: currentTopic === "All" ? "" : currentTopic
+        });
         if(seq !== homeSeq){
             return;
         }
         homeVideos = (feed.videos || []).filter(v => v && v.id);
         homeNextToken = feed.nextPageToken || "";
+
+        // The backend reports which topics actually exist in the current pool.
+        // Rendering the real set keeps the category bar honest.
+        if(Array.isArray(feed.topics) && feed.topics.length){
+            availableFeedTopics = feed.topics;
+            renderCategoryFilter();
+        }
+
         if(!homeVideos.length){
             showStatus(feed.error
                 ? ("Could not load YouTube videos: " + feed.error)
@@ -662,8 +843,7 @@ async function loadHomeFeed(fresh){
 }
 
 
-// Perform a dynamic YouTube search for the current query (or, when a category
-// chip is active with no query, the category name) and render the results.
+// Perform a dynamic YouTube search for the current query and render the results.
 // Results are YouTube-only — local videos never appear here, even when the
 // YouTube API is unreachable.
 let searchSeq = 0;
@@ -672,11 +852,19 @@ let searchNextToken = "";
 let searchRemoteVideos = [];
 let searchLoadingMore = false;
 
-// The effective search term: the typed query, or the selected category name
-// when browsing a category chip without a query. "" on the plain homepage view
-// (which renders the home feed instead).
+// Shortest query worth sending. search.list costs a flat 100 quota units per
+// call, so a two-letter prefix would be an expensive way to learn nothing.
+const SEARCH_MIN_LENGTH = 3;
+
+// One page of search results. 50 is the API maximum and costs exactly the same
+// 100 units as a 20-result page, so the biggest legal page is also the cheapest
+// one per result — and fewer pages means far fewer quota units while scrolling.
+const SEARCH_PAGE_SIZE = 50;
+
+// The effective search term: the typed query. "" on the plain homepage view,
+// which renders the home feed instead.
 function searchTerm(){
-    return currentQuery || (currentCategory !== "All" ? currentCategory : "");
+    return currentQuery;
 }
 
 function searchSentinelNearBottom(){
@@ -729,8 +917,9 @@ async function loadMoreSearchResults(){
     showStatus("Loading more results...");
 
     try{
-        const result = await client.search(q, 20, searchNextToken);
-        // Bail if the user typed something new (or clicked a category) while
+        // Same filters as page 1, or pagination would mix two result sets.
+        const result = await client.search(q, SEARCH_PAGE_SIZE, searchNextToken, undefined, currentSearchFilters());
+        // Bail if the user typed something new (or changed a filter) while
         // the page was loading.
         if(seq !== searchSeq || searchTerm() !== q){
             return;
@@ -804,10 +993,12 @@ async function doDynamicSearch(){
         return;
     }
 
-    // Require at least 2 characters before hitting the YouTube API.
-    if(term.length < 2){
+    // Require at least SEARCH_MIN_LENGTH characters before hitting the YouTube
+    // API: every search call costs 100 quota units.
+    if(term.length < SEARCH_MIN_LENGTH){
         box.replaceChildren();
-        showStatus(currentQuery ? "Type at least 2 characters to search YouTube." : "");
+        showStatus("Type at least " + SEARCH_MIN_LENGTH + " characters to search YouTube.");
+        searchNextToken = "";
         return;
     }
 
@@ -818,7 +1009,7 @@ async function doDynamicSearch(){
     let remote = [];
     let apiError = "";
     try{
-        const result = await client.search(term, 20, "", controller.signal);
+        const result = await client.search(term, SEARCH_PAGE_SIZE, "", controller.signal, currentSearchFilters());
         remote = result.videos || [];
         searchNextToken = result.nextPageToken || "";
         apiError = result.error || "";
@@ -835,7 +1026,7 @@ async function doDynamicSearch(){
         return; // a newer search superseded this one
     }
 
-    searchRemoteVideos = remote.slice(0, 30);
+    searchRemoteVideos = remote;
     if(!searchRemoteVideos.length){
         searchNextToken = "";
         showStatus(apiError
@@ -857,10 +1048,11 @@ function logHome(level, msg, err){
 
 
 // Restore ?q= from the URL on load (watch page search uses index.html?q=...).
+// Casing is preserved: YouTube receives the query exactly as it was typed.
 (function initSearchFromUrl(){
     const params = new URLSearchParams(window.location.search);
     const q = (params.get("q") || "").trim();
-    currentQuery = q.toLowerCase();
+    currentQuery = q;
     if(searchInput){
         searchInput.value = q;
     }
@@ -938,19 +1130,16 @@ makeSideItemInteractive(sideHome, () => {
 
 makeSideItemInteractive(sideTrending, () => {
     trendingMode = !trendingMode;
-    currentCategory = "All";
+    currentTopic = "All";
     currentQuery = "";
     if(searchInput){ searchInput.value = ""; }
     searchSeq++;
     renderCategoryFilter();
-    if(trendingMode){
-        setSidebarActive("sideTrending");
-        loadHomeFeed(true);
-    }
-    else{
-        setSidebarActive("sideHome");
-        loadHomeFeed();
-    }
+    setSidebarActive(trendingMode ? "sideTrending" : "sideHome");
+    // Both directions simply re-roll the feed; the toggle only moves the
+    // sidebar highlight. The previous `_t` cache-buster did nothing at all,
+    // because the upstream cache key never included it.
+    loadHomeFeed();
 });
 
 
@@ -981,12 +1170,40 @@ makeSideItemInteractive(sideLikedVideos, () => {
 // ================= INIT =================
 
 (function init(){
-    buildCategoryFilter();
+    // Start with the "All" chip; the real topic list arrives with the first feed
+    // response and replaces it via renderCategoryFilter().
+    renderCategoryFilter();
     setSidebarActive("sideHome");
     setupScrollObserver();
     setupScrollFallback();
+    showSearchFilters(Boolean(currentQuery));
     renderMain();
+    // The filter controls need the option catalogues from the YouTube module,
+    // which is deferred, so build them as soon as it reports readiness.
+    whenYTReady(() => {
+        applySearchFilterCatalogues();
+        buildSearchFilters();
+    });
 })();
+
+
+// Pull the static option catalogues (sort / length / uploaded / categories) out
+// of the YouTube module. They are constant reference data, so building the
+// controls once is enough.
+function applySearchFilterCatalogues(){
+    const client = ytClient();
+    if(!client){
+        return;
+    }
+    setSearchFilterOptions({
+        orders: client.SEARCH_ORDER_OPTIONS,
+        durations: client.SEARCH_DURATION_OPTIONS,
+        uploadDates: client.SEARCH_UPLOAD_DATE_OPTIONS,
+        categories: [{ id: "any", title: "All categories" }].concat(
+            Array.isArray(client.VIDEO_CATEGORIES) ? client.VIDEO_CATEGORIES : []
+        )
+    });
+}
 
 
 </script>
@@ -1001,9 +1218,27 @@ makeSideItemInteractive(sideLikedVideos, () => {
 
 <!-- Phase 7: YouTube dynamic discovery (backend proxy client) -->
 <script type="module">
-import { search, trending } from "./youtube.js";
+import {
+  search,
+  trending,
+  newFeedSeed,
+  FEED_TOPICS,
+  VIDEO_CATEGORIES,
+  SEARCH_ORDER_OPTIONS,
+  SEARCH_DURATION_OPTIONS,
+  SEARCH_UPLOAD_DATE_OPTIONS
+} from "./youtube.js";
 // Expose the client on window so the inline homepage script can call it.
-window.MyTubeYouTube = { search: search, trending: trending };
+window.MyTubeYouTube = {
+  search: search,
+  trending: trending,
+  newFeedSeed: newFeedSeed,
+  FEED_TOPICS: FEED_TOPICS,
+  VIDEO_CATEGORIES: VIDEO_CATEGORIES,
+  SEARCH_ORDER_OPTIONS: SEARCH_ORDER_OPTIONS,
+  SEARCH_DURATION_OPTIONS: SEARCH_DURATION_OPTIONS,
+  SEARCH_UPLOAD_DATE_OPTIONS: SEARCH_UPLOAD_DATE_OPTIONS
+};
 // Signal readiness. This module is deferred, so the inline homepage script may
 // have already run its initial render before this executes; it listens for this
 // event to retry dynamic loading (search + home discovery) with the client set.

@@ -16,6 +16,14 @@
 //   * never throws on failure — callers get { videos: [] } / { video: null }.
 // =============================================================================
 
+import {
+  FEED_TOPICS,
+  SEARCH_ORDER_OPTIONS,
+  SEARCH_DURATION_OPTIONS,
+  SEARCH_UPLOAD_DATE_OPTIONS,
+  VIDEO_CATEGORIES
+} from "./shared/categories.js";
+
 // Persistent, session-scoped cache keyed by request, so the same search is not
 // requested twice on one page session.
 const sessionCache = new Map();
@@ -136,6 +144,15 @@ async function apiRequest(route, params, signal, options = {}){
       channel: (payload && payload.channel) ? payload.channel : null,
       comments: (payload && Array.isArray(payload.comments)) ? payload.comments : [],
       nextPageToken: (payload && payload.nextPageToken) ? String(payload.nextPageToken) : "",
+      // Additive fields. Anything not present simply stays falsy, so a backend
+      // without them keeps working unchanged.
+      query: (payload && payload.query) ? String(payload.query) : "",
+      appliedFilters: (payload && payload.appliedFilters) ? payload.appliedFilters : {},
+      filteredCount: (payload && typeof payload.filteredCount === "number") ? payload.filteredCount : 0,
+      duplicatesRemoved: (payload && typeof payload.duplicatesRemoved === "number") ? payload.duplicatesRemoved : 0,
+      totalResultsEstimate: (payload && typeof payload.totalResultsEstimate === "number") ? payload.totalResultsEstimate : 0,
+      topics: (payload && Array.isArray(payload.topics)) ? payload.topics : [],
+      totalAvailable: (payload && typeof payload.totalAvailable === "number") ? payload.totalAvailable : 0,
       error: (payload && payload.error) ? payload.error : ""
     };
 
@@ -172,24 +189,90 @@ async function apiRequest(route, params, signal, options = {}){
 // Search YouTube. Returns { videos, nextPageToken, error, ok }.
 // Never resolves to null; on any failure it returns an empty array so the
 // caller can safely fall back to local videos.
-async function search(query, max, pageToken, signal){
-  const params = { q: query, max: String(max || 20) };
+//
+// `filters` is optional and maps 1:1 onto parameters the official YouTube
+// search.list resource supports (order, duration, uploadDate, categoryId,
+// region, relevanceLanguage, safeSearch, videoEmbeddable). Unsupported values
+// are dropped server-side, because YouTube answers HTTP 400 for invalid ones.
+async function search(query, max, pageToken, signal, filters){
+  const params = { q: query, max: String(max || 50) };
   if(pageToken){
     params.pageToken = String(pageToken);
   }
+  if(filters && typeof filters === "object"){
+    for(const [key, value] of Object.entries(filters)){
+      if(value !== undefined && value !== null && value !== ""){
+        params[key] = String(value);
+      }
+    }
+  }
   const res = await apiRequest("search", params, signal);
-  return { videos: res.videos || [], nextPageToken: res.nextPageToken || "", error: res.error || "", ok: res.ok, status: res.status };
+  return {
+    videos: res.videos || [],
+    nextPageToken: res.nextPageToken || "",
+    appliedFilters: res.appliedFilters || {},
+    query: res.query || query,
+    filteredCount: res.filteredCount || 0,
+    duplicatesRemoved: res.duplicatesRemoved || 0,
+    totalResultsEstimate: res.totalResultsEstimate || 0,
+    error: res.error || "",
+    ok: res.ok,
+    status: res.status
+  };
 }
 
-// Official YouTube trending / "most popular" feed. Preserves nextPageToken (so
-// callers can paginate through the whole feed) and accepts a pageToken to fetch
-// subsequent pages (passed through to the backend proxy).
-async function trending(max, bustCache, pageToken){
-  const params = { max: String(max || 20) };
-  if(bustCache){ params._t = String(Date.now()); }
-  if(pageToken){ params.pageToken = String(pageToken); }
+// A fresh seed per page load is what makes each homepage refresh show a different
+// ordering of the same large pool of real videos. It costs nothing: the server
+// permutes videos it has already paid for.
+function newFeedSeed(){
+  try{
+    if(window.crypto && typeof window.crypto.getRandomValues === "function"){
+      const buffer = new Uint32Array(1);
+      window.crypto.getRandomValues(buffer);
+      return "s" + buffer[0].toString(36);
+    }
+  }
+  catch(e){ /* fall through */ }
+  return "s" + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
+}
+
+// Homepage feed.
+//
+// `seed`    picks an ordering of the server's pool of popular videos. Omit it and
+//           the server returns its deterministic order (unchanged behaviour).
+// `topic`   optional derived-topic filter (Music, Gaming, ...) driven by the
+//           homepage category bar.
+// `pageToken` is the opaque continuation cursor from the previous page; it
+//           carries the seed/offset internally so the caller stores nothing.
+//
+// Preserves `nextPageToken` ("" when there are no more pages), so the existing
+// infinite-scroll code works untouched.
+async function trending(max, pageToken, options = {}){
+  const params = { max: String(max || 12) };
+  if(pageToken){
+    params.pageToken = String(pageToken);
+  }
+  if(options.seed){
+    params.seed = String(options.seed);
+  }
+  if(options.topic){
+    params.topic = String(options.topic);
+  }
+  if(options.region){
+    params.region = String(options.region);
+  }
   const res = await apiRequest("trending", params);
-  return { videos: res.videos || [], nextPageToken: res.nextPageToken || "", error: res.error || "", ok: res.ok, status: res.status };
+  return {
+    videos: res.videos || [],
+    nextPageToken: res.nextPageToken || "",
+    // Additive: the topics actually present in the current pool, most common
+    // first, so the category bar reflects real data instead of a static list.
+    topics: Array.isArray(res.topics) ? res.topics : [],
+    totalAvailable: Number(res.totalAvailable) || 0,
+    error: res.error || "",
+    ok: res.ok,
+    status: res.status
+  };
 }
 
 // Fetch a single YouTube video by its source id.
@@ -287,4 +370,20 @@ async function isAvailable(){
   return Boolean(base);
 }
 
-export { search, getVideo, related, channel, comments, trending, channelVideos, liveChat, isAvailable };
+export {
+  search,
+  getVideo,
+  related,
+  channel,
+  comments,
+  trending,
+  channelVideos,
+  liveChat,
+  isAvailable,
+  newFeedSeed,
+  FEED_TOPICS,
+  VIDEO_CATEGORIES,
+  SEARCH_ORDER_OPTIONS,
+  SEARCH_DURATION_OPTIONS,
+  SEARCH_UPLOAD_DATE_OPTIONS
+};
