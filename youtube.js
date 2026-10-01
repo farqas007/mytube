@@ -102,7 +102,7 @@ function cacheSet(key, value){
   sessionCache.set(key, { at: Date.now(), value });
 }
 
-async function apiRequest(route, params, signal){
+async function apiRequest(route, params, signal, options = {}){
   let cacheKey = null;
   const base = await resolveBackendBase();
   if(!base){
@@ -113,7 +113,10 @@ async function apiRequest(route, params, signal){
   const url = base + "/" + route + (qs ? ("?" + qs) : "");
   cacheKey = url;
 
-  const cached = cacheGet(cacheKey);
+  // Live chat is polled repeatedly and must never be served from the 10-minute
+  // session cache — a stale chat payload would be wrong, not merely old.
+  const cacheable = !options.noCache;
+  const cached = cacheable ? cacheGet(cacheKey) : null;
   if(cached){
     return cached;
   }
@@ -135,7 +138,20 @@ async function apiRequest(route, params, signal){
       nextPageToken: (payload && payload.nextPageToken) ? String(payload.nextPageToken) : "",
       error: (payload && payload.error) ? payload.error : ""
     };
-    if(res.ok){
+
+    // Live-chat response contract (see getLiveChat() in worker.js).
+    if(route === "liveChat"){
+      result.messages = (payload && Array.isArray(payload.messages)) ? payload.messages : [];
+      result.chatStatus = (payload && payload.status) ? String(payload.status) : "error";
+      result.isLive = Boolean(payload && payload.isLive);
+      result.liveChatId = (payload && payload.liveChatId) ? String(payload.liveChatId) : "";
+      result.concurrentViewers = Number(payload && payload.concurrentViewers) || 0;
+      result.pollingIntervalMillis = Number(payload && payload.pollingIntervalMillis) || 5000;
+      result.offlineAt = (payload && payload.offlineAt) ? String(payload.offlineAt) : "";
+      result.code = (payload && payload.code) ? String(payload.code) : "";
+    }
+
+    if(res.ok && cacheable){
       cacheSet(cacheKey, result);
     }
     return result;
@@ -209,6 +225,52 @@ async function comments(id, max, pageToken){
   return { comments: res.comments || [], nextPageToken: res.nextPageToken || "", error: res.error || "", ok: res.ok };
 }
 
+// Fetch the REAL YouTube Live Chat for a currently-live video.
+//
+// This is read-only and it is genuinely YouTube's own chat: it is never stored
+// by MyTube, and no MyTube chat/messages endpoint exists.
+//
+// `id` is a VIDEO id, never a liveChatId — the backend resolves the active chat
+// itself so this cannot be pointed at another stream. Deliberately uncached:
+// the caller polls it on YouTube's own interval, and the server fans a single
+// upstream request out to every viewer of the same stream.
+//
+// Always resolves. Returns:
+//   { ok, status, chatStatus, messages, isLive, concurrentViewers,
+//     pollingIntervalMillis, offlineAt, nextPageToken, error }
+// where chatStatus is one of:
+//   live | not_live | no_chat | ended | disabled | not_found | error
+//
+// `initial` should be true only for a viewer's FIRST poll of a stream. The server
+// uses it to hand back the recent history (so the panel is never empty) without
+// ever touching the server-owned cursor.
+async function liveChat(id, pageToken, initial){
+  const params = { id: String(id) };
+  if(initial){
+    params.initial = "1";
+  }
+  if(pageToken){
+    params.pageToken = String(pageToken);
+  }
+
+  const res = await apiRequest("liveChat", params, null, { noCache: true });
+
+  return {
+    ok: Boolean(res.ok),
+    status: Number(res.status) || 0,
+    chatStatus: res.chatStatus || (res.ok ? "error" : "error"),
+    messages: Array.isArray(res.messages) ? res.messages : [],
+    isLive: Boolean(res.isLive),
+    liveChatId: res.liveChatId || "",
+    concurrentViewers: Number(res.concurrentViewers) || 0,
+    pollingIntervalMillis: Number(res.pollingIntervalMillis) || 5000,
+    offlineAt: res.offlineAt || "",
+    nextPageToken: res.nextPageToken || "",
+    code: res.code || "",
+    error: res.error || ""
+  };
+}
+
 // Fetch recent videos from a specific YouTube channel.
 async function channelVideos(channelId, max, pageToken){
   const params = { channelId: String(channelId), max: String(max || 8) };
@@ -225,4 +287,4 @@ async function isAvailable(){
   return Boolean(base);
 }
 
-export { search, getVideo, related, channel, comments, trending, channelVideos, isAvailable };
+export { search, getVideo, related, channel, comments, trending, channelVideos, liveChat, isAvailable };

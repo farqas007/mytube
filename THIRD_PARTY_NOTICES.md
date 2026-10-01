@@ -42,6 +42,30 @@ Google's API Terms of Service. This project is an independent, unofficial
 project and is not affiliated with, endorsed by, or sponsored by Google
 LLC or YouTube. YouTube is a trademark of Google LLC.
 
+## YouTube Live Chat
+
+When the video being watched is currently live, `watch.html` displays the
+**real YouTube Live Chat** for that broadcast in a read-only panel in the
+right-hand column:
+
+- Messages are read through the YouTube Live Streaming API
+  (`liveChat/messages.list`), proxied server-side by the Cloudflare Worker
+  (`worker.js`) and, for local development, by `youtube-server/server.js`,
+  using the same server-side API key as the rest of the integration. The API
+  key is never exposed to the browser.
+- This chat is **YouTube's own live chat**, shown as-is. MyTube does not host,
+  store, moderate, mirror or archive it, and sends no messages on your behalf.
+  Nothing here is written to Firestore.
+- The panel is read-only: there is no composer, and MyTube has no
+  message-sending endpoint. Posting in live chat requires authenticated
+  access to YouTube itself and is out of scope for this project.
+- Message content is third-party user-generated content displayed verbatim,
+  attributed in the panel with a "Chat provided by YouTube" link to
+  https://www.youtube.com/live_chat.
+- Live chat is polled on YouTube's own `pollingIntervalMillis` interval, and
+  upstream requests are shared between viewers of the same stream to limit
+  API usage.
+
 ## DejaVu Sans Bold (build-time font)
 
 `create_mytube_icon.py` (the script used to generate `mytube-icon.png`)

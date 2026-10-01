@@ -12,8 +12,12 @@
 //     sourceId: "<videoId>",// the raw YouTube video id (used for the embed)
 //     type: "youtube",
 //     title, channel, channelId, thumb, time, views, viewCount,
-//     likeCount, commentCount, date, description, embeddable
+//     likeCount, commentCount, date, description, embeddable,
+//     isLive, liveChatId, concurrentViewers
 //   }
+//
+// The three live fields are additive and always present (booleans/strings/numbers
+// with safe fallbacks), so existing consumers that ignore them are unaffected.
 //
 // List endpoints always return { videos: [...], nextPageToken: "..." } (an empty
 // string when there is no next page). Comments return { comments, nextPageToken }
@@ -103,6 +107,62 @@ function pickThumbnail(thumbnails) {
   );
 }
 
+// -----------------------------------------------------------------------------
+// Live streaming state
+// -----------------------------------------------------------------------------
+// Derives the "is this broadcast live right now" state from the official
+// `liveStreamingDetails` part of a videos.list item.
+//
+// YouTube's own signals, in priority order:
+//   * snippet.liveBroadcastContent === "live"  -> definitively live
+//   * liveStreamingDetails.actualStartTime present AND actualEndTime absent
+//     -> started but not finished (covers the brief window where
+//     liveBroadcastContent has not flipped yet)
+//   * anything else -> not live
+//
+// `activeLiveChatId` is only populated by YouTube WHILE a broadcast is live, so
+// its presence is itself a strong live signal (used as a tie-breaker).
+//
+// Never throws: every field has a safe fallback so non-live videos and search
+// results without a `details` payload keep the exact same shape as before.
+function readLiveState(item) {
+  const snippet = item?.snippet || {};
+  const live = item?.liveStreamingDetails || {};
+
+  const started = Boolean(live.actualStartTime);
+  const ended = Boolean(live.actualEndTime);
+  const liveChatId = live.activeLiveChatId || "";
+  const broadcastSaysLive = snippet.liveBroadcastContent === "live";
+
+  let isLive = false;
+
+  if (broadcastSaysLive) {
+    isLive = true;
+  } else if (started && !ended) {
+    isLive = true;
+  } else if (!started && liveChatId) {
+    // activeLiveChatId without any start timestamp: treat as live, YouTube only
+    // emits it for an active broadcast.
+    isLive = true;
+  }
+
+  if (ended) {
+    isLive = false;
+  }
+
+  const viewers = Number(live.concurrentViewers);
+
+  return {
+    isLive,
+    liveChatId: isLive ? liveChatId : "",
+    concurrentViewers:
+      isLive && Number.isFinite(viewers) && viewers > 0 ? viewers : 0,
+    liveChatDisabled: isLive ? live.liveChatDisabled === true : false,
+    actualStartTime: live.actualStartTime || "",
+    actualEndTime: live.actualEndTime || ""
+  };
+}
+
 // Normalize a single video (search items, videos.list items, etc.).
 // `details` (optional) is the matching videos.list item when the caller fetched
 // statistics/contentDetails/status separately (search results don't include them).
@@ -111,6 +171,11 @@ function normalizeSearchItem(item, details = null) {
   const stats = details?.statistics || {};
   const contentDetails = details?.contentDetails || {};
   const status = details?.status || {};
+
+  // `details` is the only payload that can carry liveStreamingDetails, but
+  // snippet.liveBroadcastContent (and therefore isLive) is often available on a
+  // bare search item too. readLiveState() handles both.
+  const live = readLiveState(details || item);
 
   const videoId =
     item?.id?.videoId ||
@@ -139,7 +204,13 @@ function normalizeSearchItem(item, details = null) {
     commentCount,
     date: formatPublishedDate(snippet.publishedAt),
     description: snippet.description || "",
-    embeddable: status.embeddable !== false
+    embeddable: status.embeddable !== false,
+    isLive: live.isLive,
+    liveChatId: live.liveChatId,
+    concurrentViewers: live.concurrentViewers,
+    liveChatDisabled: live.liveChatDisabled,
+    actualStartTime: live.actualStartTime,
+    actualEndTime: live.actualEndTime
   };
 }
 
@@ -260,15 +331,98 @@ function normalizeCommentsResponse(data) {
   };
 }
 
+// -----------------------------------------------------------------------------
+// YouTube Live Chat (liveChatMessages.list)
+// -----------------------------------------------------------------------------
+// YouTube live chat is a completely different resource from video comments: it
+// only exists while a broadcast is live, it is not paginated by "relevance", and
+// it is polled (not paginated) using `nextPageToken` + `pollingIntervalMillis`.
+//
+// Normalize a single liveChatMessage. Every field has a safe fallback and only
+// plain strings/booleans leave this function, so the frontend can render it with
+// textContent only (never innerHTML).
+function normalizeLiveChatMessage(item) {
+  const snippet = item?.snippet || {};
+  const author = item?.authorDetails || {};
+
+  const id = item?.id || "";
+
+  if (!id) return null;
+
+  // Chat messages carry their text in one of two places depending on the event
+  // type: textMessageDetails for real messages, displayMessage for the rest.
+  const text =
+    snippet.textMessageDetails?.messageText ||
+    snippet.displayMessage ||
+    "";
+
+  // When a message is retracted/tombstoned YouTube replaces the text with an
+  // empty displayMessage. Treat "no text at all" as not renderable.
+  if (!text) return null;
+
+  const superChat = snippet.superChatEventDetails || null;
+  const superSticker = snippet.superStickerEventDetails || null;
+  const funding = superChat || superSticker || null;
+
+  return {
+    id,
+    author: author.displayName || "",
+    authorChannelId: author.channelId || "",
+    authorThumb: author.profileImageUrl || "",
+    text,
+    publishedAt: snippet.publishedAt || "",
+    type: snippet.type || "",
+    isChatOwner: author.isChatOwner === true,
+    isChatModerator: author.isChatModerator === true,
+    isChatSponsor: author.isChatSponsor === true,
+    isVerified: author.isVerified === true,
+    superChatAmount: funding?.amountDisplayString || "",
+    superChatUserComment: funding?.userComment || ""
+  };
+}
+
+// Normalize a full liveChatMessages.list response.
+//
+// `offlineAt` is set by YouTube only when the underlying stream has already
+// gone offline — the authoritative "this live chat is over" signal.
+function normalizeLiveChatResponse(data) {
+  const items = Array.isArray(data?.items) ? data.items : [];
+
+  const messages = items
+    .map(item => normalizeLiveChatMessage(item))
+    .filter(Boolean);
+
+  const rawInterval = Number(data?.pollingIntervalMillis);
+  const interval = Number.isFinite(rawInterval) && rawInterval > 0
+    ? Math.round(rawInterval)
+    : 5000;
+
+  const rawTotal = Number(data?.pageInfo?.totalResults);
+
+  return {
+    messages,
+    nextPageToken: data?.nextPageToken || "",
+    pollingIntervalMillis: interval,
+    offlineAt: data?.offlineAt || "",
+    activePoll: data?.activePollItem
+      ? normalizeLiveChatMessage(data.activePollItem)
+      : null,
+    totalResults: Number.isFinite(rawTotal) && rawTotal > 0 ? rawTotal : 0
+  };
+}
+
 export {
   formatPublishedDate,
   formatDuration,
   formatCount,
   pickThumbnail,
+  readLiveState,
   normalizeSearchItem,
   normalizeVideoItem,
   normalizeSearchResponse,
   normalizeVideosResponse,
   normalizeChannelResponse,
-  normalizeCommentsResponse
+  normalizeCommentsResponse,
+  normalizeLiveChatMessage,
+  normalizeLiveChatResponse
 };

@@ -2,7 +2,7 @@
 import { auth } from "./firebase.js";
 
 // ================= PHASE 7: YOUTUBE CLIENT =================
-import { getVideo, related, channel, comments } from "./youtube.js";
+import { getVideo, related, channel, comments, liveChat } from "./youtube.js";
 
 // ================= FIRESTORE DATA LAYER =================
 import {
@@ -661,6 +661,11 @@ function renderYtSubViews(v){
             loadYoutubeChannel(v.channelId);
         }
         loadYoutubeComments(sourceId);
+        // Reveal + start the real YouTube Live Chat only if this video is live.
+        maybeStartLiveChat(v);
+    }
+    else{
+        liveChatStop(true);
     }
 
     // Ensure the single Like/Dislike controls show the real YouTube like count
@@ -1334,8 +1339,534 @@ function unsubFirestoreComments(){
 }
 
 
+// ================= YOUTUBE LIVE CHAT (read-only) =================
+// The REAL YouTube Live Chat for the video currently being watched.
+//
+// Scope, deliberately narrow:
+//   * Read-only. There is no composer, no send endpoint, and nothing is written
+//     to Firestore - this is YouTube's own chat, displayed.
+//   * Separate from video comments. MyTube comments and YouTube's public
+//     commentThreads are untouched by this code and keep their own rendering.
+//   * Shown only while the backend reports the video is actually live.
+//
+// The server owns one shared upstream poll per stream and tells us how long to
+// wait (YouTube's own `pollingIntervalMillis`), so this loop stays cheap even
+// with many viewers.
+
+const LIVE_CHAT_MIN_INTERVAL_MS = 3000;
+const LIVE_CHAT_MAX_INTERVAL_MS = 10000;
+const LIVE_CHAT_MAX_MESSAGES = 200;
+
+const liveChatState = {
+    panel: null,
+    list: null,
+    status: null,
+    meta: null,
+    badge: null,
+    // Id of the video whose chat we are currently following.
+    sourceId: "",
+    // Message ids already rendered, so a re-poll or an overlapping server delta
+    // can never double-post a message.
+    seen: new Set(),
+    timer: null,
+    // The active poll loop, so a hidden-tab pause can be resumed.
+    tick: null,
+    paused: false,
+    // Monotonic token: any async result from a previous video is ignored.
+    run: 0,
+    stopped: false
+};
+
+
+// Poll interval comes from YouTube but is clamped so a bad/huge value cannot
+// hammer the backend (or spin the CPU).
+function liveChatInterval(value){
+    const n = Number(value);
+
+    if(!Number.isFinite(n) || n <= 0){
+        return 5000;
+    }
+
+    return Math.min(Math.max(Math.round(n), LIVE_CHAT_MIN_INTERVAL_MS), LIVE_CHAT_MAX_INTERVAL_MS);
+}
+
+
+function liveChatEls(){
+    if(!liveChatState.panel){
+        liveChatState.panel = document.getElementById("liveChatPanel");
+        liveChatState.list = document.getElementById("liveChatList");
+        liveChatState.status = document.getElementById("liveChatStatus");
+        liveChatState.meta = document.getElementById("liveChatMeta");
+        liveChatState.badge = document.getElementById("liveChatBadge");
+    }
+
+    return liveChatState;
+}
+
+
+function liveChatSetStatus(text){
+    const els = liveChatEls();
+
+    if(!els.status){
+        return;
+    }
+
+    els.status.textContent = text || "";
+    els.status.hidden = !text;
+}
+
+
+function liveChatSetBadge(label, ended){
+    const els = liveChatEls();
+
+    if(!els.badge){
+        return;
+    }
+
+    els.badge.textContent = label || "";
+    els.badge.classList.toggle("is-ended", Boolean(ended));
+}
+
+
+function liveChatFormatViewers(count){
+    const n = Number(count);
+
+    if(!Number.isFinite(n) || n <= 0){
+        return "";
+    }
+
+    if(n >= 1000000){
+        return (n / 1000000).toFixed(n >= 10000000 ? 0 : 1).replace(/\.0$/, "") + "M watching";
+    }
+
+    if(n >= 1000){
+        return Math.round(n / 1000) + "K watching";
+    }
+
+    return n + " watching";
+}
+
+
+// "12s ago" style relative stamp. Live chat is a live feed, so relative time is
+// more useful than an absolute timestamp here.
+function liveChatTimeAgo(iso){
+    const then = Date.parse(iso || "");
+
+    if(!Number.isFinite(then)){
+        return "";
+    }
+
+    const secs = Math.max(0, Math.round((Date.now() - then) / 1000));
+
+    if(secs < 60){
+        return secs + "s ago";
+    }
+
+    if(secs < 3600){
+        return Math.round(secs / 60) + "m ago";
+    }
+
+    if(secs < 86400){
+        return Math.round(secs / 3600) + "h ago";
+    }
+
+    return Math.round(secs / 86400) + "d ago";
+}
+
+
+// Build one message row. EVERY piece of YouTube-supplied text goes in through
+// textContent: chat text is untrusted user input and must never be parsed as
+// HTML.
+function liveChatMessageEl(msg){
+    const row = document.createElement("div");
+    row.className = "live-chat-msg";
+    // Tracked so trimming from the front can also forget the dedupe id.
+    row.dataset.msgId = msg.id || "";
+
+    if(msg.authorThumb){
+        const avatar = document.createElement("img");
+        avatar.className = "live-chat-avatar";
+        avatar.src = msg.authorThumb;
+        avatar.alt = "";
+        avatar.loading = "lazy";
+        avatar.referrerPolicy = "no-referrer";
+        row.appendChild(avatar);
+    }
+
+    const body = document.createElement("div");
+    body.className = "live-chat-body";
+
+    const authorRow = document.createElement("div");
+    authorRow.className = "live-chat-author";
+
+    const author = document.createElement("span");
+    author.textContent = msg.author || "Unknown";
+    authorRow.appendChild(author);
+
+    if(msg.isChatOwner){
+        authorRow.appendChild(liveChatRoleEl("OWNER", "is-owner"));
+    }
+    else if(msg.isChatModerator){
+        authorRow.appendChild(liveChatRoleEl("MOD", "is-moderator"));
+    }
+    else if(msg.isChatSponsor){
+        authorRow.appendChild(liveChatRoleEl("MEMBER", ""));
+    }
+
+    if(msg.superChatAmount){
+        const amount = document.createElement("span");
+        amount.className = "live-chat-superc";
+        amount.textContent = msg.superChatAmount;
+        authorRow.appendChild(amount);
+    }
+
+    body.appendChild(authorRow);
+
+    // textMessageDetails for real messages, userComment for a Super Chat.
+    const text = msg.text || msg.superChatUserComment || "";
+
+    if(text){
+        const textEl = document.createElement("p");
+        textEl.className = "live-chat-text";
+        textEl.textContent = text;
+        body.appendChild(textEl);
+    }
+
+    const stamp = liveChatTimeAgo(msg.publishedAt);
+
+    if(stamp){
+        const timeEl = document.createElement("div");
+        timeEl.className = "live-chat-time";
+        timeEl.textContent = stamp;
+        body.appendChild(timeEl);
+    }
+
+    row.appendChild(body);
+
+    return row;
+}
+
+
+function liveChatRoleEl(label, modifier){
+    const el = document.createElement("span");
+    el.className = "live-chat-role" + (modifier ? " " + modifier : "");
+    el.textContent = label;
+
+    return el;
+}
+
+
+function liveChatPollEl(poll){
+    const card = document.createElement("div");
+    card.className = "live-chat-poll";
+
+    const q = document.createElement("p");
+    q.className = "live-chat-poll-q";
+    q.textContent = poll.text || "";
+    card.appendChild(q);
+
+    if(poll.total){
+        const meta = document.createElement("p");
+        meta.className = "live-chat-poll-meta";
+        meta.textContent = poll.total + " vote" + (poll.total === 1 ? "" : "s");
+        card.appendChild(meta);
+    }
+
+    return card;
+}
+
+
+// Append newly-seen messages and trim to the cap. Returns how many were added.
+function liveChatRender(messages, poll){
+    const els = liveChatEls();
+
+    if(!els.list){
+        return 0;
+    }
+
+    const items = Array.isArray(messages) ? messages : [];
+    let added = 0;
+
+    for(const msg of items){
+        if(!msg || !msg.id || liveChatState.seen.has(msg.id)){
+            continue;
+        }
+
+        liveChatState.seen.add(msg.id);
+
+        const wasEmpty = els.list.childElementCount === 0;
+
+        if(wasEmpty){
+            // An active poll belongs at the top of the feed, like YouTube's.
+            if(poll && poll.text){
+                els.list.appendChild(liveChatPollEl(poll));
+            }
+        }
+
+        els.list.appendChild(liveChatMessageEl(msg));
+        added++;
+    }
+
+    // Trim from the front, keeping the newest window and the ids in step with it.
+    while(els.list.childElementCount > LIVE_CHAT_MAX_MESSAGES){
+        const first = els.list.firstElementChild;
+
+        if(!first){
+            break;
+        }
+
+        // The poll card has no id, so it is never "seen"-tracked: drop it here.
+        if(first.classList.contains("live-chat-msg")){
+            const id = first.dataset.msgId;
+
+            if(id){
+                liveChatState.seen.delete(id);
+            }
+        }
+
+        first.remove();
+    }
+
+    if(added > 0){
+        // Stick to the newest messages while the user is already at the bottom;
+        // never yank the view if they scrolled up to read something.
+        const nearBottom =
+            els.list.scrollHeight - els.list.scrollTop - els.list.clientHeight < 120;
+
+        if(nearBottom){
+            els.list.scrollTop = els.list.scrollHeight;
+        }
+    }
+
+    return added;
+}
+
+
+function liveChatReset(){
+    const els = liveChatEls();
+
+    if(els.list){
+        els.list.textContent = "";
+    }
+
+    liveChatState.seen.clear();
+    liveChatSetStatus("");
+    liveChatSetMeta("");
+}
+
+
+// Stop polling entirely and clear the panel. Used on navigation away and when the
+// next video turns out not to be live.
+function liveChatStop(hidePanel){
+    liveChatState.stopped = true;
+    liveChatState.paused = false;
+    liveChatState.tick = null;
+    liveChatState.run++;
+
+    if(liveChatState.timer){
+        clearTimeout(liveChatState.timer);
+        liveChatState.timer = null;
+    }
+
+    liveChatState.sourceId = "";
+    liveChatReset();
+
+    if(hidePanel && liveChatState.panel){
+        liveChatState.panel.hidden = true;
+    }
+}
+
+
+function liveChatSetMeta(text){
+    const els = liveChatEls();
+
+    if(els.meta){
+        els.meta.textContent = text || "";
+    }
+}
+
+
+// Terminal states: the chat is over for good, so stop polling and leave a clear
+// note in place of a permanently empty box.
+function liveChatFinish(status){
+    liveChatState.stopped = true;
+
+    if(liveChatState.timer){
+        clearTimeout(liveChatState.timer);
+        liveChatState.timer = null;
+    }
+
+    if(status === "ended"){
+        liveChatSetBadge("ENDED", true);
+        liveChatSetStatus("This live chat has ended.");
+    }
+    else if(status === "disabled"){
+        liveChatSetBadge("OFF", true);
+        liveChatSetStatus("Live chat is turned off for this broadcast.");
+    }
+    else if(status === "not_found"){
+        liveChatSetBadge("OFF", true);
+        liveChatSetStatus("This live chat is unavailable.");
+    }
+
+    // Keep any messages already rendered on screen: the history is still useful.
+    liveChatState.sourceId = "";
+    // Terminal: never resume, even after a hidden/visible tab cycle.
+    liveChatState.tick = null;
+    liveChatState.paused = false;
+}
+
+
+// Start following the live chat for a video. `isLive` comes from the video's own
+// liveStreamingDetails, so a non-live video never triggers any chat traffic.
+function liveChatStart(sourceId, isLive){
+    if(!sourceId || !isLive){
+        liveChatStop(true);
+        return;
+    }
+
+    const els = liveChatEls();
+
+    if(!els.panel){
+        return;
+    }
+
+    // Already following this stream: nothing to do.
+    if(liveChatState.sourceId === sourceId && !liveChatState.stopped){
+        return;
+    }
+
+    liveChatStop(false);
+
+    const run = ++liveChatState.run;
+    liveChatState.stopped = false;
+    liveChatState.sourceId = sourceId;
+
+    els.panel.hidden = false;
+    liveChatSetBadge("LIVE", false);
+    liveChatSetMeta("");
+    liveChatSetStatus("Connecting to live chat...");
+
+    // Poll one batch. The server decides whether this is the first fetch (it then
+    // returns recent history) or a follow-up (it returns only new messages), so
+    // the client does not have to know. `isFirstPoll` asks for the history on our
+    // opening request, which also covers joining a stream another viewer already
+    // has open - the server then serves cached history instead of an empty delta.
+    let isFirstPoll = true;
+
+    const poll = async () => {
+        if(liveChatState.stopped || run !== liveChatState.run){
+            return;
+        }
+
+        // A hidden tab must not keep spending the shared upstream poll.
+        if(document.visibilityState === "hidden"){
+            liveChatState.paused = true;
+            liveChatState.timer = null;
+            return;
+        }
+
+        const result = await liveChat(sourceId, "", isFirstPoll);
+        isFirstPoll = false;
+
+        // A newer video took over while this request was in flight.
+        if(liveChatState.stopped || run !== liveChatState.run){
+            return;
+        }
+
+        if(document.visibilityState === "hidden"){
+            liveChatState.paused = true;
+            liveChatState.timer = null;
+            return;
+        }
+
+        if(!result.ok){
+            // Transient failure: back off and retry rather than showing an error.
+            liveChatSetStatus("Live chat is reconnecting...");
+            liveChatState.timer = setTimeout(poll, 10000);
+            return;
+        }
+
+        if(!result.isLive){
+            // The stream ended (or never really started) between renders.
+            liveChatFinish("ended");
+            return;
+        }
+
+        if(result.concurrentViewers){
+            liveChatSetMeta(liveChatFormatViewers(result.concurrentViewers));
+        }
+
+        const added = liveChatRender(result.messages, result.activePoll);
+        const els2 = liveChatEls();
+
+        if(result.chatStatus === "ended" || result.chatStatus === "disabled" || result.chatStatus === "not_found"){
+            liveChatFinish(result.chatStatus);
+            return;
+        }
+
+        if(result.chatStatus === "error"){
+            liveChatSetStatus("Live chat is temporarily unavailable. Retrying...");
+            liveChatState.timer = setTimeout(poll, 10000);
+            return;
+        }
+
+        // Status is "live" here. Say something only when there is genuinely
+        // nothing to show, so a busy chat is not cluttered with text.
+        if(added === 0 && els2.list && els2.list.childElementCount === 0){
+            liveChatSetStatus("Waiting for chat messages...");
+        }
+        else{
+            liveChatSetStatus("");
+        }
+
+        liveChatState.timer = setTimeout(poll, liveChatInterval(result.pollingIntervalMillis));
+    };
+
+    // Kept so a hidden-tab pause can be resumed by the visibilitychange handler.
+    liveChatState.tick = poll;
+    liveChatState.timer = setTimeout(poll, 0);
+}
+
+
+// Called once real YouTube metadata has loaded. Reveals the panel only for a
+// live broadcast.
+function maybeStartLiveChat(video){
+    if(!video || !isYt){
+        liveChatStop(true);
+        return;
+    }
+
+    const sourceId = ytSourceId(rawId);
+
+    liveChatStart(sourceId, Boolean(video.isLive));
+}
+
+
 window.addEventListener("pagehide", () => {
     unsubFirestoreComments();
+    liveChatStop(false);
+});
+
+
+// Don't poll a chat nobody is looking at. A hidden tab stops the loop entirely
+// (saving the shared upstream poll); returning to the tab resumes the same
+// stream where it left off.
+document.addEventListener("visibilitychange", () => {
+    if(document.visibilityState === "hidden"){
+        if(liveChatState.timer){
+            clearTimeout(liveChatState.timer);
+            liveChatState.timer = null;
+        }
+
+        liveChatState.paused = Boolean(liveChatState.sourceId);
+        return;
+    }
+
+    if(liveChatState.paused && liveChatState.tick && !liveChatState.stopped){
+        liveChatState.paused = false;
+        liveChatState.timer = setTimeout(liveChatState.tick, 0);
+    }
 });
 
 

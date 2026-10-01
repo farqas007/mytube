@@ -448,6 +448,40 @@ maxlength="2000"
 
 
 
+<!-- YouTube Live Chat (read-only).
+     Lives inside the right-hand column above Up Next. Hidden by default: watch.js
+     reveals it only when the backend reports the video is currently live. The
+     messages shown are YouTube's own live chat for that broadcast - MyTube does
+     not store or send any of it. -->
+<section id="liveChatPanel" class="live-chat" aria-label="YouTube Live Chat" hidden>
+
+<header class="live-chat-head">
+
+<h3 class="live-chat-title">
+YouTube Live Chat
+</h3>
+
+<span id="liveChatBadge" class="live-chat-badge">LIVE</span>
+
+</header>
+
+<p id="liveChatMeta" class="live-chat-meta"></p>
+
+<div id="liveChatList" class="live-chat-list" role="log" aria-live="polite" aria-relevant="additions">
+
+</div>
+
+<p id="liveChatStatus" class="live-chat-status"></p>
+
+<footer class="live-chat-foot">
+<a href="https://www.youtube.com/live_chat" target="_blank" rel="noopener noreferrer" class="live-chat-attrib">
+Chat provided by YouTube
+</a>
+</footer>
+
+</section>
+
+
 <aside class="suggested" aria-label="Up Next">
 
 

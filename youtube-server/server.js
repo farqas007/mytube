@@ -39,6 +39,10 @@ const YT_ROOT = process.env.YT_ROOT
 
 const YT_API_BASE = "https://www.googleapis.com/youtube/v3";
 
+// `liveStreamingDetails` is what exposes activeLiveChatId, which YouTube only
+// returns while a broadcast is live. It costs no extra quota units on videos.list.
+const VIDEO_PARTS_FULL = "snippet,contentDetails,statistics,status,liveStreamingDetails";
+
 // Small in-memory cache to avoid spamming the quota during a session.
 const cache = new Map();
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -238,10 +242,16 @@ function httpsGetJSON(fullUrl, timeoutMs = 15000){
 }
 
 // Fetch from the YouTube Data API with a key, honoring cache.
-async function ytFetch(cacheKey, url){
-  const cached = cacheGet(cacheKey);
-  if(cached){
-    return cached;
+//
+// `options.skipCache` bypasses the generic 10-minute response cache. Live chat
+// must never use it: a 10-minute-old chat payload is useless, and the short-TTL
+// live probe below would otherwise keep reporting a stale "not live" verdict.
+async function ytFetch(cacheKey, url, options = {}){
+  if(!options.skipCache){
+    const cached = cacheGet(cacheKey);
+    if(cached){
+      return cached;
+    }
   }
 
   const fullUrl = url + "&key=" + encodeURIComponent(API_KEY);
@@ -292,8 +302,429 @@ async function ytFetch(cacheKey, url){
     throw new Error("YouTube API returned an empty response.");
   }
 
-  cacheSet(cacheKey, data);
+  if(!options.skipCache){
+    cacheSet(cacheKey, data);
+  }
+
   return data;
+}
+
+// =============================================================================
+// YOU TUBE LIVE CHAT (Phase 1 — read only)
+// =============================================================================
+// Local-dev mirror of the Worker implementation in worker.js, with identical
+// semantics and an identical JSON response contract so the frontend works
+// unchanged against either backend.
+//
+// This is the REAL YouTube Live Chat for a currently-live broadcast. Nothing is
+// stored in Firestore and no separate MyTube chat is created or implied.
+//
+//   * The client never sends a liveChatId — it sends a video id and the active
+//     chat is resolved server-side, so no caller can aim this at another stream.
+//   * The generic 10-minute cache is bypassed. Each liveChatId gets ONE fan-out
+//     entry shared by all viewers, polled at most once every
+//     `pollingIntervalMillis` (YouTube's own instruction) no matter how many
+//     browsers are watching.
+//   * Errors back off exponentially so a broken stream cannot become a hot loop.
+//   * Live chat has its own rate-limit bucket so periodic polling never spends
+//     the shared general API budget.
+// =============================================================================
+
+const LIVE_CHAT_POLL_FLOOR_MS = 3 * 1000;
+const LIVE_CHAT_POLL_CEIL_MS = 10 * 1000;
+const LIVE_CHAT_DEFAULT_INTERVAL_MS = 5000;
+const LIVE_CHAT_BACKOFF_MIN_MS = 5 * 1000;
+const LIVE_CHAT_BACKOFF_MAX_MS = 60 * 1000;
+const LIVE_CHAT_MAX_ENTRIES = 24;
+const LIVE_CHAT_HISTORY_LIMIT = 200;
+
+const liveChatEntries = new Map();
+
+// Dedicated limiter for live chat polling. Sized for periodic traffic (one
+// request every few seconds per viewer); upstream cost is already capped by the
+// fan-out entry, so this is purely abuse protection.
+const LIVE_CHAT_RATE_WINDOW_MS = 60 * 1000;
+const LIVE_CHAT_RATE_MAX_PER_WINDOW = 120;
+const liveChatRateBuckets = new Map();
+
+// Short-TTL "is this video live right now" cache. The generic 10-minute cache is
+// far too slow: a stream that just started would stay hidden for ten minutes.
+const LIVE_PROBE_TTL_MS = 30 * 1000;
+const LIVE_PROBE_MAX_ENTRIES = 60;
+const liveProbeCache = new Map();
+
+function liveChatRateLimitAllowed(req){
+  const ip = (req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "local")
+    .split(",")[0]
+    .trim();
+  const now = Date.now();
+  const bucket = liveChatRateBuckets.get(ip) || { count: 0, windowStart: now };
+
+  if(now - bucket.windowStart >= LIVE_CHAT_RATE_WINDOW_MS){
+    bucket.count = 0;
+    bucket.windowStart = now;
+  }
+
+  bucket.count++;
+  liveChatRateBuckets.set(ip, bucket);
+
+  if(liveChatRateBuckets.size > 5000){
+    for(const [key, entry] of liveChatRateBuckets){
+      if(now - entry.windowStart >= LIVE_CHAT_RATE_WINDOW_MS){
+        liveChatRateBuckets.delete(key);
+      }
+    }
+  }
+
+  return bucket.count <= LIVE_CHAT_RATE_MAX_PER_WINDOW;
+}
+
+function clampPollingInterval(value){
+  const interval = Number(value);
+
+  if(!Number.isFinite(interval) || interval <= 0){
+    return LIVE_CHAT_DEFAULT_INTERVAL_MS;
+  }
+
+  return Math.min(
+    Math.max(Math.round(interval), LIVE_CHAT_POLL_FLOOR_MS),
+    LIVE_CHAT_POLL_CEIL_MS
+  );
+}
+
+function pruneLiveProbeCache(){
+  const now = Date.now();
+
+  for(const [key, entry] of liveProbeCache){
+    if(now - entry.at >= LIVE_PROBE_TTL_MS){
+      liveProbeCache.delete(key);
+    }
+  }
+}
+
+// Resolve the CURRENT live state of a video through the official YouTube API,
+// cached only for LIVE_PROBE_TTL_MS so live/not-live transitions are noticed
+// quickly. On a transient failure the last known value is reused, so a blip never
+// hides a working live panel.
+async function probeVideoLive(videoId){
+  const now = Date.now();
+  const cached = liveProbeCache.get(videoId);
+
+  if(cached && now - cached.at < LIVE_PROBE_TTL_MS){
+    return cached.value;
+  }
+
+  let item = null;
+
+  try{
+    const url = YT_API_BASE + "/videos?part=snippet,liveStreamingDetails&id=" +
+      encodeURIComponent(videoId);
+    const data = await ytFetch("liveprobe:" + videoId, url, { skipCache: true });
+    item = (data.items && data.items[0]) || null;
+  }
+  catch(err){
+    if(cached){
+      return cached.value;
+    }
+
+    throw err;
+  }
+
+  const value = normalize.readLiveState(item);
+
+  if(liveProbeCache.size >= LIVE_PROBE_MAX_ENTRIES){
+    pruneLiveProbeCache();
+  }
+
+  if(liveProbeCache.size >= LIVE_PROBE_MAX_ENTRIES){
+    const firstKey = liveProbeCache.keys().next().value;
+
+    if(firstKey){
+      liveProbeCache.delete(firstKey);
+    }
+  }
+
+  liveProbeCache.set(videoId, { at: now, value });
+
+  return value;
+}
+
+// Map a YouTube live-chat failure onto a stable, user-safe state. These are NOT
+// outages: they are the normal terminal states of any live chat.
+function classifyLiveChatError(err){
+  const reason = err?.youtubeReason || "";
+
+  if(reason === "liveChatEnded"){
+    return "ended";
+  }
+  if(reason === "liveChatDisabled"){
+    return "disabled";
+  }
+  if(reason === "liveChatNotFound" || err?.status === 404){
+    return "not_found";
+  }
+
+  return "";
+}
+
+async function fetchLiveChatBatch(liveChatId, pageToken){
+  let url = YT_API_BASE + "/liveChat/messages?part=snippet,authorDetails" +
+    "&liveChatId=" + encodeURIComponent(liveChatId) +
+    // YouTube's documented minimum for this endpoint is 200.
+    "&maxResults=200" +
+    "&profileImageSize=88";
+
+  if(pageToken){
+    url += "&pageToken=" + encodeURIComponent(pageToken);
+  }
+
+  // skipCache: a 10-minute-old chat response would be actively wrong.
+  const data = await ytFetch("livechat:" + liveChatId + ":" + (pageToken || ""), url, {
+    skipCache: true
+  });
+
+  return normalize.normalizeLiveChatResponse(data);
+}
+
+function getLiveChatEntry(liveChatId){
+  let entry = liveChatEntries.get(liveChatId);
+
+  if(entry){
+    return entry;
+  }
+
+  entry = {
+    liveChatId,
+    // Server-owned cursor: every viewer of a stream shares one upstream chain.
+    nextPageToken: "",
+    pollingIntervalMillis: LIVE_CHAT_DEFAULT_INTERVAL_MS,
+    offlineAt: "",
+    delta: [],
+    history: [],
+    activePoll: null,
+    totalResults: 0,
+    fetchCount: 0,
+    failures: 0,
+    backoffMs: 0,
+    nextAllowedAt: 0,
+    inflight: null,
+    skippedLast: false,
+    terminated: false,
+    terminalStatus: "",
+    lastError: ""
+  };
+
+  if(liveChatEntries.size >= LIVE_CHAT_MAX_ENTRIES){
+    for(const [key, value] of liveChatEntries){
+      if(!value.inflight && value !== entry){
+        liveChatEntries.delete(key);
+        break;
+      }
+    }
+  }
+
+  liveChatEntries.set(liveChatId, entry);
+
+  return entry;
+}
+
+// At most one upstream fetch per entry per pollingIntervalMillis; concurrent
+// callers share the same in-flight promise, so N viewers => 1 API call.
+function refreshLiveChatEntry(entry, startPageToken){
+  if(entry.inflight){
+    return entry.inflight;
+  }
+
+  if(Date.now() < entry.nextAllowedAt){
+    // Too soon to poll YouTube again: no new upstream batch was retrieved, so
+    // the previous delta must not be handed back as newly fetched. The bounded
+    // history ring is left intact for a viewer joining mid-stream.
+    entry.skippedLast = true;
+    return Promise.resolve();
+  }
+
+  entry.skippedLast = false;
+
+  entry.inflight = (async () => {
+    try{
+      const normalized = await fetchLiveChatBatch(entry.liveChatId, startPageToken);
+
+      entry.failures = 0;
+      entry.backoffMs = 0;
+      entry.lastError = "";
+
+      // The cursor moved forward, so this batch is exactly the messages that
+      // were not in the previous batch.
+      entry.delta = normalized.messages;
+      entry.history = entry.history.concat(normalized.messages);
+
+      if(entry.history.length > LIVE_CHAT_HISTORY_LIMIT){
+        entry.history = entry.history.slice(-LIVE_CHAT_HISTORY_LIMIT);
+      }
+
+      entry.nextPageToken = normalized.nextPageToken;
+      entry.pollingIntervalMillis = normalized.pollingIntervalMillis;
+      entry.offlineAt = normalized.offlineAt;
+      entry.activePoll = normalized.activePoll;
+      entry.totalResults = normalized.totalResults;
+      entry.fetchCount++;
+
+      entry.nextAllowedAt =
+        Date.now() + clampPollingInterval(normalized.pollingIntervalMillis);
+
+      // `offlineAt` is YouTube's authoritative "the stream is over" signal.
+      if(normalized.offlineAt){
+        entry.terminated = true;
+        entry.terminalStatus = "ended";
+      }
+    }
+    catch(err){
+      const terminal = classifyLiveChatError(err);
+
+      entry.delta = [];
+      entry.lastError = String(err?.message || "unknown");
+
+      if(terminal){
+        entry.terminated = true;
+        entry.terminalStatus = terminal;
+
+        // A terminal state is a normal end-of-life, not a failure to report.
+        entry.lastError = "";
+        entry.backoffMs = 0;
+        entry.nextAllowedAt = Infinity;
+
+        return;
+      }
+
+      entry.failures++;
+
+      const doubled = entry.backoffMs > 0 ? entry.backoffMs * 2 : 0;
+
+      entry.backoffMs = Math.min(
+        Math.max(doubled, LIVE_CHAT_BACKOFF_MIN_MS),
+        LIVE_CHAT_BACKOFF_MAX_MS
+      );
+
+      entry.nextAllowedAt = Date.now() +
+        Math.max(clampPollingInterval(entry.pollingIntervalMillis), entry.backoffMs);
+    }
+    finally{
+      entry.inflight = null;
+    }
+  })();
+
+  return entry.inflight;
+}
+
+// GET /api/liveChat?id=<videoId>[&pageToken=<token>][&initial=1]
+// `initial=1` asks for the recent-message history (used by a viewer joining a
+// stream that is already being followed) instead of just the newest delta.
+async function handleLiveChat(req, res, params){
+  const id = (params.get("id") || "").trim();
+
+  if(!id){
+    return sendJSON(res, 400, {
+      messages: [],
+      status: "not_live",
+      error: "Missing id",
+      code: "BAD_REQUEST"
+    });
+  }
+
+  if(!API_KEY){
+    return sendJSON(res, 503, {
+      messages: [],
+      status: "error",
+      error: "YouTube API key not configured.",
+      code: "API_KEY_MISSING"
+    });
+  }
+
+  const live = await probeVideoLive(id);
+
+  const base = {
+    isLive: live.isLive,
+    liveChatId: live.liveChatId,
+    concurrentViewers: live.concurrentViewers,
+    messages: [],
+    nextPageToken: "",
+    pollingIntervalMillis: LIVE_CHAT_DEFAULT_INTERVAL_MS,
+    offlineAt: live.actualEndTime || "",
+    activePoll: null,
+    status: "not_live",
+    code: "",
+    error: ""
+  };
+
+  if(!live.isLive){
+    return sendJSON(res, 200, base);
+  }
+
+  // Live but no active chat id: chat is turned off, or the broadcast has not
+  // produced a chat yet.
+  if(!live.liveChatId){
+    return sendJSON(res, 200, {
+      ...base,
+      status: live.liveChatDisabled ? "disabled" : "no_chat"
+    });
+  }
+
+  const entry = getLiveChatEntry(live.liveChatId);
+
+  // Terminal states are sticky: once YouTube says the chat ended/disabled we stop
+  // polling instead of re-hitting the API every interval.
+  if(entry.terminated){
+    return sendJSON(res, 200, {
+      ...base,
+      status: entry.terminalStatus || "ended",
+      messages: entry.history.slice(),
+      nextPageToken: entry.nextPageToken,
+      pollingIntervalMillis: clampPollingInterval(entry.pollingIntervalMillis),
+      offlineAt: entry.offlineAt,
+      activePoll: entry.activePoll
+    });
+  }
+
+  const hadState = entry.fetchCount > 0;
+
+  await refreshLiveChatEntry(
+    entry,
+    // The SERVER-owned cursor drives every call after the first, so the upstream
+    // batches are strictly disjoint and no message can be skipped. A client
+    // token is honoured on that very first call only, to resume a chat the
+    // process happened to restart mid-stream; once server state exists the
+    // client value is ignored and cannot corrupt the cursor.
+    hadState ? entry.nextPageToken : (params.get("pageToken") || "")
+  );
+
+  // A skipped poll retrieved nothing new: report an empty delta instead of
+  // re-serving the previous batch. A viewer joining a stream that is already
+  // being followed asks for `initial` and still gets the recent history, so its
+  // panel is never empty.
+  const fresh = !entry.skippedLast;
+  const wantsHistory = !hadState || params.get("initial") === "1";
+
+  const status = entry.terminated
+    ? (entry.terminalStatus || "ended")
+    : entry.lastError
+      ? "error"
+      : entry.offlineAt
+        ? "ended"
+        : "live";
+
+  return sendJSON(res, 200, {
+    ...base,
+    status,
+    messages: wantsHistory
+      ? entry.history.slice()
+      : (fresh ? entry.delta.slice() : []),
+    nextPageToken: entry.nextPageToken,
+    pollingIntervalMillis: clampPollingInterval(entry.pollingIntervalMillis),
+    offlineAt: entry.offlineAt,
+    activePoll: entry.activePoll,
+    code: entry.lastError ? "LIVE_CHAT_UNAVAILABLE" : "",
+    error: entry.lastError ? "Live chat is temporarily unavailable." : ""
+  });
 }
 
 // =============================================================================
@@ -325,7 +756,7 @@ async function handleTrending(req, res, params){
   const cacheKey = "trending:" + region + ":" + maxResults + ":" + pageToken;
 
   try{
-    let url = YT_API_BASE + "/videos?part=snippet,contentDetails,statistics&chart=mostPopular" +
+    let url = YT_API_BASE + "/videos?part=" + VIDEO_PARTS_FULL + "&chart=mostPopular" +
       "&regionCode=" + encodeURIComponent(region) + "&maxResults=" + maxResults;
     if(pageToken){
       url += "&pageToken=" + encodeURIComponent(pageToken);
@@ -406,7 +837,7 @@ async function handleVideo(req, res, params){
   try{
     // "status" is requested so the normalized video exposes status.embeddable,
     // letting the watch page show an honest fallback for non-embeddable videos.
-    const url = YT_API_BASE + "/videos?part=snippet,contentDetails,statistics,status&id=" + encodeURIComponent(id);
+    const url = YT_API_BASE + "/videos?part=" + VIDEO_PARTS_FULL + "&id=" + encodeURIComponent(id);
     const data = await ytFetch(cacheKey, url);
     const videos = normalize.normalizeVideosResponse(data);
     if(!videos.length){
@@ -929,13 +1360,29 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 405, { error: "Method not allowed" });
     }
 
-    if(!rateLimitAllowed(req)){
+    // Live chat polling is periodic by design, so it is metered by its own dedicated
+    // limiter (liveChatRateLimitAllowed) and must NOT spend the shared general
+    // budget — otherwise merely watching a live stream would start returning 429
+    // for search / trending / comments.
+    if(route !== "liveChat" && !rateLimitAllowed(req)){
       return sendJSON(res, 429, { error: "Too many requests. Please slow down and try again shortly." });
     }
 
     try{
       if(route === "ping"){
         return handlePing(req, res);
+      }
+      if(route === "liveChat"){
+        // Dedicated limiter, checked before any upstream work.
+        if(!liveChatRateLimitAllowed(req)){
+          return sendJSON(res, 429, {
+            messages: [],
+            status: "error",
+            code: "RATE_LIMITED",
+            error: "Too many live chat requests. Please slow down."
+          });
+        }
+        return await handleLiveChat(req, res, url.searchParams);
       }
       if(route.startsWith("trending")){
         return await handleTrending(req, res, url.searchParams);

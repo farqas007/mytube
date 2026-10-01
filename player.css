@@ -1543,3 +1543,208 @@ header input{
     opacity:0.6;
     cursor:default;
 }
+
+/* ================= YOUTUBE LIVE CHAT (read-only) ================= */
+/* The real YouTube Live Chat for a currently-live broadcast, shown in the right
+   column above Up Next. No composer and no MyTube chat: this is a read-only view
+   of YouTube's own chat, and nothing here is persisted by MyTube. */
+
+.live-chat{
+    background:#202020;
+    border:1px solid #2f2f2f;
+    border-radius:10px;
+    padding:12px;
+    margin-bottom:20px;
+    display:flex;
+    flex-direction:column;
+    /* Fills the sticky right column without fighting the Up Next list. */
+    min-height:0;
+}
+
+/* The panel stays hidden until watch.js confirms the video is live. */
+.live-chat[hidden]{
+    display:none;
+}
+
+.live-chat-head{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:8px;
+}
+
+.live-chat-title{
+    margin:0;
+    font-size:15px;
+    font-weight:600;
+}
+
+.live-chat-badge{
+    background:#cc0000;
+    color:#fff;
+    font-size:11px;
+    font-weight:700;
+    letter-spacing:.5px;
+    padding:2px 6px;
+    border-radius:4px;
+}
+
+/* End-of-stream badge: same slot, but not alarming. */
+.live-chat-badge.is-ended{
+    background:#3a3a3a;
+    color:#bbb;
+}
+
+.live-chat-meta{
+    margin:6px 0 0;
+    font-size:12px;
+    color:#888;
+    min-height:0;
+}
+
+.live-chat-list{
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+    /* Scrolling region so a busy chat can never stretch the page. */
+    max-height:320px;
+    overflow-y:auto;
+    overscroll-behavior:contain;
+    margin:10px 0 0;
+    padding-right:2px;
+}
+
+.live-chat-msg{
+    display:flex;
+    gap:8px;
+    align-items:flex-start;
+}
+
+.live-chat-avatar{
+    width:24px;
+    height:24px;
+    border-radius:50%;
+    flex:0 0 24px;
+    object-fit:cover;
+    background:#333;
+}
+
+.live-chat-body{
+    min-width:0;
+    flex:1;
+}
+
+.live-chat-author{
+    font-size:12px;
+    color:#aaa;
+    display:flex;
+    align-items:center;
+    gap:5px;
+    flex-wrap:wrap;
+}
+
+/* Owner / moderator / member markers, mirroring YouTube's own role badges. */
+.live-chat-role{
+    font-size:10px;
+    font-weight:700;
+    letter-spacing:.3px;
+    padding:1px 4px;
+    border-radius:3px;
+    background:#333;
+    color:#bbb;
+}
+
+.live-chat-role.is-owner{
+    background:#3d2b00;
+    color:#ffca28;
+}
+
+.live-chat-role.is-moderator{
+    background:#12331e;
+    color:#7ee2a8;
+}
+
+/* Super Chat / Super Stickers: the only "paid" bit YouTube puts in live chat. */
+.live-chat-superc{
+    font-size:11px;
+    font-weight:700;
+    color:#f5c518;
+    margin-left:5px;
+}
+
+.live-chat-text{
+    margin:2px 0 0;
+    font-size:13px;
+    line-height:1.4;
+    color:#eee;
+    /* Chat text is untrusted user input: never allow markup/URL injection. */
+    word-break:break-word;
+    overflow-wrap:anywhere;
+}
+
+.live-chat-time{
+    font-size:11px;
+    color:#777;
+    margin-top:2px;
+}
+
+.live-chat-status{
+    margin:10px 0 0;
+    font-size:13px;
+    color:#999;
+}
+
+.live-chat-status[hidden]{
+    display:none;
+}
+
+/* Active poll card YouTube injects into live chat. */
+.live-chat-poll{
+    background:#262626;
+    border-radius:8px;
+    padding:10px;
+}
+
+.live-chat-poll-q{
+    font-size:13px;
+    font-weight:600;
+    margin:0 0 2px;
+}
+
+.live-chat-poll-meta{
+    font-size:11px;
+    color:#888;
+    margin:0;
+}
+
+.live-chat-foot{
+    margin-top:10px;
+    padding-top:8px;
+    border-top:1px solid #2f2f2f;
+}
+
+.live-chat-attrib{
+    font-size:11px;
+    color:#777;
+    text-decoration:none;
+}
+
+.live-chat-attrib:hover{
+    color:#aaa;
+    text-decoration:underline;
+}
+
+
+/* Right column already stacks under the player at 1000px; the chat list can then
+   breathe a little more. */
+@media(max-width:1000px){
+    .live-chat-list{
+        max-height:300px;
+    }
+}
+
+@media(max-width:600px){
+    .live-chat-list{
+        max-height:260px;
+    }
+}
