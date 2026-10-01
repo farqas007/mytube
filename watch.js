@@ -553,6 +553,9 @@ async function loadYouTubeVideo(){
         viewCount: info.viewCount || 0,
         likeCount: (typeof info.likeCount === "number") ? info.likeCount : null,
         commentCount: (typeof info.commentCount === "number") ? info.commentCount : null,
+        // Must survive the rebuild: maybeStartLiveChat() reads it to decide
+        // whether to reveal the YouTube Live Chat panel for this video.
+        isLive: Boolean(info.isLive),
         date: info.date || "",
         description: info.description || "",
         category: ""
