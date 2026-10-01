@@ -34,6 +34,28 @@ function ytSourceId(raw){
     return str.startsWith("yt:") ? str.slice(3) : "";
 }
 
+// A YouTube video id is always exactly 11 URL-safe base64 characters.
+// https://www.youtube.com/watch?v=dQw4w9WgXcQ
+const YT_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+
+// Canonicalize the `?id=` value once, at page init.
+//
+// `/watch?id=<videoId>` (a plain YouTube video id) must behave exactly like
+// `/watch?id=yt:<videoId>`, so a bare, valid video id is promoted to the
+// internal "yt:" representation here. Everything downstream (isYouTubeId,
+// ytSourceId, the embed, getVideo(), liveChat(), canonical URL, storage keys)
+// keeps reading `rawId` unchanged, so this is the only place that has to know
+// about the shorthand. Anything already "yt:"-prefixed — or anything that is
+// not a valid video id — is passed through untouched and keeps failing exactly
+// as it did before.
+function normalizeWatchId(raw){
+    const str = String(raw === null || raw === undefined ? "" : raw).trim();
+    if(!str || isYouTubeId(str)){
+        return str;
+    }
+    return YT_VIDEO_ID_RE.test(str) ? "yt:" + str : str;
+}
+
 
 function formatCommentTime(ts){
     const date = new Date(ts);
@@ -81,9 +103,15 @@ function currentUserName(){
 // ================= PAGE STATE =================
 
 
-const rawId = getRawId();
-// MyTube is YouTube-only: no local dataset exists, so a non-"yt:" id never
-// resolves to a playable video. `current` stays null and `renderers` read the
+// The `?id=` value, already canonicalized to the "yt:" representation when it is
+// a bare YouTube video id (see normalizeWatchId). Everything below — the load
+// flow, the embed, the API calls, the storage keys and the canonical URL — is
+// written against that single form, so `?id=<videoId>` and `?id=yt:<videoId>`
+// are indistinguishable from here on.
+const rawId = normalizeWatchId(getRawId());
+// MyTube is YouTube-only: no local dataset exists, so an id that is not a
+// "yt:" id (e.g. an old local-video record or a malformed id) never resolves to
+// a playable video. `current` stays null and `renderers` read the
 // asynchronously-populated `active` object (see loadYouTubeVideo).
 const current = null;
 // Fallback storage key used until a YouTube video's metadata loads.
@@ -214,10 +242,11 @@ function loadVideo(){
         return;
     }
 
-    // MyTube is YouTube-only: the legacy local MP4 dataset is gone, so a
-    // non-"yt:" id (e.g. an old direct link or stored local-video record) can
-    // never resolve to a playable video. Show the clean "not found" panel
-    // instead of attempting to load a nonexistent /videos/*.mp4 file.
+    // MyTube is YouTube-only: the legacy local MP4 dataset is gone, so an id
+    // that did not normalize to "yt:" (e.g. a stored local-video record or a
+    // malformed id) can never resolve to a playable video. Show the clean "not
+    // found" panel instead of attempting to load a nonexistent
+    // /videos/*.mp4 file.
     renderErrorState();
 }
 
