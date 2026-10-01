@@ -88,6 +88,7 @@ Logout
 
     <nav class="sidebar-nav">
 
+        <a class="sidebar-nav-link" href="/">
         <p id="sideHome" class="sidebar-item active">
             <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M3 10.5 12 3l9 7.5"></path>
@@ -96,6 +97,7 @@ Logout
             </svg>
             <span>Home</span>
         </p>
+        </a>
 
         <p id="sideTrending" class="sidebar-item">
             <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -105,6 +107,7 @@ Logout
             <span>Trending</span>
         </p>
 
+        <a class="sidebar-nav-link" href="/subscriptions">
         <p id="sideSubs" class="sidebar-item sidebar-section-link">
             <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
                 <rect x="3" y="5" width="18" height="14" rx="2"></rect>
@@ -113,6 +116,7 @@ Logout
             <span>Subscriptions</span>
             <span class="sidebar-chevron">›</span>
         </p>
+        </a>
 
         <div id="sidebarSubscriptionsList" class="sidebar-subscriptions-list"></div>
 
@@ -128,6 +132,7 @@ Logout
             <span class="sidebar-chevron">›</span>
         </p>
 
+        <a class="sidebar-nav-link" href="/library">
         <p id="sideLibrary" class="sidebar-item">
             <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v17H6.5A2.5 2.5 0 0 0 4 22V5.5Z"></path>
@@ -135,7 +140,9 @@ Logout
             </svg>
             <span>Library</span>
         </p>
+        </a>
 
+        <a class="sidebar-nav-link" href="/library?tab=history">
         <p id="sideHistory" class="sidebar-item">
             <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M6 4h12v16H6z"></path>
@@ -145,7 +152,9 @@ Logout
             </svg>
             <span>History</span>
         </p>
+        </a>
 
+        <a class="sidebar-nav-link" href="/library?tab=saved">
         <p id="sideWatchLater" class="sidebar-item">
             <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M12 4v10"></path>
@@ -154,13 +163,16 @@ Logout
             </svg>
             <span>Watch later</span>
         </p>
+        </a>
 
+        <a class="sidebar-nav-link" href="/library?tab=liked">
         <p id="sideLikedVideos" class="sidebar-item">
             <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
                 <path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9L12 3Z"></path>
             </svg>
             <span>Liked videos</span>
         </p>
+        </a>
 
     </nav>
 
@@ -171,6 +183,9 @@ Logout
 
 
 <div class="home-content">
+
+
+<h1 class="sr-only">MyTube — watch trending videos, search YouTube and build your library</h1>
 
 
 <div id="categoryFilter" class="category-filter" role="group" aria-label="Filter by category"></div>
@@ -263,8 +278,15 @@ function buildCard(v){
     thumb.appendChild(img);
     thumb.appendChild(badge);
 
+    // Real anchor so crawlers can follow the title into the watch page. The
+    // heading text is unchanged; only the wrapper is new, and the card's own
+    // click/keyboard handlers still fire because the click bubbles up to them.
     const title = document.createElement("h3");
-    title.textContent = v.title;
+    const titleLink = document.createElement("a");
+    titleLink.className = "card-title-link";
+    titleLink.href = "/watch?id=" + encodeURIComponent(v.id);
+    titleLink.textContent = v.title;
+    title.appendChild(titleLink);
 
     const meta = document.createElement("p");
     meta.textContent = cardMeta(v);

@@ -141,6 +141,8 @@ function renderErrorState(){
     if(pageError){
         pageError.style.display = "block";
     }
+    // A dead/unavailable watch URL must not be indexed.
+    setVideoPageMetaNoIndex();
     console.warn("Video not found for id:", rawId);
 }
 
@@ -555,6 +557,88 @@ function setPageMetaDescription(v){
 }
 
 
+// ================= PAGE METADATA (client-side) =================
+// IMPORTANT: this is CLIENT-SIDE metadata only. worker.js sends every
+// non-/api/ request straight to the static ASSETS binding, so watch.html is
+// served verbatim and these tags are applied by the browser after render.
+// Crawlers that execute JS may pick them up; they are not server-rendered.
+
+const WATCH_ORIGIN = "https://mytube.farqas007.workers.dev";
+const ROBOTS_INDEXABLE = "index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1";
+const ROBOTS_NOINDEX = "noindex, follow";
+
+
+function setMetaContent(selector, value){
+    if(!value){
+        return;
+    }
+    const el = document.querySelector(selector);
+    if(el){
+        el.setAttribute("content", String(value));
+    }
+}
+
+
+// Ensure the page has exactly one robots meta and point it at `content`.
+function setRobotsMeta(content){
+    let el = document.querySelector('meta[name="robots"]');
+    if(!el){
+        el = document.createElement("meta");
+        el.setAttribute("name", "robots");
+        document.head.appendChild(el);
+    }
+    el.setAttribute("content", content);
+}
+
+
+// Point the single canonical link (the one shipped in watch.html) at `url`.
+function setCanonicalUrl(url){
+    let el = document.getElementById("pageCanonical");
+    if(!el){
+        el = document.createElement("link");
+        el.id = "pageCanonical";
+        el.setAttribute("rel", "canonical");
+        document.head.appendChild(el);
+    }
+    el.setAttribute("href", url);
+}
+
+
+// A video actually rendered: make canonical + OG describe that video.
+function setVideoPageMeta(v){
+    const id = v && v.id ? String(v.id) : String(rawId || "");
+    if(!id){
+        return;
+    }
+    const url = WATCH_ORIGIN + "/watch?id=" + encodeURIComponent(id);
+
+    setCanonicalUrl(url);
+    setRobotsMeta(ROBOTS_INDEXABLE);
+    setMetaContent('meta[property="og:url"]', url);
+
+    if(v && v.title){
+        setMetaContent('meta[property="og:title"]', v.title + " - MyTube");
+        setMetaContent('meta[name="twitter:title"]', v.title + " - MyTube");
+    }
+
+    const desc = v && v.description ? String(v.description).slice(0, 160) : "";
+    if(desc){
+        setMetaContent('meta[property="og:description"]', desc);
+        setMetaContent('meta[name="twitter:description"]', desc);
+    }
+
+    if(v && v.thumb){
+        setMetaContent('meta[property="og:image"]', v.thumb);
+    }
+}
+
+
+// Invalid or unavailable video: keep the page out of the search index.
+function setVideoPageMetaNoIndex(){
+    setRobotsMeta(ROBOTS_NOINDEX);
+}
+
+
 function renderYtSubViews(v){
     const titleEl = document.getElementById("videoTitle");
     if(titleEl){
@@ -562,6 +646,7 @@ function renderYtSubViews(v){
     }
     document.title = (v && v.title ? v.title : "Watch") + " - MyTube";
     setPageMetaDescription(v);
+    setVideoPageMeta(v);
 
     renderVideoDetails();
     renderChannel();
@@ -993,7 +1078,14 @@ function buildSuggestedItem(v){
     const info = document.createElement("div");
 
     const h4 = document.createElement("h4");
-    h4.textContent = v.title;
+    // Real anchor so crawlers can follow the suggestion into the watch page.
+    // Click/keyboard behavior is unchanged: the click still bubbles to the
+    // item's own handler.
+    const h4Link = document.createElement("a");
+    h4Link.className = "suggest-title-link";
+    h4Link.href = "/watch?id=" + encodeURIComponent(v.id);
+    h4Link.textContent = v.title;
+    h4.appendChild(h4Link);
 
     const p = document.createElement("p");
     p.textContent = v.channel;
