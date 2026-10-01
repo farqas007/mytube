@@ -6,6 +6,8 @@ import {
   normalizeChannelResponse,
   normalizeCommentsResponse,
   normalizeLiveChatResponse,
+  formatCount,
+  formatPublishedDate,
   readLiveState
 } from "./shared/normalize.js";
 import {
@@ -23,6 +25,12 @@ import {
   resolveSearchFilters,
   resolveSearchMax
 } from "./shared/search.js";
+import {
+  VIDEO_TYPE_YOUTUBE,
+  getVideoByVideoId,
+  markFetchedAt,
+  upsertVideos
+} from "./shared/index-store.js";
 
 const YT_API_BASE = "https://www.googleapis.com/youtube/v3";
 
@@ -83,6 +91,314 @@ function withSecurityHeaders(response) {
 // errors their own handling (they mean very different things than generic 403s).
 function isLiveChatPath(pathname) {
   return String(pathname || "").includes("liveChat/");
+}
+
+// -----------------------------------------------------------------------------
+// D1 INDEX (Phase 1) — availability guard, read-first detail lookup, write-behind
+// -----------------------------------------------------------------------------
+// Every function in this block is OPTIONAL infrastructure wrapped around the
+// existing YouTube paths. The rules it keeps:
+//
+//   * No binding, no ctx, or a binding that is not a usable D1 database => every
+//     function here is a no-op and the Worker behaves exactly as it did before
+//     the index existed. A missing or broken D1 can never turn into a 5xx.
+//   * Nothing here ever ADDS an upstream YouTube request. A read is served from
+//     the index only instead of from YouTube, and a write reuses metadata the
+//     Worker had already paid for. Upstream quota usage is therefore identical,
+//     and for /api/video an index hit actually spends less.
+//   * Nothing here blocks a response. Writes run through ctx.waitUntil(), so the
+//     client is answered from the payload already in hand.
+//   * Nothing here stores user data. The only rows written are
+//     `videos`-table metadata rows built by shared/index-store.js from a raw
+//     videos.list item: no live chat ids, no chat messages, no comments, no
+//     credentials, no email addresses.
+//
+// Origin labels written to `videos.origin` (see 0001_init.sql) — one per existing
+// upstream path, so a row can always be traced back to how it was obtained.
+const INDEX_ORIGIN_DETAIL = "detail";
+const INDEX_ORIGIN_SEARCH = "search";
+const INDEX_ORIGIN_RELATED = "related";
+const INDEX_ORIGIN_CHANNEL = "channel";
+const INDEX_ORIGIN_CHART_PREFIX = "chart:";
+
+// How long an indexed row may answer /api/video.
+//
+// The 6-minute TTL is the WHOLE staleness budget, not a slice of a larger one.
+// Rows are stamped with the instant their payload arrived from YouTube
+// (VIDEO_FETCHED_AT), never with the moment the row was written, so re-indexing a
+// cache hit does not renew the row's lease on life. A row therefore becomes
+// unusable 6 minutes after the fetch it describes, even if it was re-written
+// 50 times in between, and the index cannot make a client see older data than
+// the pre-existing 10-minute response cache already permitted.
+//
+// It exists to cut YouTube calls, never to relax freshness.
+const VIDEO_INDEX_TTL_MS = 6 * 60 * 1000;
+
+// A row stamped slightly in the future is accepted (clock skew between the
+// writing isolate and this one); anything further ahead than this is treated as
+// untrustworthy and simply re-fetched, because a bad timestamp must not become a
+// permanently "fresh" row.
+const VIDEO_INDEX_CLOCK_SKEW_MS = 60 * 1000;
+
+// Upper bound on a runtime that can be rebuilt into the canonical DTO at all.
+// normalize.js's formatDuration() only understands the PT… form, so a day-or-longer
+// runtime (a P1D/P1W duration) has no canonical rendering to reproduce.
+// See the duration gate in indexRowIsFresh() for the full rule.
+const VIDEO_INDEX_MAX_DURATION_SECONDS = 86400;
+
+// Builds the per-request index handle, or null when indexing must be skipped.
+//
+// null is returned when the binding is absent/malformed OR when ctx cannot accept
+// background work — which is the whole availability guard in one place.
+function createIndexContext(ctx, env) {
+  const db = env?.mytube_index;
+
+  if (!db || typeof db.prepare !== "function") {
+    return null;
+  }
+
+  if (typeof ctx?.waitUntil !== "function") {
+    return null;
+  }
+
+  return { db, ctx };
+}
+
+// Schedule an index write. Returns immediately; the write never delays the
+// response and a D1 failure is logged here rather than propagated, because the
+// response has already been computed from the same payload.
+function scheduleIndexWrite(index, items, options = {}) {
+  const list = Array.isArray(items) ? items : [];
+
+  if (!index || !list.length) {
+    return;
+  }
+
+  const task = upsertVideos(index.db, list, options).catch(error => {
+    console.error(
+      "[mytube] D1 index write failed",
+      error?.message || error
+    );
+  });
+
+  index.ctx.waitUntil(task);
+}
+
+// True when a row may answer /api/video instead of a YouTube call.
+function indexRowIsFresh(row, now) {
+  if (!row || typeof row !== "object") {
+    return false;
+  }
+
+  if (String(row.type || "") !== VIDEO_TYPE_YOUTUBE) {
+    return false;
+  }
+
+  // Only a plain YouTube video id is looked up. Anything carrying the namespaced
+  // form ("yt:…") is left to the existing path untouched, so no request that
+  // behaves differently today can start behaving differently here.
+  const videoId = String(row.video_id || "").trim();
+
+  if (!videoId || !/^[A-Za-z0-9_-]{1,64}$/.test(videoId)) {
+    return false;
+  }
+
+  const fetchedAt = Number(row.metadata_fetched_at_ms);
+
+  if (!Number.isFinite(fetchedAt)) {
+    return false;
+  }
+
+  const age = now - fetchedAt;
+
+  if (age > VIDEO_INDEX_TTL_MS || age < -VIDEO_INDEX_CLOCK_SKEW_MS) {
+    return false;
+  }
+
+  // Live state is time-critical: a row written as "not live" can become live at
+  // any moment, and the watch page's live panel must keep polling YouTube. Such
+  // rows always take the live YouTube path, so indexing can never delay a
+  // broadcast going live.
+  if (Number(row.is_live) === 1) {
+    return false;
+  }
+
+  // Two duration states cannot be rendered identically to the YouTube path and
+  // are therefore never served from the index:
+  //
+  //   0       ambiguous. "PT0S" renders "0:00" but "P0D" (a stream with no fixed
+  //           runtime, which is most live content) renders "" — and both land in
+  //           the same column, so the row cannot tell them apart.
+  //   >= 1 day normalize.js's formatDuration() has no PT… form that yields this,
+  //           so there is no canonical rendering to reproduce.
+  //
+  // A NULL duration is fine and renders "" on both paths.
+  if (row.duration_seconds !== null && row.duration_seconds !== undefined && row.duration_seconds !== "") {
+    const duration = Number(row.duration_seconds);
+
+    if (!Number.isFinite(duration) || duration <= 0 || duration >= VIDEO_INDEX_MAX_DURATION_SECONDS) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// Integer seconds -> the exact string normalize.js's formatDuration() produces
+// for the equivalent PT… duration. Only reached for durations the canonical
+// formatter can render (see the duration gate in indexRowIsFresh).
+function formatIndexedDuration(seconds) {
+  if (seconds === null || seconds === undefined || seconds === "") {
+    return "";
+  }
+
+  const total = Number(seconds);
+
+  if (!Number.isFinite(total) || total < 0) {
+    return "";
+  }
+
+  const whole = Math.floor(total);
+
+  if (whole >= VIDEO_INDEX_MAX_DURATION_SECONDS) {
+    return "";
+  }
+
+  const hours = Math.floor(whole / 3600);
+  const minutes = Math.floor((whole % 3600) / 60);
+  const rest = whole % 60;
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
+  }
+
+  return `${minutes}:${String(rest).padStart(2, "0")}`;
+}
+
+// Rebuild a YouTube RFC 3339 timestamp from stored epoch milliseconds.
+//
+// YouTube emits publishedAt / actualStartTime / actualEndTime as
+// "YYYY-MM-DDTHH:MM:SSZ" — whole seconds, UTC, no fractional part. Formatting
+// through toISOString() and dropping the milliseconds only when the stored value
+// is a whole second therefore reproduces the upstream string BYTE FOR BYTE,
+// which is what lets an index-served /api/video be deep-equal to a
+// YouTube-served one. (A non-whole-second value cannot come from these fields;
+// it is rendered with full precision rather than silently rounded.)
+function formatIndexedTimestamp(value) {
+  if (value === null || value === undefined || value === "") {
+    return "";
+  }
+
+  const ms = Number(value);
+
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return "";
+  }
+
+  const iso = new Date(ms).toISOString();
+
+  return ms % 1000 === 0 ? iso.replace(/\.\d{3}Z$/, "Z") : iso;
+}
+
+// Rebuild the canonical DTO from an indexed row.
+//
+// The returned object has the SAME keys, in the same order, with the same value
+// types as normalizeVideoItem() for the same video — that is the contract /api/video
+// has always had, so a row served from the index is indistinguishable from one
+// built from a fresh videos.list response.
+function videoFromIndexRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  const videoId = String(row.video_id || "").trim();
+
+  if (!videoId) {
+    return null;
+  }
+
+  // `embeddable` is NOT NULL in the schema, but "unknown" is still rendered the
+  // way normalize.js renders it (an absent status part means embeddable).
+  const embeddable = row.embeddable === null || row.embeddable === undefined
+    ? true
+    : Number(row.embeddable) !== 0;
+
+  const publishedAtMs =
+    row.published_at_ms === null || row.published_at_ms === undefined || row.published_at_ms === ""
+      ? null
+      : Number(row.published_at_ms);
+
+  // The index never stores live chat content, so these are always empty/zero on a
+  // row this function is allowed to serve (live rows are rejected above).
+  return {
+    id: `yt:${videoId}`,
+    sourceId: videoId,
+    type: VIDEO_TYPE_YOUTUBE,
+    title: String(row.title || ""),
+    channel: String(row.channel_title || ""),
+    channelId: String(row.channel_id || ""),
+    thumb: String(row.thumb_url || ""),
+    time: formatIndexedDuration(row.duration_seconds),
+    views: `${formatCount(Number(row.view_count) || 0)} views`,
+    viewCount: Number(row.view_count) || 0,
+    likeCount: Number(row.like_count) || 0,
+    commentCount: Number(row.comment_count) || 0,
+    // Recomputed from the absolute publication instant at response time, which is
+    // exactly what the YouTube path does — "2y ago" is never stored.
+    date: formatPublishedDate(
+      Number.isFinite(publishedAtMs) ? publishedAtMs : null
+    ),
+    description: String(row.description || ""),
+    embeddable,
+    isLive: Number(row.is_live) === 1,
+    liveChatId: "",
+    concurrentViewers: 0,
+    liveChatDisabled: false,
+    actualStartTime: formatIndexedTimestamp(row.live_start_ms),
+    actualEndTime: formatIndexedTimestamp(row.live_end_ms)
+  };
+}
+
+// Index-first lookup for /api/video.
+//
+//   { video, degraded }  video === null means "use the existing YouTube path".
+//                       degraded === true means the index itself failed, which is
+//                       reported as X-MyTube-Degraded: 1 without ever surfacing
+//                       as an error.
+async function readIndexedVideo(index, videoId) {
+  if (!index) {
+    return { video: null, degraded: false };
+  }
+
+  try {
+    const row = await getVideoByVideoId(index.db, videoId);
+
+    if (!indexRowIsFresh(row, Date.now())) {
+      return { video: null, degraded: false };
+    }
+
+    return { video: videoFromIndexRow(row), degraded: false };
+  } catch (error) {
+    console.error(
+      "[mytube] D1 index read failed",
+      error?.message || error
+    );
+
+    return { video: null, degraded: true };
+  }
+}
+
+// Observability headers for every route the index touches.
+//
+//   source     index    answered from a fresh D1 row
+//              youtube  answered from YouTube, as before
+//              fallback answered from YouTube AFTER the index failed
+//   degraded   1 when the index path errored and the request was degraded, else 0
+function indexHeaders(source, degraded = false) {
+  return {
+    "X-MyTube-Source": source,
+    "X-MyTube-Degraded": degraded ? "1" : "0"
+  };
 }
 
 // -----------------------------------------------------------------------------
@@ -175,7 +491,10 @@ const MAX_CACHE_ENTRIES = 200;
 
 const memoryCache = new Map();
 
-function json(data, status = 200, request) {
+// `extraHeaders` carries the Phase 1 index observability headers only. It is
+// applied AFTER the CORS/Cache-Control block so it can never overwrite
+// Content-Type, Cache-Control, Access-Control-Allow-Origin or Vary.
+function json(data, status = 200, request, extraHeaders = null) {
   const headers = {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store"
@@ -184,6 +503,10 @@ function json(data, status = 200, request) {
   if (originAllowed(request)) {
     headers["Access-Control-Allow-Origin"] = request.headers.get("Origin");
     headers["Vary"] = "Origin";
+  }
+
+  for (const [name, value] of Object.entries(extraHeaders || {})) {
+    headers[name] = String(value);
   }
 
   return new Response(JSON.stringify(data), {
@@ -471,6 +794,22 @@ async function ytFetch(pathname, params, apiKey, options = {}) {
     data
   };
 
+  // Stamp the moment the bytes actually arrived, BEFORE the response enters the
+  // in-memory cache. The marker rides inside the cached object, so a later cache
+  // hit keeps reporting the original fetch time and re-indexing it cannot renew a
+  // row's freshness lease (see VIDEO_FETCHED_AT in shared/index-store.js).
+  //
+  // Only `items` are stamped: those are the raw videos.list/search.list objects
+  // that reach the index. Non-item payloads (channels, playlistItems, liveChat)
+  // are never indexed, so there is nothing to mark.
+  if (Array.isArray(data?.items)) {
+    const fetchedAt = Date.now();
+
+    for (const item of data.items) {
+      markFetchedAt(item, fetchedAt);
+    }
+  }
+
   if (!options.skipCache) {
     cacheSet(cacheKey, result);
   }
@@ -536,6 +875,14 @@ async function searchYouTube(query, max, apiKey, pageToken, options = {}) {
         detailsById.set(item.id, item);
       }
     }
+
+    // Index what this search ALREADY paid for. Same videos.list response, no
+    // extra request, and /api/search keeps answering from YouTube: this only
+    // records metadata beside the response. Search itself is never answered from
+    // the index in Phase 1.
+    scheduleIndexWrite(options.index, [...detailsById.values()], {
+      origin: INDEX_ORIGIN_SEARCH
+    });
   }
 
   const normalized = [];
@@ -619,6 +966,8 @@ function getCachedFeedPool() {
 
 // Fetch one region's chart page and normalize it, keeping the raw tags so a real
 // topic label can be derived for each video (free — already in the response).
+// The raw videos.list items are returned alongside (keyed by video id) purely so
+// the pool build can index them without a second upstream call.
 async function fetchFeedRegion(apiKey, region) {
   const result = await ytFetch(
     "videos",
@@ -633,6 +982,7 @@ async function fetchFeedRegion(apiKey, region) {
 
   const videos = [];
   const ids = new Set();
+  const rawById = new Map();
 
   for (const item of result.data?.items || []) {
     const video = normalizeVideoItem(item);
@@ -642,22 +992,24 @@ async function fetchFeedRegion(apiKey, region) {
     }
 
     ids.add(video.sourceId);
+    rawById.set(video.sourceId, item);
     videos.push({
       ...video,
       topic: topicFromTags(item?.snippet?.tags)
     });
   }
 
-  return { region, videos, ids };
+  return { region, videos, ids, rawById };
 }
 
-async function buildFeedPool(apiKey) {
+async function buildFeedPool(apiKey, index) {
   const regions = await Promise.all(
     FEED_POOL_REGIONS.map(region =>
       fetchFeedRegion(apiKey, region).catch(() => ({
         region,
         videos: [],
-        ids: new Set()
+        ids: new Set(),
+        rawById: new Map()
       }))
     )
   );
@@ -666,8 +1018,15 @@ async function buildFeedPool(apiKey) {
   const seen = new Set();
   const regionIds = {};
 
+  // Metadata to index, grouped by the chart that contributed each video so a row
+  // records the region it was actually observed in ("chart:PK", …).
+  const rawById = new Map();
+  const contributed = [];
+
   for (const entry of regions) {
     regionIds[entry.region] = entry.ids;
+
+    const freshIds = [];
 
     for (const video of entry.videos) {
       if (seen.has(video.sourceId)) {
@@ -676,19 +1035,83 @@ async function buildFeedPool(apiKey) {
 
       seen.add(video.sourceId);
       items.push(video);
+
+      const raw = entry.rawById?.get(video.sourceId);
+
+      if (raw) {
+        rawById.set(video.sourceId, raw);
+        freshIds.push(video.sourceId);
+      }
+    }
+
+    if (freshIds.length) {
+      contributed.push({ region: entry.region, ids: freshIds });
     }
   }
 
   // Never hand back an empty feed: fall back to the primary region alone if every
   // multi-region build somehow failed.
   if (!items.length) {
+    const fallbackRegion = FEED_POOL_REGIONS[0] || "US";
     const fallback = await fetchFeedRegion(
       apiKey,
-      FEED_POOL_REGIONS[0] || "US"
-    ).catch(() => ({ videos: [], ids: new Set() }));
+      fallbackRegion
+    ).catch(() => ({ videos: [], ids: new Set(), rawById: new Map() }));
 
-    regionIds[FEED_POOL_REGIONS[0] || "US"] = fallback.ids;
+    regionIds[fallbackRegion] = fallback.ids;
     items.push(...fallback.videos);
+
+    const fallbackIds = [];
+
+    for (const video of fallback.videos) {
+      const raw = fallback.rawById?.get(video.sourceId);
+
+      if (raw) {
+        rawById.set(video.sourceId, raw);
+        fallbackIds.push(video.sourceId);
+      }
+    }
+
+    if (fallbackIds.length) {
+      contributed.push({ region: fallbackRegion, ids: fallbackIds });
+    }
+  }
+
+  // Index-only: the same chart payloads the pool was just built from. The feed
+  // itself is still built by shared/feed.js from the same pool as before, so
+  // refresh diversity, channel diversification and cursor pagination are
+  // untouched — nothing about /api/trending's answers changes.
+  //
+  // Reduce write amplification: index a capped subset of unique videos from the
+  // pool (e.g. first 200 unique videos encountered) rather than every video
+  // from every region. This preserves diversified feed behavior while avoiding
+  // 8 D1 batch calls for large pools.
+  const MAX_TRENDING_INDEX = 200;
+  const toIndex = [];
+  // Build a deterministic order of unique videos to index (preserve encounter order)
+  for (const group of contributed) {
+    for (const id of group.ids) {
+      if (toIndex.length >= MAX_TRENDING_INDEX) {
+        break;
+      }
+      if (toIndex.some(x => x.id === id)) {
+        continue;
+      }
+      const raw = rawById.get(id);
+      if (raw) {
+        toIndex.push({ id, raw, region: group.region });
+      }
+    }
+    if (toIndex.length >= MAX_TRENDING_INDEX) {
+      break;
+    }
+  }
+  if (toIndex.length > 0) {
+    scheduleIndexWrite(
+      index,
+      toIndex.map(x => x.raw),
+      { origin: `${INDEX_ORIGIN_CHART_PREFIX}pool` }
+    );
   }
 
   return {
@@ -700,7 +1123,7 @@ async function buildFeedPool(apiKey) {
 
 // One shared build for all concurrent callers: without this, a burst of page
 // loads would each spend 8 quota units.
-async function getFeedPool(apiKey) {
+async function getFeedPool(apiKey, index) {
   const cached = getCachedFeedPool();
 
   if (cached) {
@@ -708,7 +1131,7 @@ async function getFeedPool(apiKey) {
   }
 
   if (!feedPoolInflight) {
-    feedPoolInflight = buildFeedPool(apiKey)
+    feedPoolInflight = buildFeedPool(apiKey, index)
       .then(pool => {
         feedPoolEntry = { at: Date.now(), value: pool };
         pruneFeedPool();
@@ -736,7 +1159,7 @@ async function getFeedPool(apiKey) {
 // URL), so the "bust the cache" button silently did nothing. It now genuinely
 // changes the feed, and costs nothing.
 async function getTrending(max, region, apiKey, pageToken, options = {}) {
-  const pool = await getFeedPool(apiKey);
+  const pool = await getFeedPool(apiKey, options.index);
 
   let items = pool.items;
   const cursor = decodeFeedCursor(pageToken);
@@ -817,7 +1240,7 @@ async function getComments(videoId, max, apiKey, pageToken) {
   );
 }
 
-async function getRelated(videoId, max, apiKey) {
+async function getRelated(videoId, max, apiKey, options = {}) {
   const target = await getVideoDetails(videoId, apiKey);
 
   if (!target) {
@@ -825,6 +1248,9 @@ async function getRelated(videoId, max, apiKey) {
       videos: []
     };
   }
+
+  // The target's full payload was just fetched for the channel lookup above.
+  scheduleIndexWrite(options.index, [target], { origin: INDEX_ORIGIN_RELATED });
 
   const targetSnippet = target.snippet || {};
   const channelId = targetSnippet.channelId || "";
@@ -884,6 +1310,12 @@ async function getRelated(videoId, max, apiKey) {
       }
     }
 
+    // One batched write for the whole related set, from the videos.list response
+    // this function already made.
+    scheduleIndexWrite(options.index, [...detailMap.values()], {
+      origin: INDEX_ORIGIN_RELATED
+    });
+
     for (let i = 0; i < results.length; i++) {
       const detail = detailMap.get(results[i].sourceId);
 
@@ -898,7 +1330,7 @@ async function getRelated(videoId, max, apiKey) {
   };
 }
 
-async function getChannelVideos(channelId, max, apiKey, pageToken) {
+async function getChannelVideos(channelId, max, apiKey, pageToken, options = {}) {
   const maxResults = Math.min(
     Math.max(Number(max) || 8, 1),
     25
@@ -969,6 +1401,11 @@ async function getChannelVideos(channelId, max, apiKey, pageToken) {
       detailsById.set(item.id, item);
     }
   }
+
+  // Batched write from the videos.list response this function already made.
+  scheduleIndexWrite(options.index, [...detailsById.values()], {
+    origin: INDEX_ORIGIN_CHANNEL
+  });
 
   const videos = [];
 
@@ -1434,10 +1871,15 @@ async function getLiveChat(videoId, apiKey, options = {}) {
   };
 }
 
-async function handleAPI(request, env) {
+async function handleAPI(request, env, ctx) {
   const url = new URL(request.url);
   const route = url.pathname.replace(/^\/api\/?/, "");
   const apiKey = env.YOUTUBE_API_KEY || "";
+
+  // Phase 1 index handle for this request, or null when the D1 binding is
+  // absent/malformed. Null disables every read and write below; nothing else
+  // changes.
+  const index = createIndexContext(ctx, env);
 
   if (request.method === "OPTIONS") {
     const headers = {
@@ -1541,10 +1983,12 @@ async function handleAPI(request, env) {
         max,
         apiKey,
         pageToken,
-        { filters: searchParams }
+        { filters: searchParams, index }
       );
 
-      return json({ ...result, appliedFilters: applied }, 200, request);
+      // Still YouTube-backed: the index records this search's metadata but never
+      // answers one. No local search parity is claimed in Phase 1.
+      return json({ ...result, appliedFilters: applied }, 200, request, indexHeaders("youtube"));
     }
 
     if (route === "trending") {
@@ -1563,10 +2007,12 @@ async function handleAPI(request, env) {
         region,
         apiKey,
         pageToken,
-        { seed: rawSeed, topic }
+        { seed: rawSeed, topic, index }
       );
 
-      return json(result, 200, request);
+      // Feed construction is unchanged and stays YouTube-backed; the pool build
+      // only writes to the index.
+      return json(result, 200, request, indexHeaders("youtube"));
     }
 
     if (route === "video") {
@@ -1580,6 +2026,22 @@ async function handleAPI(request, env) {
           },
           400,
           request
+        );
+      }
+
+      // Index first, YouTube second. A miss, a stale row, a live row or a failed
+      // D1 read all fall through to exactly the path this route used before, and
+      // an index hit spends NO upstream quota at all.
+      const indexed = await readIndexedVideo(index, id);
+
+      if (indexed.video) {
+        return json(
+          {
+            video: indexed.video
+          },
+          200,
+          request,
+          indexHeaders("index", indexed.degraded)
         );
       }
 
@@ -1597,16 +2059,22 @@ async function handleAPI(request, env) {
             video: null
           },
           404,
-          request
+          request,
+          indexHeaders(indexed.degraded ? "fallback" : "youtube", indexed.degraded)
         );
       }
+
+      // Write-behind: the response is built from the payload already in hand, so
+      // indexing never delays it and never adds a YouTube request.
+      scheduleIndexWrite(index, [item], { origin: INDEX_ORIGIN_DETAIL });
 
       return json(
         {
           video: normalizeVideoItem(item)
         },
         200,
-        request
+        request,
+        indexHeaders(indexed.degraded ? "fallback" : "youtube", indexed.degraded)
       );
     }
 
@@ -1716,10 +2184,11 @@ async function handleAPI(request, env) {
       const result = await getRelated(
         id,
         max,
-        apiKey
+        apiKey,
+        { index }
       );
 
-      return json(result, 200, request);
+      return json(result, 200, request, indexHeaders("youtube"));
     }
 
     if (route === "channelVideos") {
@@ -1743,10 +2212,11 @@ async function handleAPI(request, env) {
         channelId,
         max,
         apiKey,
-        pageToken
+        pageToken,
+        { index }
       );
 
-      return json(result, 200, request);
+      return json(result, 200, request, indexHeaders("youtube"));
     }
 
     return json(
@@ -1768,11 +2238,11 @@ async function handleAPI(request, env) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     const response = url.pathname.startsWith("/api/")
-      ? await handleAPI(request, env)
+      ? await handleAPI(request, env, ctx)
       : await env.ASSETS.fetch(request);
 
     return withSecurityHeaders(response);

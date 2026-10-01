@@ -1,0 +1,35 @@
+-- MyTube Independence Roadmap — Phase 1 follow-up: point lookup for /api/video
+--
+-- Why this migration exists
+-- -----------------------
+-- 0001_init.sql indexes channel_id, published_at_ms, view_count, category_id,
+-- metadata_fetched_at_ms, refresh_priority and (type, published_at_ms) — but NOT
+-- video_id. getVideoByVideoId() in shared/index-store.js therefore resolves
+-- `WHERE video_id = ? AND type = ?` with a full scan of `videos` plus a filter.
+--
+-- That is fine for an occasional detail lookup and wrong for a hot path, which is
+-- exactly how 0001 documented it. Phase 1 wires that lookup into /api/video so a
+-- fresh row can answer the request without spending YouTube quota, and the table
+-- is being filled at roughly 400 rows per feed-pool rebuild (every 15 minutes)
+-- plus every search and channel page. Left unindexed, every /api/video request
+-- degrades into a scan that grows without bound as the index fills.
+--
+-- Design notes
+-- ------------
+--   * video_id leads, because the lookup is an equality test on it. Trailing
+--     `type` is a free second equality filter that lets SQLite satisfy the whole
+--     WHERE clause from the index and skip the table lookup entirely.
+--   * NOT UNIQUE. The schema allows two rows to share a video_id (only
+--     source_id is the primary key), and adding a unique constraint would be a
+--     behaviour change that could fail on data already indexed. Phase 1 keeps
+--     that possibility open.
+--   * Additive only: no table is rebuilt, no row is rewritten, no column is
+--     added. Safe to run against a live, populated table.
+--
+-- Apply with:
+--   npx wrangler d1 migrations apply mytube-index --remote
+--
+-- 0001_init.sql is already applied and must not be edited or re-run; this file
+-- carries the change instead.
+
+CREATE INDEX IF NOT EXISTS idx_videos_video_id_type ON videos (video_id, type);
