@@ -26,7 +26,12 @@ import {
   getVideoBySourceId,
   getVideoByVideoId,
   searchVideoIds,
-  buildFtsMatchQuery
+  buildFtsMatchQuery,
+  buildFtsMatchQueryAny,
+  FTS_MATCH_MAX_TOKENS,
+  FTS_MATCH_PREFIX_MIN_LENGTH,
+  FTS_BM25_WEIGHTS,
+  VIDEO_SEARCH_SQL
 } from "../shared/index-store.js";
 
 // A trimmed but realistic `videos.list` item: snippet, statistics,
@@ -573,25 +578,71 @@ test("planVideoUpserts applies one observation time to the whole batch", () => {
 // -----------------------------------------------------------------------------
 
 test("buildFtsMatchQuery quotes every term and joins them with AND", () => {
-  assert.equal(buildFtsMatchQuery("lofi beats"), '"lofi" AND "beats"');
-  assert.equal(buildFtsMatchQuery("LoFi BEATS"), '"lofi" AND "beats"');
-  assert.equal(buildFtsMatchQuery("  spaced   out  "), '"spaced" AND "out"');
+  assert.equal(buildFtsMatchQuery("lofi beats"), '"lofi"* AND "beats"*');
+  assert.equal(buildFtsMatchQuery("LoFi BEATS"), '"lofi"* AND "beats"*');
+  assert.equal(buildFtsMatchQuery("  spaced   out  "), '"spaced"* AND "out"*');
+});
+
+test("buildFtsMatchQuery prefix-matches words but not single characters", () => {
+  assert.equal(FTS_MATCH_PREFIX_MIN_LENGTH, 2);
+
+  // Long enough to be a useful prefix: a trailing * is appended by the builder.
+  assert.equal(buildFtsMatchQuery("lofi"), '"lofi"*');
+  assert.equal(buildFtsMatchQuery("ab"), '"ab"*');
+
+  // One character stays exact: "a"* would match almost every document.
+  assert.equal(buildFtsMatchQuery("a"), '"a"');
+  assert.equal(buildFtsMatchQuery("a b"), '"a" AND "b"');
 });
 
 test("buildFtsMatchQuery neutralises FTS5 operators from user text", () => {
-  // Every one of these is raw FTS5 syntax; quoting turns them into search terms
-  // instead of a "fts5: syntax error near ..." statement failure.
-  assert.equal(buildFtsMatchQuery('"unbalanced'), '"unbalanced"');
-  assert.equal(buildFtsMatchQuery("title:secret"), '"title" AND "secret"');
-  assert.equal(buildFtsMatchQuery("a OR b"), '"a" AND "or" AND "b"');
-  assert.equal(buildFtsMatchQuery("near(x)"), '"near" AND "x"');
-  assert.equal(buildFtsMatchQuery("prefix*"), '"prefix"');
-  assert.equal(buildFtsMatchQuery("minus - plus +"), '"minus" AND "plus"');
+  // Every one of these is raw FTS5 syntax; tokenising keeps only letters/numbers
+  // and quoting turns the rest into search terms instead of a
+  // "fts5: syntax error near ..." statement failure.
+  assert.equal(buildFtsMatchQuery('"unbalanced'), '"unbalanced"*');
+  assert.equal(buildFtsMatchQuery("title:secret"), '"title"* AND "secret"*');
+  assert.equal(buildFtsMatchQuery("a OR b"), '"a" AND "or"* AND "b"');
+  assert.equal(buildFtsMatchQuery("near(x)"), '"near"* AND "x"');
+  assert.equal(buildFtsMatchQuery("prefix*"), '"prefix"*');
+  assert.equal(buildFtsMatchQuery("minus - plus +"), '"minus"* AND "plus"*');
   assert.equal(
     buildFtsMatchQuery("lofi beats'; DROP TABLE videos; --"),
-    '"lofi" AND "beats" AND "drop" AND "table" AND "videos"'
+    '"lofi"* AND "beats"* AND "drop"* AND "table"* AND "videos"*'
   );
   assert.equal(buildFtsMatchQuery("1=1"), '"1"');
+});
+
+test("buildFtsMatchQuery output can never contain an unquoted FTS operator", () => {
+  // The only shapes the builder may emit are quoted terms and the AND/OR
+  // keywords. Anything else means user text escaped the quoting.
+  const safe = /^"[^"]+"\*?(?: (?:AND|OR) "[^"]+"\*?)*$/;
+  const hostile = [
+    'a" OR "b',
+    "a* OR b*",
+    "NEAR(a b)",
+    "title:secret",
+    "a) OR (b",
+    '" OR "1"="1" OR "',
+    "AND OR NOT",
+    "../../etc/passwd"
+  ];
+
+  for(const input of hostile){
+    const built = buildFtsMatchQuery(input);
+
+    if(built !== null){
+      assert.match(built, safe, "unsafe expression for input: " + JSON.stringify(input));
+    }
+  }
+});
+
+test("buildFtsMatchQuery NFKC-normalises compatibility and decomposed text", () => {
+  // Fullwidth letters fold to ASCII.
+  assert.equal(buildFtsMatchQuery("ｌｏｆｉ"), '"lofi"*');
+  // A decomposed "e" + combining acute becomes the composed "é".
+  assert.equal(buildFtsMatchQuery("cafe\u0301"), '"café"*');
+  // Mixed case is folded consistently with the tokenizer.
+  assert.equal(buildFtsMatchQuery("CAFÉ"), '"café"*');
 });
 
 test("buildFtsMatchQuery returns null when nothing is searchable", () => {
@@ -603,5 +654,33 @@ test("buildFtsMatchQuery returns null when nothing is searchable", () => {
 });
 
 test("buildFtsMatchQuery drops repeated terms", () => {
-  assert.equal(buildFtsMatchQuery("lofi lofi LOFI beats"), '"lofi" AND "beats"');
+  assert.equal(buildFtsMatchQuery("lofi lofi LOFI beats"), '"lofi"* AND "beats"*');
+});
+
+test("buildFtsMatchQuery caps the number of tokens", () => {
+  const many = Array.from({ length: FTS_MATCH_MAX_TOKENS + 8 }, (_, i) => "token" + i).join(" ");
+  const terms = buildFtsMatchQuery(many).split(" AND ");
+
+  assert.equal(terms.length, FTS_MATCH_MAX_TOKENS);
+  assert.equal(terms[0], '"token0"*');
+  assert.equal(terms[terms.length - 1], '"token' + (FTS_MATCH_MAX_TOKENS - 1) + '"*');
+});
+
+test("buildFtsMatchQueryAny uses OR for recall and matches the AND builder for one token", () => {
+  assert.equal(buildFtsMatchQueryAny("lofi beats"), '"lofi"* OR "beats"*');
+  assert.equal(buildFtsMatchQueryAny("lofi"), buildFtsMatchQuery("lofi"));
+  assert.equal(buildFtsMatchQueryAny(""), null);
+  assert.equal(buildFtsMatchQueryAny(null), null);
+  assert.equal(buildFtsMatchQueryAny("a b c"), '"a" OR "b" OR "c"');
+});
+
+test("the search statement uses weighted bm25 and a rowid tiebreak", () => {
+  assert.equal(FTS_BM25_WEIGHTS.length, 5, "one weight per indexed column");
+  assert.ok(FTS_BM25_WEIGHTS.every(weight => typeof weight === "number" && weight > 0));
+  assert.ok(
+    VIDEO_SEARCH_SQL.includes("bm25(video_fts, " + FTS_BM25_WEIGHTS.join(", ") + ")"),
+    "weighted bm25 must reference the real table name (MATCH requires it too)"
+  );
+  assert.ok(VIDEO_SEARCH_SQL.includes("ORDER BY match_score, v.rowid"));
+  assert.ok(!VIDEO_SEARCH_SQL.includes("ORDER BY match_score LIMIT"));
 });

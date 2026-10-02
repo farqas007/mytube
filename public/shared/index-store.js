@@ -151,6 +151,26 @@ const VIDEO_UPSERT_CHUNK_SIZE = 50;
 const VIDEO_SEARCH_LIMIT_DEFAULT = 20;
 const VIDEO_SEARCH_LIMIT_MAX = 50;
 
+// bm25() column weights, in the exact column order declared by video_fts in
+// migrations/0003_fts_tokenizer.sql:
+//   1 title, 2 channel_title, 3 description, 4 tags_json, 5 topic.
+//
+// A higher weight multiplies that column's term frequency, which makes a match
+// there score lower (better) under bm25. Title and channel are the strongest
+// signals a viewer sees, description is the weakest, tags/topic sit between.
+// These are heuristics for the local index only — they are NOT a claim of parity
+// with YouTube's own relevance ranking.
+const FTS_BM25_WEIGHTS = Object.freeze([5, 3, 1, 2, 1.5]);
+
+// Query-side bound on how many distinct tokens one MATCH expression may carry,
+// so a pathological paste cannot build an unbounded FTS query.
+const FTS_MATCH_MAX_TOKENS = 12;
+
+// Tokens at least this long are matched as prefixes, so "lof" finds "lofi".
+// Single characters stay exact: a 1-character prefix matches almost every row
+// and would be pure noise.
+const FTS_MATCH_PREFIX_MIN_LENGTH = 2;
+
 // -----------------------------------------------------------------------------
 // Statement construction (frozen at module load, values are never interpolated)
 // -----------------------------------------------------------------------------
@@ -179,7 +199,9 @@ const VIDEO_UPSERT_SQL = [
   VIDEO_UPDATE_COLUMNS.map(buildUpdateAssignment).join(", ")
 ].join(" ");
 
-// FTS5 search over the external-content `video_fts` table from 0001_init.sql.
+// FTS5 search over the external-content `video_fts` table. The table and
+// tokenizer are (re)defined in migrations/0003_fts_tokenizer.sql; 0001 created
+// the original, so docs must not be pinned to a single migration.
 //
 // The join is mandatory, not stylistic: video_fts is external-content over
 // `videos` and keyed by videos.rowid, so a bare FTS rowid must always be resolved
@@ -188,7 +210,7 @@ const VIDEO_UPSERT_SQL = [
 // FTS5 requires the real table name on the left of MATCH.
 //
 // Only the two bound parameters are ever caller-influenced: the MATCH expression
-// (built by buildFtsMatchQuery) and the result limit.
+// (built by buildFtsMatchQuery/buildFtsMatchQueryAny) and the result limit.
 const VIDEO_SEARCH_SQL = [
   "SELECT",
   "  v.source_id,",
@@ -203,14 +225,17 @@ const VIDEO_SEARCH_SQL = [
   "  v.duration_seconds,",
   "  v.view_count,",
   "  v.is_live,",
-  // FTS5's `rank` is the relevance score (bm25, lower is better). It is exposed
-  // as `match_score`, never as `search_rank`: that name is already a column on
-  // `videos`, and reusing it here would make `ORDER BY` ambiguous.
-  "  rank AS match_score",
+  // Weighted bm25 (lower is better) rather than bare `rank`, so title/channel
+  // matches outrank a description-only hit. Exposed as `match_score`, never as
+  // `search_rank`: that name is already a column on `videos`, and reusing it
+  // here would make `ORDER BY` ambiguous.
+  `  bm25(video_fts${FTS_BM25_WEIGHTS.map(weight => `, ${weight}`).join("")}) AS match_score`,
   "FROM video_fts f",
   "JOIN videos v ON v.rowid = f.rowid",
   "WHERE video_fts MATCH ?",
-  "ORDER BY match_score",
+  // Relevance first, then the stable rowid tiebreak so equal-scoring rows never
+  // shuffle between identical calls (and offset-free pagination stays possible).
+  "ORDER BY match_score, v.rowid",
   "LIMIT ?"
 ].join(" ");
 
@@ -739,43 +764,99 @@ async function getVideoByVideoId(db, videoId, type = VIDEO_TYPE_YOUTUBE){
     .first();
 }
 
-// Convert free text into a safe FTS5 MATCH expression.
+// Lowercase + Unicode-compatibility-normalise free text into ordered, unique,
+// FTS-safe tokens. Shared by the precision ("all") and recall ("any") builders so
+// both always agree on what the query's tokens are.
 //
-// FTS5 query syntax is not a search box: bare `-`, `"`, `*`, `:`, `(`, `)`,
-// NEAR/AND/OR and column filters are operators, so forwarding user input
-// verbatim makes a stray character a SQL error. Every token is therefore
-// lowercased and wrapped in a quoted string literal (doubling any embedded
-// quote, per FTS5 string escaping) and combined with AND, which turns every
-// operator character back into ordinary text.
+//   * normalize("NFKC") folds compatibility forms before tokenising, so fullwidth
+//     "ｌｏｆｉ" becomes "lofi" and a decomposed "cafe\u0301" becomes "café".
+//   * /[\p{L}\p{N}]+/gu keeps only letters and numbers. That strips every FTS5
+//     operator character (`"`, `*`, `:`, `(`, `)`, `-`, `+`, `=`, NEAR, ...)
+//     by construction instead of trying to escape it.
+//   * toLowerCase() handles case; D1's unicode61 tokenizer folds case and
+//     diacritics again on its side.
+//   * duplicates collapse (FTS5 would only inflate the score) and the token
+//     count is capped.
+function tokenizeFtsQuery(query){
+  if(query === null || query === undefined){
+    return [];
+  }
+
+  const text = String(query).normalize("NFKC");
+  const rawTokens = text.match(/[\p{L}\p{N}]+/gu) || [];
+  const tokens = [];
+  const seen = new Set();
+
+  for(const rawToken of rawTokens){
+    const token = rawToken.toLowerCase();
+
+    if(!token || seen.has(token)){
+      continue;
+    }
+
+    if(tokens.length >= FTS_MATCH_MAX_TOKENS){
+      break;
+    }
+
+    seen.add(token);
+    tokens.push(token);
+  }
+
+  return tokens;
+}
+
+// One token -> one quoted FTS5 string literal, optionally a prefix query.
+//
+// Quoting is what makes the expression injection-safe: a token can only contain
+// letters/numbers (see tokenizeFtsQuery), so it can never close the quote or be
+// read as an operator. Doubling embedded quotes is defensive depth in case a
+// caller passes a token straight through.
+//
+// The trailing `*` is FTS5 prefix syntax and is added here, never taken from
+// input, so a literal `*` in the query can never become an operator.
+function ftsTokenExpression(token){
+  const quoted = `"${token.replace(/"/g, '""')}"`;
+
+  if(token.length >= FTS_MATCH_PREFIX_MIN_LENGTH){
+    return `${quoted}*`;
+  }
+
+  return quoted;
+}
+
+// Precision query: every token must be present (AND), each as a prefix match.
+// Used first so the most specific results win when they exist.
 //
 // Returns null when there is nothing searchable left — a blank or punctuation
 // only query is answered with "no matches", never with a failing statement.
 function buildFtsMatchQuery(query){
-  if(query === null || query === undefined){
-    return null;
-  }
-
-  const tokens = String(query).match(/[\p{L}\p{N}]+/gu) || [];
+  const tokens = tokenizeFtsQuery(query);
 
   if(!tokens.length){
     return null;
   }
 
-  const terms = [];
-  const seen = new Set();
+  return tokens.map(ftsTokenExpression).join(" AND ");
+}
 
-  for(const token of tokens){
-    const term = token.toLowerCase();
+// Recall fallback for multi-token queries: any token may be present (OR). The
+// caller only uses this when the AND form matched nothing, so "lofi beats" still
+// returns the "lofi" rows instead of an empty page when "beats" is absent.
+//
+// Returns exactly what buildFtsMatchQuery returns for a single token (so the
+// caller can skip a redundant second query), or null when nothing is searchable.
+function buildFtsMatchQueryAny(query){
+  const tokens = tokenizeFtsQuery(query);
 
-    if(seen.has(term)){
-      continue;
-    }
-
-    seen.add(term);
-    terms.push(`"${term.replace(/"/g, '""')}"`);
+  if(!tokens.length){
+    return null;
   }
 
-  return terms.length ? terms.join(" AND ") : null;
+  if(tokens.length === 1){
+    return ftsTokenExpression(tokens[0]);
+  }
+
+  return tokens.map(ftsTokenExpression).join(" OR ");
 }
 
 function resolveSearchLimit(value){
@@ -788,31 +869,12 @@ function resolveSearchLimit(value){
   return Math.min(Math.max(Math.round(numeric), 1), VIDEO_SEARCH_LIMIT_MAX);
 }
 
-// FTS5 search over the existing video_fts external-content table.
-//
-// This is storage-side retrieval only. It does NOT replace /api/search, which
-// still answers from the live YouTube Data API; it exists so a later phase can
-// answer from the index once it is proven equivalent.
-//
-// Returns an array of rows (empty when nothing matches), ordered by FTS5 relevance
-// with that score exposed as `match_score`. A query with nothing searchable in it
-// returns [] without touching the database — see buildFtsMatchQuery().
-async function searchVideoIds(db, query, limit){
-  requireDb(db);
-
-  const match = buildFtsMatchQuery(query);
-
-  if(!match){
-    return [];
-  }
-
-  const maxResults = resolveSearchLimit(limit);
-
-  const statement = db
+// Run one prepared MATCH expression and normalise the D1 result shape.
+async function runFtsSearch(db, match, limit){
+  const results = await db
     .prepare(VIDEO_SEARCH_SQL)
-    .bind(match, maxResults);
-
-  const results = await statement.all();
+    .bind(match, limit)
+    .all();
 
   // Same rule as the write path: a read that did not really happen must not be
   // reported as "no matches".
@@ -821,6 +883,47 @@ async function searchVideoIds(db, query, limit){
   }
 
   return results.results;
+}
+
+// FTS5 search over the local `video_fts` index (see
+// migrations/0003_fts_tokenizer.sql for the tokenizer/columns and the bm25
+// weights in VIDEO_SEARCH_SQL).
+//
+// This is storage-side retrieval only. It does NOT replace /api/search, which
+// still answers from the live YouTube Data API; it exists so a later phase can
+// answer from the index once it is proven acceptable.
+//
+// Multi-token strategy: run the precision AND query first; if it matches
+// nothing, retry with the OR fallback so a useful query does not return an empty
+// page just because one word is missing. A single-token query skips the second
+// round-trip because both builders produce the same expression.
+//
+// Returns an array of rows (empty when nothing matches), ordered by weighted
+// bm25 relevance then rowid, with the score exposed as `match_score`. A query
+// with nothing searchable returns [] without touching the database.
+async function searchVideoIds(db, query, limit){
+  requireDb(db);
+
+  const matchAll = buildFtsMatchQuery(query);
+
+  if(!matchAll){
+    return [];
+  }
+
+  const maxResults = resolveSearchLimit(limit);
+  const allMatches = await runFtsSearch(db, matchAll, maxResults);
+
+  if(allMatches.length){
+    return allMatches;
+  }
+
+  const matchAny = buildFtsMatchQueryAny(query);
+
+  if(!matchAny || matchAny === matchAll){
+    return allMatches;
+  }
+
+  return runFtsSearch(db, matchAny, maxResults);
 }
 
 export {
@@ -835,6 +938,9 @@ export {
   VIDEO_UPSERT_CHUNK_SIZE,
   VIDEO_SEARCH_LIMIT_DEFAULT,
   VIDEO_SEARCH_LIMIT_MAX,
+  FTS_BM25_WEIGHTS,
+  FTS_MATCH_MAX_TOKENS,
+  FTS_MATCH_PREFIX_MIN_LENGTH,
   parseIsoDuration,
   toVideoRow,
   markFetchedAt,
@@ -843,5 +949,6 @@ export {
   getVideoBySourceId,
   getVideoByVideoId,
   buildFtsMatchQuery,
+  buildFtsMatchQueryAny,
   searchVideoIds
 };

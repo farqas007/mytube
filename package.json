@@ -1,5 +1,6 @@
 {
   "scripts": {
+    "test": "node --disable-warning=ExperimentalWarning --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test \"tests/test*.js\"",
     "sitemap": "node scripts/generate-sitemap.mjs"
   },
   "devDependencies": {
