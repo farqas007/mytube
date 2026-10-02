@@ -202,6 +202,30 @@ function videosResponse(items) {
   return { items, pageInfo: { totalResults: items.length, resultsPerPage: items.length } };
 }
 
+// A 2xx whose body is not JSON at all. `response.json()` throws on this, which is
+// exactly what an HTML error page, a truncated payload or a WAF interception looks
+// like from inside the Worker.
+async function withUnreadableYouTube(run) {
+  const original = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async url => {
+    const parsed = new URL(url);
+    calls.push(parsed);
+
+    return new Response("<html><body>Service unavailable</body></html>", {
+      status: 200,
+      headers: { "Content-Type": "text/html" }
+    });
+  };
+
+  try {
+    return await run(calls);
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
 async function callWorker(path, env, ctx, requestInit = {}) {
   const request = new Request(`https://mytube.farqas007.workers.dev${path}`, {
     method: "GET",
@@ -336,6 +360,63 @@ test("A4 CORS, security and cache headers are untouched by the index", async () 
     assert.equal(response.headers.get("X-Content-Type-Options"), "nosniff");
     assert.equal(response.headers.get("X-Frame-Options"), "SAMEORIGIN");
     assert.ok(response.headers.get("Content-Security-Policy"));
+  });
+});
+
+// -----------------------------------------------------------------------------
+// A 2xx whose body cannot be read is an upstream failure, never an answer
+// -----------------------------------------------------------------------------
+
+test("A5 an unreadable 200 is a 502 on /api/video, never a 404", async () => {
+  const id = "unreadableBody1";
+
+  await withUnreadableYouTube(async calls => {
+    const ctx = createFakeCtx();
+    const { response, body } = await callWorker(
+      `/api/video?id=${id}`,
+      envWith(undefined),
+      ctx
+    );
+
+    // 404 is the watch page's "video unavailable" state. Answering it here would
+    // tell a client that a perfectly good video does not exist, purely because
+    // one upstream byte was not JSON.
+    assert.equal(response.status, 502);
+    assert.equal(body.code, "UPSTREAM_INVALID_RESPONSE");
+    assert.equal(body.video, undefined);
+    assert.equal(calls.length, 1, "one call, and no retry storm");
+    assert.equal(ctx.pending.length, 0, "an unreadable payload is never indexed");
+  });
+});
+
+test("A6 an unreadable 200 on the index-miss path is still a 502, not a 404", async () => {
+  const id = "staleRowFallback";
+  const db = createFakeDb({
+    rows: { [id]: toVideoRow(videoItem(id), { now: Date.now() - 60 * 60 * 1000 }) }
+  });
+
+  await withUnreadableYouTube(async () => {
+    const { response, body } = await callWorker(
+      `/api/video?id=${id}`,
+      envWith(db),
+      createFakeCtx()
+    );
+
+    assert.equal(response.status, 502);
+    assert.equal(body.code, "UPSTREAM_INVALID_RESPONSE");
+  });
+});
+
+test("A7 an unreadable 200 is a 502 on /api/search too", async () => {
+  await withUnreadableYouTube(async () => {
+    const { response, body } = await callWorker(
+      "/api/search?q=lofi",
+      envWith(undefined),
+      createFakeCtx()
+    );
+
+    assert.equal(response.status, 502);
+    assert.equal(body.code, "UPSTREAM_INVALID_RESPONSE");
   });
 });
 

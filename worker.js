@@ -26,6 +26,7 @@ import {
   resolveSearchMax
 } from "./shared/search.js";
 import {
+  VIDEO_SOURCE_PREFIX,
   VIDEO_TYPE_YOUTUBE,
   getVideoByVideoId,
   markFetchedAt,
@@ -544,6 +545,16 @@ function normalizeError(error, status = 500) {
     };
   }
 
+  // A 2xx whose body was not a usable YouTube payload. This is deliberately a
+  // 502 and never a 404: the video's existence is exactly what we could not
+  // determine, and the watch page reads a 404 as "video unavailable".
+  if (error?.type === "invalidResponse") {
+    return {
+      error: "YouTube returned an unexpected response. Please try again.",
+      code: "UPSTREAM_INVALID_RESPONSE"
+    };
+  }
+
   // --- YouTube Live Chat states -------------------------------------------
   // These are NOT failures: they are the normal terminal states of a live chat.
   // The caller (and ultimately the frontend) treats them as a friendly,
@@ -639,6 +650,43 @@ function cacheSet(key, value) {
     time: Date.now(),
     value
   });
+}
+
+// A YouTube Data API v3 response is always a JSON *object*.
+//
+// `response.json()` throws on an HTML error page, an empty body, a truncated
+// payload or a WAF/captive-portal interception, and the old code swallowed that
+// into `data = null`. Every caller then read `null` as "the request succeeded and
+// there is nothing in it": /api/video answered a clean 404 for a video that
+// exists, the feed rendered empty, and the maintenance pass treated every
+// selected video as definitively deleted.
+//
+// A 200 with an unreadable body is a TRANSIENT upstream failure, so it is raised
+// as one and handled exactly like a 5xx — it is never allowed to look like an
+// empty-but-authoritative result. Called before the result is cached, so a
+// broken body can never poison the 10-minute response cache either.
+function assertUsableYouTubePayload(data, pathname) {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    throw {
+      type: "invalidResponse",
+      status: 502,
+      message: `YouTube returned an unreadable body for ${pathname}.`
+    };
+  }
+
+  // `items` is the only list-shaped field any caller in this file reads, and
+  // every one of them reads it as an array. Present-but-not-an-array is a broken
+  // payload, not an empty result, and `items: null` is exactly the shape a
+  // half-parsed or proxied response tends to arrive in.
+  if (data.items !== undefined && !Array.isArray(data.items)) {
+    throw {
+      type: "invalidResponse",
+      status: 502,
+      message: `YouTube returned a malformed item list for ${pathname}.`
+    };
+  }
+
+  return data;
 }
 
 // Fetch a YouTube Data API resource.
@@ -793,6 +841,11 @@ async function ytFetch(pathname, params, apiKey, options = {}) {
     status: response.status,
     data
   };
+
+  // The body was 2xx, so it is about to be treated as real data. Prove it is
+  // readable before anything downstream — a caller, or the response cache — can
+  // see it.
+  assertUsableYouTubePayload(data, pathname);
 
   // Stamp the moment the bytes actually arrived, BEFORE the response enters the
   // in-memory cache. The marker rides inside the cached object, so a later cache
@@ -2271,17 +2324,63 @@ export default {
 //   * It reuses ONLY existing columns (metadata_fetched_at_ms,
 //     last_seen_at_ms, refresh_priority) and existing indexes
 //     (idx_videos_metadata_fetched_at_ms). No migration is required.
-//   * index_state stores one lightweight run summary, no queue.
-//   * At most MAINTENANCE_MAX_VIDEOS_PER_RUN (20) rows are chosen per run and
-//     at most one upstream videos.list request is made. A run never storms.
+//   * index_state stores one lightweight run summary plus the pending-deletion
+//     tombstones described below. No queue, no schema change.
+//   * At most MAINTENANCE_MAX_VIDEOS_PER_RUN (20) videos are requested per run
+//     and at most MAINTENANCE_MAX_YT_REQUESTS_PER_RUN (1) upstream request is
+//     made. Both go through helpers that enforce the cap in code, so the bound
+//     is a property of the handler rather than a comment about it. A run never
+//     storms.
 //   * A missing/malformed binding makes the handler a no-op.
 //   * A transient upstream failure NEVER deletes a row; the next run retries
 //     it because candidates are always selected oldest-first.
+//   * A row is deleted only after TWO separate authoritative runs report its
+//     video as gone — the first miss writes a tombstone to index_state, the
+//     second consumes it — and only out of a response that is provably a real
+//     videos.list. A single ambiguous 200 (an HTML page, a truncated body, a
+//     200 with no list in it at all) can no longer empty the table.
 const MAINTENANCE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const MAINTENANCE_REFRESH_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const MAINTENANCE_MAX_VIDEOS_PER_RUN = 20;
 const MAINTENANCE_MAX_YT_REQUESTS_PER_RUN = 1;
 const MAINTENANCE_STATE_KEY = "maintenance:last_run";
+
+// Rows scanned per run before candidates are collapsed to distinct video ids.
+// One id can back more than one row (video_id is deliberately NOT unique — see
+// 0002_video_id_lookup_index.sql), so scanning only
+// MAINTENANCE_MAX_VIDEOS_PER_RUN rows would let duplicates shrink a run below
+// its request budget. The scan is a single indexed query and only the first
+// MAINTENANCE_MAX_VIDEOS_PER_RUN ids are ever sent upstream.
+const MAINTENANCE_CANDIDATE_SCAN_MULTIPLIER = 4;
+
+// Pending deletions live in index_state until a second run confirms them or they
+// expire. The expiry is what stops a strike that is never re-checked (its id
+// fell out of the oldest-first window behind newer backlog) from being applied
+// to some row weeks later.
+const MAINTENANCE_MISS_STATE_KEY = "maintenance:pending_misses";
+const MAINTENANCE_MISS_TOMBSTONE_MS = 7 * 24 * 60 * 60 * 1000;
+const MAINTENANCE_MISS_TOMBSTONE_MAX = 200;
+
+// D1's documented budget is 50 subrequests per invocation and 20 rows cannot
+// need more than one chunk. The chunking is explicit anyway, so raising either
+// constant later cannot quietly turn one run into 20 sequential round trips.
+const MAINTENANCE_DELETE_CHUNK_SIZE = 50;
+
+// The exact `kind` of the one list response this handler will read "this video
+// no longer exists" out of. Every other 2xx shape — an HTML error page, a
+// truncated body, a search.list reply, a 200 carrying no list at all — is a
+// non-answer, and a non-answer never deletes.
+const YT_VIDEO_LIST_KIND = "youtube#videoListResponse";
+
+const MAINTENANCE_DELETE_SQL = "DELETE FROM videos WHERE source_id = ?";
+
+// A duplicated id's non-canonical rows are not touched by the upsert (it keys
+// on source_id), so they are renewed explicitly. Without this they would keep
+// their old metadata_fetched_at_ms and stay pinned to the head of the
+// oldest-first window, which is how one duplicated id can starve every row
+// behind it.
+const MAINTENANCE_RENEW_SQL =
+  "UPDATE videos SET metadata_fetched_at_ms = ?, last_seen_at_ms = ? WHERE source_id = ?";
 
 function createMaintenanceIndexContext(env) {
   const db = env?.mytube_index;
@@ -2322,7 +2421,10 @@ async function selectMaintenanceCandidates(index, now) {
       "WHERE type = ? AND is_live != 1 " +
       "ORDER BY metadata_fetched_at_ms ASC LIMIT ?"
     )
-    .bind(VIDEO_TYPE_YOUTUBE, MAINTENANCE_MAX_VIDEOS_PER_RUN)
+    .bind(
+      VIDEO_TYPE_YOUTUBE,
+      MAINTENANCE_MAX_VIDEOS_PER_RUN * MAINTENANCE_CANDIDATE_SCAN_MULTIPLIER
+    )
     .all();
 
   if (!result || !Array.isArray(result.results)) {
@@ -2347,14 +2449,209 @@ async function selectMaintenanceCandidates(index, now) {
   return due;
 }
 
+// The only response shape from which "this video no longer exists" may be read.
+//
+// Three separate things have to hold, and each one rules out a real failure mode
+// this handler used to be vulnerable to:
+//   * `kind` is exactly the videos.list kind — a reply from a different list
+//     endpoint is not an answer about these ids.
+//   * `items` is present and is an array — an empty list is a real answer, a
+//     missing list is no answer at all. `assertUsableYouTubePayload()` in
+//     ytFetch() already rejected a non-object body and a non-array `items`;
+//     this re-checks it at the point where the consequence is destructive, so
+//     the guarantee does not depend on a caller's cache or error path.
+//   * there is no `error` object — a body that carries both is a partial
+//     failure dressed as a success.
+function isAuthoritativeVideoList(result) {
+  const data = result?.data;
+
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return false;
+  }
+
+  if (data.kind !== YT_VIDEO_LIST_KIND) {
+    return false;
+  }
+
+  if (!Array.isArray(data.items)) {
+    return false;
+  }
+
+  if (data.error !== undefined && data.error !== null) {
+    return false;
+  }
+
+  return true;
+}
+
+// Read the pending-deletion tombstones. A read that fails is treated as "no
+// tombstones", which is the SAFE direction: every miss then needs two runs
+// before anything is deleted instead of one.
+async function readPendingMisses(index) {
+  try {
+    const row = await index.db
+      .prepare("SELECT value FROM index_state WHERE key = ? LIMIT 1")
+      .bind(MAINTENANCE_MISS_STATE_KEY)
+      .first();
+
+    if (!row || typeof row.value !== "string") {
+      return {};
+    }
+
+    const parsed = JSON.parse(row.value);
+
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+
+    return parsed;
+  } catch (error) {
+    console.error("[mytube] D1 maintenance tombstone read failed", error?.message || error);
+
+    return {};
+  }
+}
+
+// Persist the tombstones. Best effort by design: a failed write only costs a
+// strike, never a deletion, because the next run simply re-observes the miss.
+async function writePendingMisses(index, pending) {
+  try {
+    await index.db
+      .prepare(
+        "INSERT INTO index_state (key, value, updated_at_ms) VALUES (?, ?, ?) " +
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at_ms = excluded.updated_at_ms"
+      )
+      .bind(MAINTENANCE_MISS_STATE_KEY, JSON.stringify(pending), Date.now())
+      .run();
+  } catch (error) {
+    console.error("[mytube] D1 maintenance tombstone write failed", error?.message || error);
+  }
+}
+
+// The tombstone record is a Map while a run is deciding and a plain object once
+// it has been through JSON. Both are accepted so no call site can quietly read
+// an empty record: Object.entries() on a Map is [], not a crash, which is the
+// worst possible failure mode for a safety record.
+function toPendingEntries(pending) {
+  if (pending instanceof Map) {
+    return [...pending.entries()];
+  }
+
+  return Object.entries(pending || {});
+}
+
+// Drop tombstones that can no longer be acted on, and cap the record so a long
+// backlog cannot grow one unbounded JSON blob in index_state.
+//
+// A tombstone expires on age alone. It is never applied to a row that was not
+// re-selected in the run that consumes it, so an expired strike cannot reach a
+// row that has since been refreshed by any other path.
+function prunePendingMisses(pending, now) {
+  const live = new Map();
+
+  for (const [videoId, tombstone] of toPendingEntries(pending)) {
+    const firstMissedAt = Number(tombstone?.firstMissedAt);
+
+    if (!videoId || !Number.isFinite(firstMissedAt)) {
+      continue;
+    }
+
+    if (now - firstMissedAt > MAINTENANCE_MISS_TOMBSTONE_MS) {
+      continue;
+    }
+
+    live.set(videoId, tombstone);
+  }
+
+  if (live.size <= MAINTENANCE_MISS_TOMBSTONE_MAX) {
+    return live;
+  }
+
+  // Oldest strikes first: the newest ones are the ones most likely to be
+  // confirmed by an imminent run.
+  return new Map(
+    [...live.entries()].sort(
+      (a, b) => Number(a[1].firstMissedAt) - Number(b[1].firstMissedAt)
+    ).slice(-MAINTENANCE_MISS_TOMBSTONE_MAX)
+  );
+}
+
+// One batched DELETE per chunk instead of one statement per row: 20 sequential
+// round trips is 20 of the invocation's 50 subrequests, spent on bookkeeping.
+//
+// db.batch() is atomic per chunk and rejects if any statement fails, so a
+// failure deletes nothing and is raised rather than counted.
+async function deleteVideoRows(index, sourceIds) {
+  const deleted = [];
+
+  for (let offset = 0; offset < sourceIds.length; offset += MAINTENANCE_DELETE_CHUNK_SIZE) {
+    const chunk = sourceIds.slice(offset, offset + MAINTENANCE_DELETE_CHUNK_SIZE);
+    const statements = chunk.map(sourceId =>
+      index.db.prepare(MAINTENANCE_DELETE_SQL).bind(sourceId)
+    );
+    const results = await index.db.batch(statements);
+
+    if (!Array.isArray(results)) {
+      throw new Error("maintenance: db.batch() did not return a result array");
+    }
+
+    results.forEach((result, position) => {
+      if (!result || result.success === false) {
+        throw new Error(
+          `maintenance: delete failed for statement ${position + 1} of the batch`
+        );
+      }
+
+      // D1 reports the affected row count; count what actually went away rather
+      // than what was asked for. A missing count (older binding, fake) is
+      // treated as one, which is the only case where a row was deleted anyway.
+      const changes = Number(result.meta?.changes);
+
+      if (!Number.isFinite(changes) || changes > 0) {
+        deleted.push(chunk[position]);
+      }
+    });
+  }
+
+  return deleted;
+}
+
+// Renew the freshness clock of duplicated rows the upsert cannot reach. Batched
+// for the same subrequest reason as the deletes above.
+async function renewVideoRows(index, sourceIds, at) {
+  if (sourceIds.length === 0) {
+    return;
+  }
+
+  const statements = sourceIds.map(sourceId =>
+    index.db.prepare(MAINTENANCE_RENEW_SQL).bind(at, at, sourceId)
+  );
+
+  const results = await index.db.batch(statements);
+
+  if (!Array.isArray(results)) {
+    throw new Error("maintenance: db.batch() did not return a result array");
+  }
+
+  for (let index = 0; index < results.length; index++) {
+    if (!results[index] || results[index].success === false) {
+      throw new Error(
+        `maintenance: renew failed for statement ${index + 1} of the batch`
+      );
+    }
+  }
+}
+
 // One maintenance pass. Returns a summary; never throws for an upstream
 // failure (that is recorded and retried next run).
 async function runIndexMaintenance(index, env, now = Date.now()) {
   const summary = {
     lastRun: now,
     selected: 0,
+    requested: 0,
     refreshed: 0,
-    deleted: 0
+    deleted: 0,
+    tombstoned: 0
   };
 
   const due = await selectMaintenanceCandidates(index, now);
@@ -2364,7 +2661,11 @@ async function runIndexMaintenance(index, env, now = Date.now()) {
     return summary;
   }
 
-  const byVideoId = new Map();
+  // Group the candidates by video id. Every row that shares an id shares its
+  // retention fate, so they are refreshed and deleted together; handling only
+  // the first row of a duplicated id used to leave its siblings stuck at the
+  // head of the oldest-first window, permanently.
+  const rowsByVideoId = new Map();
 
   for (const row of due) {
     const videoId = String(row.video_id || "").trim();
@@ -2373,42 +2674,76 @@ async function runIndexMaintenance(index, env, now = Date.now()) {
       continue;
     }
 
-    if (!byVideoId.has(videoId)) {
-      byVideoId.set(videoId, row);
+    const sourceId = String(row.source_id || "").trim();
+    const group = rowsByVideoId.get(videoId);
+
+    if (group) {
+      if (sourceId && !group.sourceIds.includes(sourceId)) {
+        group.sourceIds.push(sourceId);
+      }
+
+      continue;
     }
+
+    rowsByVideoId.set(videoId, { sourceIds: sourceId ? [sourceId] : [] });
   }
 
-  const ids = [...byVideoId.keys()].slice(0, MAINTENANCE_MAX_VIDEOS_PER_RUN);
+  const ids = [...rowsByVideoId.keys()].slice(0, MAINTENANCE_MAX_VIDEOS_PER_RUN);
+  summary.requested = ids.length;
 
   if (ids.length === 0) {
     return summary;
   }
 
-  // Exactly one upstream request per run. ytFetch stamps each returned item
-  // with the real arrival time (markFetchedAt), which is the timestamp that
-  // reaches metadata_fetched_at_ms. skipCache keeps this maintenance read out
-  // of the request-path response cache.
+  // One helper owns the only upstream call in this handler, and it counts. The
+  // cap is therefore enforced rather than documented: a future second call
+  // cannot slip past it, it trips the budget check instead.
+  let requestsUsed = 0;
+
+  const fetchVideoList = async params => {
+    if (requestsUsed >= MAINTENANCE_MAX_YT_REQUESTS_PER_RUN) {
+      throw {
+        type: "budget_exhausted",
+        message:
+          `maintenance: upstream request budget ` +
+          `(${MAINTENANCE_MAX_YT_REQUESTS_PER_RUN}) is exhausted.`
+      };
+    }
+
+    requestsUsed += 1;
+
+    // Exactly one upstream request per run. ytFetch stamps each returned item
+    // with the real arrival time (markFetchedAt), which is the timestamp that
+    // reaches metadata_fetched_at_ms. skipCache keeps this maintenance read out
+    // of the request-path response cache.
+    return ytFetch("videos", params, env?.YOUTUBE_API_KEY, { skipCache: true });
+  };
+
   let result;
 
   try {
-    result = await ytFetch(
-      "videos",
-      { part: VIDEO_PARTS_FULL, id: ids.join(",") },
-      env?.YOUTUBE_API_KEY,
-      { skipCache: true }
-    );
+    result = await fetchVideoList({ part: VIDEO_PARTS_FULL, id: ids.join(",") });
   } catch (error) {
-    // Network, quota, rate limit, 5xx, ambiguous 403, missing/invalid key:
-    // every one of these is transient for retention purposes. Delete nothing;
-    // the same rows are re-selected next run.
+    // Network, quota, rate limit, 5xx, ambiguous 403, missing/invalid key, a
+    // body that was not readable JSON, or an exhausted request budget: every
+    // one of these is transient for retention purposes. Delete nothing, write
+    // no tombstone; the same rows are re-selected next run.
     summary.error = error?.type || error?.message || "upstream_error";
     return summary;
   }
 
-  const items = Array.isArray(result?.data?.items) ? result.data.items : [];
+  // A 2xx that is not a real videos.list tells us nothing about whether these
+  // videos exist. Refreshing from it would write junk, and deleting from it
+  // would empty the table on a single bad response, so the run stops here with
+  // the candidates untouched and the reason recorded.
+  if (!isAuthoritativeVideoList(result)) {
+    summary.error = "non_authoritative_response";
+    return summary;
+  }
+
   const returned = new Map();
 
-  for (const item of items) {
+  for (const item of result.data.items) {
     const videoId = typeof item?.id === "string" ? item.id.trim() : "";
 
     if (videoId) {
@@ -2416,42 +2751,113 @@ async function runIndexMaintenance(index, env, now = Date.now()) {
     }
   }
 
+  const pendingMisses = prunePendingMisses(await readPendingMisses(index), now);
+  const nextPendingMisses = new Map();
+  // Every id this run reached a verdict on: refreshed, freshly tombstoned, or
+  // deleted. A verdict retires the old tombstone, so none of these may be
+  // carried forward.
+  const decided = new Set();
   const toUpsert = [];
+  const toRenew = [];
   const toDelete = [];
 
   for (const videoId of ids) {
+    const group = rowsByVideoId.get(videoId);
+    const sourceIds = group?.sourceIds || [];
     const item = returned.get(videoId);
+
+    decided.add(videoId);
 
     if (item) {
       // Still available: refreshing renews the 30-day window and resets
       // refresh_priority to the schema default (0) through the existing upsert.
+      // A video that came back is not a pending deletion any more, so its
+      // tombstone is simply not carried forward.
       toUpsert.push(item);
+
+      // Any row of this id that the upsert will not touch (its source_id is not
+      // the canonical yt:<videoId> the mapper derives) still needs its clock
+      // renewed, or it stays at the head of the window forever.
+      for (const sourceId of sourceIds) {
+        if (sourceId !== `${VIDEO_SOURCE_PREFIX}${videoId}`) {
+          toRenew.push(sourceId);
+        }
+      }
+
       continue;
     }
 
-    // Absent from a SUCCESSFUL videos.list for an id we explicitly requested:
-    // definitive not-found/unavailable. Safe to delete. (A failed request
-    // never reaches here, so transient errors cannot delete.)
-    const sourceId = String(byVideoId.get(videoId)?.source_id || "").trim();
+    const tombstone = pendingMisses.get(videoId);
+    const firstMissedAt = Number(tombstone?.firstMissedAt);
+    const confirmed =
+      tombstone &&
+      Number.isFinite(firstMissedAt) &&
+      now - firstMissedAt < MAINTENANCE_MISS_TOMBSTONE_MS;
 
-    if (sourceId) {
-      toDelete.push(sourceId);
+    if (confirmed) {
+      // Second authoritative run in a row reporting this video as gone. Absent
+      // from a real videos.list, for an id that was explicitly requested, in
+      // two runs at least MAINTENANCE_MISS_TOMBSTONE_MS apart is a deletion, not
+      // a guess.
+      toDelete.push(...sourceIds);
+      continue;
+    }
+
+    // First strike (or a tombstone that had expired in prunePendingMisses):
+    // remember the miss and let a later run decide. `now` is the observation
+    // time, never a wall clock read, so a run can be replayed deterministically.
+    nextPendingMisses.set(videoId, {
+      firstMissedAt: now,
+      sourceIds
+    });
+    summary.tombstoned += 1;
+  }
+
+  // Carry forward strikes for ids this run did not reach a verdict on (their
+  // rows lost the window to newer backlog). A row can only ever be deleted in a
+  // run that re-selected it and re-observed the miss, so carrying a strike
+  // forward can never delete anything that was not confirmed twice.
+  for (const [videoId, tombstone] of pendingMisses) {
+    if (!decided.has(videoId)) {
+      nextPendingMisses.set(videoId, tombstone);
     }
   }
 
-  if (toUpsert.length > 0) {
-    await upsertVideos(index.db, toUpsert);
-    summary.refreshed = toUpsert.length;
+  try {
+    if (toUpsert.length > 0) {
+      await upsertVideos(index.db, toUpsert);
+      summary.refreshed = toUpsert.length;
+    }
+
+    await renewVideoRows(index, toRenew, now);
+  } catch (error) {
+    // A D1 write failure must not consume the strikes: the tombstone state is
+    // left exactly as it was read, so the next run re-observes these misses.
+    summary.error = error?.message || "index_write_failed";
+    return summary;
   }
 
-  for (const sourceId of toDelete) {
-    await index.db
-      .prepare("DELETE FROM videos WHERE source_id = ?")
-      .bind(sourceId)
-      .run();
+  if (toDelete.length > 0) {
+    try {
+      const deleted = await deleteVideoRows(index, toDelete);
 
-    summary.deleted += 1;
+      summary.deleted = deleted.length;
+    } catch (error) {
+      // db.batch() is atomic, so nothing was deleted. The strikes stay pending
+      // and the next run tries again.
+      summary.error = error?.message || "index_delete_failed";
+      return summary;
+    }
   }
+
+  // Written last, and only once the deletes are committed: a crash before this
+  // leaves the tombstones intact, which costs a repeated confirmation, never a
+  // lost one. Pruned once more on the way out so the record has a hard size and
+  // age bound rather than "however many rows this run happened to strike".
+  await writePendingMisses(
+    index,
+    Object.fromEntries(prunePendingMisses(nextPendingMisses, now))
+  );
 
   return summary;
 }
@@ -2480,5 +2886,11 @@ export {
   MAINTENANCE_REFRESH_WINDOW_MS,
   MAINTENANCE_MAX_VIDEOS_PER_RUN,
   MAINTENANCE_MAX_YT_REQUESTS_PER_RUN,
+  MAINTENANCE_MISS_STATE_KEY,
+  MAINTENANCE_MISS_TOMBSTONE_MS,
+  MAINTENANCE_DELETE_SQL,
+  YT_VIDEO_LIST_KIND,
+  isAuthoritativeVideoList,
+  prunePendingMisses,
   runIndexMaintenance
 };
