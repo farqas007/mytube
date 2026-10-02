@@ -2638,6 +2638,69 @@ function watchDegradedShellResponse(shell) {
   });
 }
 
+// -----------------------------------------------------------------------------
+// A valid video URL that ran out of SSR budget
+// -----------------------------------------------------------------------------
+// watchDegradedShellResponse() above hands back the shell byte for byte, and that
+// is right for the `unavailable` branch: we learned nothing about the video, so
+// we invent nothing. It is wrong for the RATE-LIMITED branch, because that one
+// has already proved the `?id=` names a real, playable YouTube video -- only
+// that we declined to spend a YouTube call confirming it this time.
+//
+// The generic shell is indexable but its canonical carries no `?id=` at all, and
+// `/watch` itself answers `noindex, follow`. So the untouched shell hands a
+// crawler an indexable video URL canonicalized to a noindex URL, which is a
+// self-contradictory page: Google is told to index this URL, then told the URL
+// it indexes is not indexable. During any crawl that walks the sitemap faster
+// than 60 URLs per 5 minutes, every video past the budget got exactly that.
+//
+// So this branch keeps the generic metadata and corrects only the URL identity:
+//
+//   * robots stays `index, follow`. A spent budget is NOT evidence the video is
+//     gone, and noindexing a perfectly valid video because of our own budget
+//     would be the worst possible outcome.
+//   * the title, description, og:title, og:description and og:image stay the
+//     shell's generic values. We know the video exists; we do not know its
+//     title, and fabricating one would be a lie a crawler could cache.
+//   * canonical and og:url become this video's own URL, built by the same
+//     setVideoCanonical() every other path uses, so the sitemap, the healthy
+//     render and the client all agree on one string.
+//   * no second YouTube lookup happens. The budget exists precisely because we
+//     must not spend one here, and /api/video still answers the client on
+//     hydration with the real metadata.
+//   * Cache-Control stays `no-store`, so a degraded minute never becomes five
+//     minutes of cached generic head.
+// -----------------------------------------------------------------------------
+function renderWatchRateLimitedHtml(html, videoId) {
+  const canonical = setVideoCanonical(videoId);
+
+  let out = setCanonicalHref(html, canonical);
+
+  return setMetaContent(out, "property", "og:url", canonical);
+}
+
+// The response wrapper for that render.
+//
+// Same header treatment as watchHtmlResponse() -- the body was rewritten, so the
+// asset's Content-Encoding/Content-Length/ETag no longer describe it -- but with
+// the degraded cacheability instead of the revalidating one, and without any of
+// withSecurityHeaders() for the same reason watchHtmlResponse() omits it.
+function watchRateLimitedResponse(shell, html) {
+  const headers = new Headers(shell.headers);
+
+  headers.delete("Content-Encoding");
+  headers.delete("Content-Length");
+  headers.delete("ETag");
+  headers.set("Content-Type", "text/html; charset=utf-8");
+  headers.set("Cache-Control", WATCH_DEGRADED_CACHE_CONTROL);
+
+  return new Response(html, {
+    status: shell.status,
+    statusText: shell.statusText,
+    headers
+  });
+}
+
 // Rebuild the asset response around a modified body.
 //
 // The shell's own headers are kept so the page's header surface stays exactly
@@ -2692,11 +2755,16 @@ async function handleWatchPage(request, env, ctx, url) {
     return watchHtmlResponse(shell, renderWatchNoIndexHtml(await shell.text()));
   }
 
-  // Over budget: answer from the shell, unchanged and still indexable, exactly
-  // as if this section did not exist. The client hydrates it as before. It is a
-  // degraded render, so it must not be stored at the CDN.
+  // Over budget: a valid video we chose not to look up. Serve the generic shell
+  // -- still indexable, because a spent budget is not evidence of absence -- but
+  // with the canonical and og:url pointed at this video's own URL instead of at
+  // the noindex `/watch`. No upstream call is made; the client still hydrates the
+  // real metadata. Uncacheable, as every degraded render is.
   if (!watchSeoRateLimitAllowed(request)) {
-    return watchDegradedShellResponse(shell);
+    return watchRateLimitedResponse(
+      shell,
+      renderWatchRateLimitedHtml(await shell.text(), videoId)
+    );
   }
 
   const index = createIndexContext(ctx, env);

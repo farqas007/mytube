@@ -1092,16 +1092,20 @@ test("F6 the watch HTML deliberately keeps the asset header surface", async () =
 });
 
 test("F7 a degraded watch render is no-store but stays indexable", async () => {
-  // A degraded render answers with the untouched generic shell. That shell is
-  // not a valid head for a video URL -- its canonical carries no `?id=` at all --
-  // so letting the CDN store it would pin every watch URL to one generic page
-  // for the whole s-maxage window, long after the upstream recovered.
+  // A degraded render is uncacheable: letting the CDN store the generic shell
+  // would pin every watch URL to one generic page for the whole s-maxage window,
+  // long after the upstream recovered.
   //
   // `noindex` is deliberately NOT the remedy: a transient failure is not evidence
   // that the video is gone, and the client reaches the correct verdict on
   // hydration. So both halves are asserted together -- uncacheable, yet still
   // indexable. D4 pins the same robots outcome for the no-API-key variant; this
   // pins the cacheability that the degraded branch used to get wrong.
+  //
+  // The two halves end at DIFFERENT canonicals, and that difference is the
+  // point. (a) could not find out anything about the video, so it keeps the
+  // shell's generic `/watch` canonical. (b) knows exactly which video the URL
+  // is, so it canonicalizes to that video. Both stay indexable. See R2.
   const transientId = nextSourceId();
 
   // (a) the lookup could not complete at all.
@@ -1159,12 +1163,307 @@ test("F7 a degraded watch render is no-store but stays indexable", async () => {
     );
 
     // Over the budget the shell is served uncacheable, and still indexable.
+    // The canonical is now this video's OWN url rather than the generic
+    // `/watch`: the `?id=` has already proved a real video exists, so pointing
+    // at the noindex `/watch` (which half (a), having learned nothing, still
+    // correctly does) would hand a crawler an indexable url canonicalized to an
+    // unindexable one. The title stays generic either way. See R2 and R5.
     assert.equal(last.response.status, 200);
     assert.equal(last.response.headers.get("Cache-Control"), "no-store");
     assert.equal(metaContent(last.html, 'meta[name="robots"]'), INDEXABLE);
-    assert.equal(canonicalHref(last.html), SHELL_CANONICAL);
+    assert.equal(canonicalHref(last.html), `${ORIGIN}/watch?id=yt%3A${rateId}`);
     assert.equal(titleText(last.html), SHELL_TITLE);
   });
+});
+
+// ---------------------------------------------------------------------------
+// R) A rate-limited render is still the right page for that video
+// ---------------------------------------------------------------------------
+// The over-budget branch used to hand back the generic shell untouched. That
+// shell is indexable, and its canonical carries no `?id=` at all -- so every
+// valid watch URL fetched past the budget was served as "an indexable page,
+// canonical = /watch", while `/watch` itself answers `noindex, follow`. A
+// crawler walking the 50-URL sitemap faster than the budget therefore received a
+// self-contradictory head for every video past request 60 of each 5-minute
+// window: told to index the URL, then told the URL it should index is not
+// indexable.
+//
+// The fix corrects the URL identity and nothing else. These tests pin that it
+// corrects exactly that: robots stays indexable, the generic metadata stays
+// generic, every noindex verdict stays noindex, the healthy path is untouched,
+// the `unavailable` path is untouched, and two rate-limited videos can never
+// borrow each other's id.
+// ---------------------------------------------------------------------------
+
+const WATCH_SEO_RATE_MAX_PER_WINDOW = 60; // WATCH_SEO_RATE_MAX_PER_WINDOW in worker.js
+
+// Drive one video past the per-IP SSR budget and return the last response.
+//
+// Every request comes from one IP, exactly as one crawler would, and the
+// upstream responder stays healthy for the whole loop -- so the final response
+// can only have been degraded by the budget, never by a failing lookup. The
+// extra requests past the budget guarantee the bucket is spent regardless of how
+// many the healthy path consumed.
+async function overBudgetWatchResponse(videoId, options = {}) {
+  const ip = options.ip ?? nextIp();
+  const env = options.env ?? envWith(undefined, createFakeAssets());
+  const ctx = options.ctx ?? createFakeCtx();
+  let result;
+
+  for (let i = 0; i < WATCH_SEO_RATE_MAX_PER_WINDOW + 5; i += 1) {
+    result = await callWorker(`/watch?id=${encodeURIComponent(videoId)}`, env, ctx, { ip });
+  }
+
+  return { ...result, ip, env, ctx };
+}
+
+test("R1 a rate-limited valid video stays indexable", async () => {
+  // The one outcome that must never regress: a valid video must not be noindexed
+  // because the site ran out of its own render budget. That would be a
+  // self-inflicted deindexing of a perfectly good page.
+  const sourceId = nextSourceId();
+
+  await withYouTube(videoResponder(sourceId, videoItem(sourceId)), async () => {
+    const { response, html } = await overBudgetWatchResponse(`yt:${sourceId}`);
+
+    assert.equal(response.status, 200);
+    assert.equal(metaContent(html, 'meta[name="robots"]'), INDEXABLE);
+    assert.notEqual(metaContent(html, 'meta[name="robots"]'), NOINDEX);
+  });
+});
+
+test("R2 a rate-limited valid video canonicalizes to its own exact URL", async () => {
+  const sourceId = nextSourceId();
+  const videoId = `yt:${sourceId}`;
+  const expected = `${ORIGIN}/watch?id=yt%3A${sourceId}`;
+
+  await withYouTube(videoResponder(sourceId, videoItem(sourceId)), async () => {
+    const { html } = await overBudgetWatchResponse(videoId);
+
+    assert.equal(canonicalHref(html), expected);
+    assert.notEqual(
+      canonicalHref(html),
+      SHELL_CANONICAL,
+      "the generic /watch canonical is noindex; a video url must never point at it"
+    );
+    // The one canonical form of a watch url, built the same way as everywhere else.
+    assert.equal(canonicalHref(html), setVideoCanonical(videoId));
+    assert.equal(canonicalHref(html), watchUrl(videoId));
+  });
+});
+
+test("R3 a rate-limited valid video reports the same URL as og:url", async () => {
+  const sourceId = nextSourceId();
+
+  await withYouTube(videoResponder(sourceId, videoItem(sourceId)), async () => {
+    const { html } = await overBudgetWatchResponse(`yt:${sourceId}`);
+
+    assert.equal(metaContent(html, 'meta[property="og:url"]'), canonicalHref(html));
+  });
+});
+
+test("R4 a rate-limited render is still uncacheable", async () => {
+  // The body is now rewritten (canonical + og:url), so the asset's ETag and
+  // Content-Length no longer describe it -- which is also why the branch must
+  // stay no-store rather than inheriting the revalidating SSR cache policy.
+  const sourceId = nextSourceId();
+
+  await withYouTube(videoResponder(sourceId, videoItem(sourceId)), async () => {
+    const { response } = await overBudgetWatchResponse(`yt:${sourceId}`);
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Cache-Control"), "no-store");
+    assert.equal(response.headers.get("ETag"), null);
+    assert.equal(response.headers.get("Content-Length"), null);
+  });
+});
+
+test("R5 a rate-limited render keeps the generic metadata and fabricates nothing", async () => {
+  // The upstream responder in this test is healthy and would happily hand over
+  // the real title, description and thumbnail. Not one of them may be used: we
+  // chose not to spend the lookup, so the head must stay generic rather than
+  // half-invented. The client supplies the real metadata on hydration.
+  const sourceId = nextSourceId();
+
+  await withYouTube(videoResponder(sourceId, videoItem(sourceId)), async () => {
+    const { html } = await overBudgetWatchResponse(`yt:${sourceId}`);
+
+    assert.equal(titleText(html), SHELL_TITLE);
+    assert.equal(metaContent(html, 'meta[name="description"]'), SHELL_DESCRIPTION);
+    assert.equal(metaContent(html, 'meta[property="og:title"]'), SHELL_TITLE);
+    assert.equal(metaContent(html, 'meta[property="og:description"]'), SHELL_DESCRIPTION);
+    assert.equal(metaContent(html, 'meta[property="og:image"]'), SHELL_IMAGE);
+
+    // Explicitly: the real values the healthy upstream would have produced are absent.
+    assert.notEqual(titleText(html), `${TITLE} - MyTube`);
+    assert.equal(html.includes(TITLE), false);
+    assert.equal(html.includes(DESCRIPTION), false);
+  });
+});
+
+test("R6 /watch itself stays noindex, budget spent or not", async () => {
+  // The bare URL has no id, so it returns before the rate limiter is ever
+  // consulted. Asserted under a spent bucket as well as a fresh IP, because
+  // "the bare page is noindex" and "a rate-limited video is indexable" have to
+  // hold at the same time for the fix to mean anything.
+  const sourceId = nextSourceId();
+
+  await withYouTube(videoResponder(sourceId, videoItem(sourceId)), async () => {
+    const fresh = await callWorker("/watch", envWith(undefined, createFakeAssets()), createFakeCtx());
+
+    assert.equal(fresh.response.status, 200);
+    assert.equal(metaContent(fresh.html, 'meta[name="robots"]'), NOINDEX);
+    assert.equal(canonicalHref(fresh.html), SHELL_CANONICAL);
+
+    const { ip, env, ctx } = await overBudgetWatchResponse(`yt:${sourceId}`);
+
+    // Same IP, bucket now definitely spent.
+    const spent = await callWorker("/watch", env, ctx, { ip });
+
+    assert.equal(spent.response.status, 200);
+    assert.equal(metaContent(spent.html, 'meta[name="robots"]'), NOINDEX);
+    assert.equal(canonicalHref(spent.html), SHELL_CANONICAL);
+  });
+});
+
+test("R7 malformed and missing ids stay noindex even under a spent budget", async () => {
+  // The rate-limited branch is only reachable for an id that already proved
+  // itself a valid YouTube video. Nothing about a spent budget may promote a
+  // junk URL into an indexable page.
+  const sourceId = nextSourceId();
+  const junk = ["", "   ", "garbage", "yt:short", "yt:has spaces", "vimeo:12345", "yt:way-too-long"];
+
+  await withYouTube(videoResponder(sourceId, videoItem(sourceId)), async () => {
+    const { ip, env, ctx } = await overBudgetWatchResponse(`yt:${sourceId}`);
+
+    for (const raw of junk) {
+      const { response, html } = await callWorker(
+        `/watch?id=${encodeURIComponent(raw)}`,
+        env,
+        ctx,
+        { ip }
+      );
+
+      assert.equal(response.status, 200, `?id=${raw} must still answer 200`);
+      assert.equal(
+        metaContent(html, 'meta[name="robots"]'),
+        NOINDEX,
+        `?id=${raw} must stay noindex once the SSR budget is spent`
+      );
+      assert.equal(canonicalHref(html), SHELL_CANONICAL, `?id=${raw} canonical`);
+    }
+  });
+});
+
+test("R8 a healthy render is completely unchanged", async () => {
+  // The control for every test above: under the budget the full SSR render still
+  // happens, with the revalidating edge cache and the real per-video metadata.
+  const sourceId = nextSourceId();
+  const videoId = `yt:${sourceId}`;
+
+  await withYouTube(videoResponder(sourceId, videoItem(sourceId)), async () => {
+    const { response, html } = await callWorker(
+      `/watch?id=${encodeURIComponent(videoId)}`,
+      envWith(undefined, createFakeAssets()),
+      createFakeCtx()
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(canonicalHref(html), `${ORIGIN}/watch?id=yt%3A${sourceId}`);
+    assert.equal(metaContent(html, 'meta[property="og:url"]'), `${ORIGIN}/watch?id=yt%3A${sourceId}`);
+    assert.equal(metaContent(html, 'meta[name="robots"]'), INDEXABLE);
+    assert.equal(titleText(html), `${TITLE} - MyTube`);
+    assert.equal(metaContent(html, 'meta[property="og:image"]'), `https://i.ytimg.com/vi/${sourceId}/hq.jpg`);
+    assert.match(response.headers.get("Cache-Control") || "", /s-maxage=\d+/);
+    assert.equal(response.headers.get("ETag"), null);
+  });
+});
+
+test("R9 an authoritative unavailable render is unchanged", async () => {
+  // `unavailable` is NOT the rate-limited branch and must not be folded into it.
+  // A lookup that could not complete says nothing about which video the URL is
+  // for, so this branch keeps the shell's generic canonical exactly as before.
+  // The rate-limited branch can self-canonicalize precisely because the id was
+  // already proven valid; here it was not.
+  const sourceId = nextSourceId();
+
+  await withYouTube(() => {
+    throw new Error("simulated upstream outage");
+  }, async () => {
+    const { response, html } = await callWorker(
+      `/watch?id=${encodeURIComponent(`yt:${sourceId}`)}`,
+      envWith(undefined, createFakeAssets()),
+      createFakeCtx()
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Cache-Control"), "no-store");
+    assert.equal(metaContent(html, 'meta[name="robots"]'), INDEXABLE);
+    assert.equal(canonicalHref(html), SHELL_CANONICAL, "unavailable keeps the generic canonical");
+    assert.equal(metaContent(html, 'meta[property="og:url"]'), SHELL_CANONICAL);
+    assert.equal(titleText(html), SHELL_TITLE);
+    // Untouched body means the asset's own validators still describe it.
+    assert.equal(response.headers.get("ETag"), '"shell-etag"');
+  });
+});
+
+test("R10 two rate-limited videos never share or leak metadata", async () => {
+  // Both ids are rate limited from one IP, so both renders take the same
+  // degraded path. Neither may end up describing the other -- a shared buffer or
+  // a stale rewrite would show up here as one id in the other's head.
+  const firstId = nextSourceId();
+  const secondId = nextSourceId();
+  const ip = nextIp();
+  const env = envWith(undefined, createFakeAssets());
+  const ctx = createFakeCtx();
+
+  await withYouTube(
+    parsed => {
+      if (parsed.pathname.endsWith("/videos")) {
+        const id = parsed.searchParams.get("id");
+
+        return videosResponse([videoItem(id)]);
+      }
+
+      return {};
+    },
+    async () => {
+      // Spend the budget on the first video, then alternate.
+      for (let i = 0; i < WATCH_SEO_RATE_MAX_PER_WINDOW + 5; i += 1) {
+        await callWorker(`/watch?id=${encodeURIComponent(`yt:${firstId}`)}`, env, ctx, { ip });
+      }
+
+      const first = await callWorker(
+        `/watch?id=${encodeURIComponent(`yt:${firstId}`)}`,
+        env,
+        ctx,
+        { ip }
+      );
+      const second = await callWorker(
+        `/watch?id=${encodeURIComponent(`yt:${secondId}`)}`,
+        env,
+        ctx,
+        { ip }
+      );
+
+      assert.equal(canonicalHref(first.html), `${ORIGIN}/watch?id=yt%3A${firstId}`);
+      assert.equal(canonicalHref(second.html), `${ORIGIN}/watch?id=yt%3A${secondId}`);
+      assert.equal(metaContent(first.html, 'meta[property="og:url"]'), `${ORIGIN}/watch?id=yt%3A${firstId}`);
+      assert.equal(metaContent(second.html, 'meta[property="og:url"]'), `${ORIGIN}/watch?id=yt%3A${secondId}`);
+
+      // Neither head may mention the other video, in either direction.
+      assert.equal(first.html.includes(secondId), false, "video A's head must not mention video B");
+      assert.equal(second.html.includes(firstId), false, "video B's head must not mention video A");
+
+      // Both stay indexable and uncacheable, and both stay generic.
+      for (const [label, result] of [["first", first], ["second", second]]) {
+        assert.equal(result.response.status, 200, label);
+        assert.equal(metaContent(result.html, 'meta[name="robots"]'), INDEXABLE, label);
+        assert.equal(result.response.headers.get("Cache-Control"), "no-store", label);
+        assert.equal(titleText(result.html), SHELL_TITLE, label);
+      }
+    }
+  );
 });
 
 // ---------------------------------------------------------------------------
