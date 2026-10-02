@@ -590,10 +590,17 @@ function setPageMetaDescription(v){
 
 
 // ================= PAGE METADATA (client-side) =================
-// IMPORTANT: this is CLIENT-SIDE metadata only. worker.js sends every
-// non-/api/ request straight to the static ASSETS binding, so watch.html is
-// served verbatim and these tags are applied by the browser after render.
-// Crawlers that execute JS may pick them up; they are not server-rendered.
+// worker.js renders the per-video <title>/description/canonical/og head for
+// /watch?id=... before the response leaves the edge, from the same index-first /
+// YouTube-fallback lookup /api/video performs. Everything below re-applies that
+// same metadata after hydration: it is idempotent for a page the server already
+// enriched (the values it computes are byte-identical), and it is what still
+// produces the correct head when the SSR pass could not resolve the video —
+// most importantly setVideoPageMetaNoIndex(), which decides the error state.
+//
+// Keep the formats here identical to renderWatchSeoHtml() in worker.js, and to
+// watchUrl() in scripts/generate-sitemap.mjs: the sitemap loc, the page's own
+// canonical and these rewrites must all be the same string.
 
 const WATCH_ORIGIN = "https://mytube.farqas007.workers.dev";
 const ROBOTS_INDEXABLE = "index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1";
@@ -1218,7 +1225,7 @@ async function loadRelatedFromYouTube(sourceId, listEl){
 
 
 function navigateToVideo(videoId){
-    window.location.href = "watch.html?id=" + videoId;
+    window.location.href = "/watch?id=" + encodeURIComponent(videoId);
 }
 
 

@@ -47,7 +47,7 @@ let playlistDetailName = "";
 // ================= HELPERS =================
 
 function openVideo(id){
-    window.location.href = "watch.html?id=" + id;
+    window.location.href = "/watch?id=" + encodeURIComponent(id);
 }
 
 
@@ -55,7 +55,7 @@ function buildVideoItem(v, options){
     options = options || {};
     const link = document.createElement("a");
     link.className = "profile-video";
-    link.href = "watch.html?id=" + v.id;
+    link.href = "/watch?id=" + encodeURIComponent(v.id);
     link.setAttribute("aria-label", "Watch " + v.title);
 
     const img = document.createElement("img");

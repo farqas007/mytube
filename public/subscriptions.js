@@ -61,7 +61,7 @@ function getInitials(name){
 
 
 function openVideo(id){
-    window.location.href = "watch.html?id=" + id;
+    window.location.href = "/watch?id=" + encodeURIComponent(id);
 }
 
 

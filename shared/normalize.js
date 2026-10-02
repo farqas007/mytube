@@ -8,7 +8,7 @@
 //
 // Canonical video shape (mirrors the local videos in videos.js):
 //   {
-//     id: "yt:<videoId>",   // namespaced id for watch.html?id=yt:<id>
+//     id: "yt:<videoId>",   // namespaced id for /watch?id=yt%3A<id>
 //     sourceId: "<videoId>",// the raw YouTube video id (used for the embed)
 //     type: "youtube",
 //     title, channel, channelId, thumb, time, views, viewCount,

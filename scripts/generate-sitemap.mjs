@@ -7,17 +7,28 @@
 // exits non-zero and leaves the existing sitemap.xml completely untouched.
 
 import { writeFile, rename, unlink } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 
-const ORIGIN = "https://mytube.farqas007.workers.dev";
+export const ORIGIN = "https://mytube.farqas007.workers.dev";
 const TRENDING_API = `${ORIGIN}/api/trending?max=50`;
 const REQUEST_TIMEOUT_MS = 30000;
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
-const sitemapPath = path.join(repoRoot, "sitemap.xml");
+// Cloudflare serves the static frontend from `public/` (see the `assets.directory`
+// binding in wrangler.jsonc), so the ONLY sitemap the site ever serves is
+// public/sitemap.xml — which is also what robots.txt advertises. The output path
+// must therefore point inside public/; writing to the repository root produces a
+// file nothing serves and that nothing deploys.
+const sitemapPath = path.join(repoRoot, "public", "sitemap.xml");
 const tempPath = sitemapPath + ".tmp";
+
+// Exported so the test suite can assert the resolved output path without ever
+// touching the network or the working tree.
+export function resolveSitemapPath() {
+  return sitemapPath;
+}
 
 const MAX_VIDEOS = 50;
 
@@ -33,7 +44,12 @@ function fail(message, error){
 
 // MyTube is YouTube-only: every playable id is "yt:<sourceId>". Only those
 // ids produce a resolvable /watch?id=... URL, so anything else is skipped.
-function watchUrl(id){
+//
+// The `encodeURIComponent(trimmed)` call is the single encoding convention for a
+// /watch?id=... URL across the whole repository. worker.js (setVideoCanonical)
+// and public/watch.js (setVideoPageMeta) must produce the exact same string, or
+// the sitemap and the page's own canonical disagree.
+export function watchUrl(id){
     if(typeof id !== "string"){
         return "";
     }
@@ -78,7 +94,7 @@ async function fetchTrending(){
 }
 
 
-function buildSitemap(urls, lastmod){
+export function buildSitemap(urls, lastmod){
     const entries = [
         {
             loc: `${ORIGIN}/`,
@@ -159,8 +175,12 @@ async function main(){
         return fail("could not write sitemap.xml; the previous file is left in place.", error);
     }
 
-    console.log(`generate-sitemap: wrote sitemap.xml (1 homepage + ${urls.length} watch URLs, lastmod ${lastmod}).`);
+    console.log(`generate-sitemap: wrote public/sitemap.xml (1 homepage + ${urls.length} watch URLs, lastmod ${lastmod}).`);
 }
 
 
-await main();
+// Only generate when invoked directly (`npm run sitemap`). Importing this module
+// — as tests/testSitemap.js does — must never hit the network or write a file.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+    await main();
+}

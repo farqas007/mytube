@@ -35,16 +35,26 @@ import { test } from "node:test";
 import worker, {
   scheduled,
   runIndexMaintenance,
-  MAINTENANCE_RETENTION_MS,
-  MAINTENANCE_REFRESH_WINDOW_MS,
-  MAINTENANCE_MAX_VIDEOS_PER_RUN,
-  MAINTENANCE_MAX_YT_REQUESTS_PER_RUN,
-  MAINTENANCE_MISS_STATE_KEY,
-  MAINTENANCE_MISS_TOMBSTONE_MS,
-  YT_VIDEO_LIST_KIND,
+  maintenanceConfig,
+  isAuthoritativeVideoList,
   prunePendingMisses
 } from "../worker.js";
 import { VIDEO_COLUMNS, toVideoRow } from "../shared/index-store.js";
+
+// The maintenance policy, read through worker.js's maintenanceConfig() getter
+// rather than imported as named exports. A Worker module may only export
+// functions — workerd refuses to load one that also exports a plain value — so
+// these are surfaced as data instead. The values are the module's own, so the
+// assertions below pin exactly the same numbers as before.
+const {
+  retentionMs: MAINTENANCE_RETENTION_MS,
+  refreshWindowMs: MAINTENANCE_REFRESH_WINDOW_MS,
+  maxVideosPerRun: MAINTENANCE_MAX_VIDEOS_PER_RUN,
+  maxYtRequestsPerRun: MAINTENANCE_MAX_YT_REQUESTS_PER_RUN,
+  missStateKey: MAINTENANCE_MISS_STATE_KEY,
+  missTombstoneMs: MAINTENANCE_MISS_TOMBSTONE_MS,
+  videoListKind: YT_VIDEO_LIST_KIND
+} = maintenanceConfig();
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -379,6 +389,47 @@ test("the refresh window starts before the 30-day boundary", () => {
   assert.equal(MAINTENANCE_RETENTION_MS, 30 * DAY_MS);
   assert.ok(MAINTENANCE_REFRESH_WINDOW_MS > 0);
   assert.ok(MAINTENANCE_REFRESH_WINDOW_MS < MAINTENANCE_RETENTION_MS);
+});
+
+test("maintenanceConfig reports the policy the handler actually enforces", () => {
+  // The policy reaches the tests through a getter (a Worker module may only
+  // export functions), so this pins the getter to the exported behaviour rather
+  // than trusting that it reads the right constants. If the getter ever drifted
+  // from the handler, these would fail instead of the suite quietly asserting
+  // against a stale copy of the numbers.
+  const config = maintenanceConfig();
+
+  // The `kind` the deletion predicate accepts, and nothing else.
+  assert.ok(
+    isAuthoritativeVideoList({ data: { kind: config.videoListKind, items: [] } }),
+    "the reported kind must be the one videos.list replies with"
+  );
+  for (const other of [
+    "youtube#searchListResponse",
+    "youtube#playlistListResponse",
+    "youtube#video",
+    "",
+    undefined,
+    null
+  ]) {
+    assert.equal(
+      isAuthoritativeVideoList({ data: { kind: other, items: [] } }),
+      false,
+      "only the reported kind may be authoritative, got " + String(other)
+    );
+  }
+
+  // The per-run caps, stated outright rather than only comparatively.
+  assert.equal(config.maxVideosPerRun, 20);
+  assert.equal(config.maxYtRequestsPerRun, 1);
+
+  // The tombstone window the expiry test above exercises, and the state key the
+  // tombstones are written under.
+  assert.equal(config.missTombstoneMs, 7 * DAY_MS);
+  assert.equal(config.missStateKey, "maintenance:pending_misses");
+
+  // The delete statement targets the non-unique index column, keyed per source.
+  assert.equal(config.deleteSql, "DELETE FROM videos WHERE source_id = ?");
 });
 
 test("an expired row is refreshed when upstream still returns it", async () => {

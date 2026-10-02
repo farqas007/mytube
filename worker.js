@@ -2290,9 +2290,494 @@ async function handleAPI(request, env, ctx) {
   }
 }
 
+// -----------------------------------------------------------------------------
+// WATCH PAGE SEO — server-rendered metadata for /watch (and /watch.html alias)
+// -----------------------------------------------------------------------------
+// Before this section, worker.js sent every non-/api/ request straight to the
+// static ASSETS binding, so public/watch.html was delivered byte-for-byte. That
+// made EVERY /watch?id=... URL ship the same generic head: title "Watch -
+// MyTube", description "Watch videos on MyTube", and a canonical of
+// https://mytube.farqas007.workers.dev/watch — a canonical with no `?id=` at
+// all, which points every watch URL in the sitemap at one single page. The real
+// per-video metadata only ever appeared when watch.js rewrote the head after the
+// browser had already fetched /api/video.
+//
+// This section moves that rewrite to the server. It changes NOTHING about the
+// page itself: public/watch.html is still the application shell that is served,
+// with the same markup, the same element ids and the same script tags. Only the
+// values inside <head> are filled in, and only from real video metadata.
+//
+// Rules this block keeps:
+//
+//   * No fabricated metadata. A title, description or thumbnail is only ever
+//     written when it came out of the index or out of YouTube. Anything missing
+//     keeps whatever the shell already said.
+//   * Never marks an unknown page indexable. An id that is absent, malformed, or
+//     authoritatively gone from YouTube gets `noindex, follow` — which is the
+//     same verdict watch.js's renderErrorState() reaches a moment later, applied
+//     earlier. A *transient* failure (D1 down, network, quota) is NOT treated as
+//     proof of absence: the shell is served untouched and the client decides.
+//   * Adds no upstream cost beyond the index-first lookup /api/video already
+//     performs, and is metered by its own bucket so a crawler can never spend
+//     the general budget the browser's own /api/video call needs.
+//   * No API key ever reaches the HTML: only the normalized video DTO is used.
+// -----------------------------------------------------------------------------
+
+// The absolute origin every canonical/og:url is built from.
+//
+// This is intentionally the same literal the rest of the repository already
+// hardcodes (public/watch.js WATCH_ORIGIN, scripts/generate-sitemap.mjs ORIGIN,
+// the homepage canonical and public/robots.txt). Sitemap URL and canonical URL
+// have to be byte-identical strings, so they must be derived the same way.
+const WATCH_ORIGIN = "https://mytube.farqas007.workers.dev";
+
+// The one canonical form of a watch URL, in one place.
+//
+// `encodeURIComponent("yt:<sourceId>")` is the encoding convention shared with
+// public/watch.js (setVideoPageMeta) and scripts/generate-sitemap.mjs (watchUrl).
+// Keep all three identical or the sitemap and the page disagree again.
+function setVideoCanonical(videoId) {
+  return `${WATCH_ORIGIN}/watch?id=${encodeURIComponent(videoId)}`;
+}
+
+// A YouTube video id is always exactly 11 URL-safe base64 characters.
+// Mirrors YT_VIDEO_ID_RE in public/watch.js.
+const YT_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+
+// Canonicalize a raw `?id=` value the same way public/watch.js does, so the
+// server and the client can never disagree about which video a URL is for.
+//
+//   ""                     -> ""                       (no video)
+//   "yt:<id>"              -> unchanged                (already canonical)
+//   "<11-char video id>"   -> "yt:<id>"                (bare-id shorthand)
+//   anything else          -> unchanged                (invalid; stays invalid)
+function normalizeWatchId(raw) {
+  const value = String(raw === null || raw === undefined ? "" : raw).trim();
+
+  if (!value || value.startsWith(VIDEO_SOURCE_PREFIX)) {
+    return value;
+  }
+
+  return YT_VIDEO_ID_RE.test(value) ? VIDEO_SOURCE_PREFIX + value : value;
+}
+
+// A watch URL is only rendered server-side when it actually identifies a YouTube
+// video. An id that is absent, un-namespaced-but-invalid, or a `yt:` prefix with
+// something that is not a video id is left for the client to report as not
+// found — the Worker never spends an upstream request proving a string is junk.
+function watchSourceId(videoId) {
+  if (!videoId || !videoId.startsWith(VIDEO_SOURCE_PREFIX)) {
+    return "";
+  }
+
+  const sourceId = videoId.slice(VIDEO_SOURCE_PREFIX.length).trim();
+
+  return YT_VIDEO_ID_RE.test(sourceId) ? sourceId : "";
+}
+
+// Dedicated budget for the server-rendered watch head.
+//
+// The lookup is index-first, so it normally costs nothing, but an index miss
+// falls through to the same videos.list call /api/video makes. It therefore gets
+// its own bucket — exactly like search.list and live chat — so a crawler walking
+// the sitemap can never exhaust the 120-request/5-minute general budget that the
+// browser's own /api/video request spends. Being refused here is not an error:
+// the plain shell is served unchanged and the client hydrates it as before.
+const WATCH_SEO_RATE_WINDOW_MS = 5 * 60 * 1000;
+const WATCH_SEO_RATE_MAX_PER_WINDOW = 60;
+const watchSeoRateBuckets = new Map();
+
+function watchSeoRateLimitAllowed(request) {
+  const ip = clientIp(request);
+  const now = Date.now();
+  const bucket = watchSeoRateBuckets.get(ip) || { count: 0, windowStart: now };
+
+  if (now - bucket.windowStart >= WATCH_SEO_RATE_WINDOW_MS) {
+    bucket.count = 0;
+    bucket.windowStart = now;
+  }
+
+  bucket.count++;
+  watchSeoRateBuckets.set(ip, bucket);
+
+  if (watchSeoRateBuckets.size > 5000) {
+    for (const [key, entry] of watchSeoRateBuckets) {
+      if (now - entry.windowStart >= WATCH_SEO_RATE_WINDOW_MS) {
+        watchSeoRateBuckets.delete(key);
+      }
+    }
+  }
+
+  return bucket.count <= WATCH_SEO_RATE_MAX_PER_WINDOW;
+}
+
+// Resolve the metadata for one watch URL.
+//
+//   ok          real metadata; `video` is the same DTO /api/video returns
+//   missing     YouTube authoritatively has no such video (empty items list).
+//               The same condition /api/video reports as HTTP 404.
+//   unavailable we could not find out right now (no D1 + no API key, network
+//               error, quota, unreadable upstream body). Says nothing about the
+//               video's existence, so it must never be treated as `missing`.
+//
+// Index-first, then YouTube — the identical order and the identical write-behind
+// call /api/video uses, so a watch page render warms the index for free and the
+// browser's own /api/video call afterwards normally costs no quota at all.
+async function resolveWatchVideo(index, sourceId, apiKey) {
+  const indexed = await readIndexedVideo(index, sourceId);
+
+  if (indexed.video) {
+    return { status: "ok", video: indexed.video };
+  }
+
+  let item;
+
+  try {
+    item = await getVideoDetails(sourceId, apiKey);
+  } catch (error) {
+    console.error(
+      "[mytube] watch metadata lookup failed",
+      error?.message || error
+    );
+
+    return { status: "unavailable", video: null };
+  }
+
+  // YouTube answers a removed/never-existing id with an empty list rather than
+  // an error (see the identical branch in the /api/video route).
+  if (!item) {
+    return { status: "missing", video: null };
+  }
+
+  scheduleIndexWrite(index, [item], { origin: INDEX_ORIGIN_DETAIL });
+
+  return { status: "ok", video: normalizeVideoItem(item) };
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Rewrite the content="..." of the <meta> tag carrying `attrName="attrValue"`.
+//
+// `watch.html` writes `name=`/`property=` before `content=` on every SEO tag, so
+// that ordering is what the pattern anchors on. The value is passed through a
+// replacer function rather than a `$1`-style template so a title containing `$&`
+// or `$1` can never be interpreted as a backreference.
+//
+// Returns the html untouched when the tag is absent, so a future edit to
+// watch.html degrades to "no server-side metadata" instead of a broken page.
+function setMetaContent(html, attrName, attrValue, content) {
+  const pattern = new RegExp(
+    `(<meta\\b[^>]*\\b${escapeRegExp(attrName)}="${escapeRegExp(attrValue)}"[^>]*\\bcontent=")[^"]*(")`,
+    "i"
+  );
+
+  if (!pattern.test(html)) {
+    return html;
+  }
+
+  return html.replace(
+    pattern,
+    (match, open, close) => `${open}${content}${close}`
+  );
+}
+
+// Same idea for <link ... id="pageCanonical" href="...">, the single canonical
+// element watch.js also reuses (it never adds a second one).
+function setCanonicalHref(html, href) {
+  const pattern = /(<link\b[^>]*\bid="pageCanonical"[^>]*\bhref=")[^"]*(")/i;
+
+  if (!pattern.test(html)) {
+    return html;
+  }
+
+  return html.replace(
+    pattern,
+    (match, open, close) => `${open}${href}${close}`
+  );
+}
+
+// Replace the <title> element's text.
+//
+// The replacement is passed as a replacer FUNCTION, never as a string: a title
+// containing `$&` (or `$1`) would otherwise be expanded as a replacement
+// pattern and splice the matched shell title back into the middle of it,
+// corrupting the element. Real video titles do contain `$`.
+function setTitleText(html, title) {
+  const pattern = /<title>[\s\S]*?<\/title>/i;
+
+  if (!pattern.test(html)) {
+    return html;
+  }
+
+  return html.replace(pattern, () => `<title>${title}</title>`);
+}
+
+// Description cap. Matches the 160 characters public/watch.js
+// (setPageMetaDescription) already applies, so the server-rendered head and the
+// client-updated head stay byte-identical instead of oscillating.
+const WATCH_META_DESCRIPTION_MAX = 160;
+
+function watchDescription(video) {
+  const description = String(video?.description || "").trim();
+
+  return description ? description.slice(0, WATCH_META_DESCRIPTION_MAX) : "";
+}
+
+// Only a real absolute http(s) URL is ever written into og:image. YouTube's
+// thumbnail picker always yields one, but an index row written before the column
+// existed could be empty, and an empty og:image is worse than the shell's own
+// site icon.
+function isHttpUrl(value) {
+  try {
+    const parsed = new URL(String(value));
+
+    return parsed.protocol === "https:" || parsed.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+// Rewrite <head> for a video that is known to exist.
+//
+// Every value written here is either the shell's existing value or real metadata
+// from the index/YouTube. The title suffix, the description cap and the
+// canonical format all match public/watch.js, so when watch.js re-applies the
+// same values after hydration it is writing back exactly what is already there.
+function renderWatchSeoHtml(html, video, videoId) {
+  const title = String(video.title || "").trim();
+  const description = watchDescription(video);
+  const canonical = setVideoCanonical(videoId);
+
+  let out = setCanonicalHref(html, canonical);
+  out = setMetaContent(out, "property", "og:url", canonical);
+
+  if (title) {
+    const fullTitle = `${title} - MyTube`;
+
+    out = setTitleText(out, escapeHtml(fullTitle));
+    out = setMetaContent(out, "property", "og:title", escapeHtml(fullTitle));
+    out = setMetaContent(out, "name", "twitter:title", escapeHtml(fullTitle));
+  }
+
+  if (description) {
+    const escaped = escapeHtml(description);
+
+    out = setMetaContent(out, "name", "description", escaped);
+    out = setMetaContent(out, "property", "og:description", escaped);
+    out = setMetaContent(out, "name", "twitter:description", escaped);
+  }
+
+  if (isHttpUrl(video.thumb)) {
+    const thumb = escapeHtml(video.thumb);
+
+    out = setMetaContent(out, "property", "og:image", thumb);
+    // The shell ships `og:image:alt` = "MyTube", which would misdescribe a
+    // video thumbnail once one is set.
+    out = setMetaContent(
+      out,
+      "property",
+      "og:image:alt",
+      title ? escapeHtml(title) : "MyTube"
+    );
+  }
+
+  return out;
+}
+
+// Keep a page that is definitionally not a video out of the index.
+//
+// Only the robots tag changes: no title, description, canonical or og value is
+// invented, and the client-side error panel renders exactly as it does today.
+function renderWatchNoIndexHtml(html) {
+  return setMetaContent(html, "name", "robots", "noindex, follow");
+}
+
+// The SSR head is a point-in-time snapshot, so it gets the same 5-minute edge
+// lifetime as the D1 index TTL (VIDEO_INDEX_TTL_MS) and may be served stale while
+// it revalidates.
+const WATCH_HTML_CACHE_CONTROL =
+  "public, max-age=0, s-maxage=300, stale-while-revalidate=600";
+
+// A DEGRADED render — an exhausted rate budget, or a lookup that could not
+// complete (quota, dead D1, upstream timeout) — answers with the untouched
+// generic shell. That shell is not a valid head for a video URL: its canonical
+// is `.../watch` with no `?id=` at all, so storing it would pin every watch URL
+// to one generic page for the whole s-maxage window even after the upstream
+// recovers. `no-store` keeps a bad minute from becoming five minutes of lost
+// per-video metadata.
+//
+// Note what is deliberately NOT changed here. `noindex` is still not applied:
+// a transient failure is not evidence that the video is gone, and the client
+// reaches the correct verdict on hydration. An authoritative "video unavailable"
+// is a different branch (renderWatchNoIndexHtml) and keeps its own caching.
+//
+// The body is the shell byte for byte, so its ETag still describes it and is
+// deliberately left in place; only cacheability changes.
+const WATCH_DEGRADED_CACHE_CONTROL = "no-store";
+
+function watchDegradedShellResponse(shell) {
+  const headers = new Headers(shell.headers);
+
+  headers.set("Cache-Control", WATCH_DEGRADED_CACHE_CONTROL);
+
+  return new Response(shell.body, {
+    status: shell.status,
+    statusText: shell.statusText,
+    headers
+  });
+}
+
+// Rebuild the asset response around a modified body.
+//
+// The shell's own headers are kept so the page's header surface stays exactly
+// what the static binding produced. Content-Encoding/Content-Length/ETag are
+// dropped because the bytes no longer match the asset that was read. Note this
+// response deliberately does NOT pass through withSecurityHeaders(): the watch
+// page is currently served by the ASSETS binding and never receives that header
+// set, and applying CSP to it for the first time would newly restrict the
+// Firebase module graph the page loads (watch.js -> firebase.js). Changing the
+// page's security posture is not this change's job.
+function watchHtmlResponse(shell, html) {
+  const headers = new Headers(shell.headers);
+
+  headers.delete("Content-Encoding");
+  headers.delete("Content-Length");
+  headers.delete("ETag");
+  headers.set("Content-Type", "text/html; charset=utf-8");
+  headers.set("Cache-Control", WATCH_HTML_CACHE_CONTROL);
+
+  return new Response(html, {
+    status: shell.status,
+    statusText: shell.statusText,
+    headers
+  });
+}
+
+// GET /watch (the URL the sitemap, the homepage and watch.js itself all use).
+async function handleWatchPage(request, env, ctx, url) {
+  // Non-GET/HEAD is not ours to interpret — hand it to the asset binding.
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return env.ASSETS.fetch(request);
+  }
+
+  const videoId = normalizeWatchId(url.searchParams.get("id"));
+  const sourceId = watchSourceId(videoId);
+
+  // The shell is always requested by its real asset path rather than by `/watch`.
+  // That keeps this handler independent of the static binding's html_handling
+  // setting, and it is fetched with a clean header set so a conditional request
+  // can never come back as a bodiless 304.
+  const shell = await env.ASSETS.fetch(
+    new Request(`${url.origin}/watch.html`, { method: "GET" })
+  );
+
+  if (!shell.ok) {
+    return shell;
+  }
+
+  // Nothing renderable to work with (no id, or an id that is not a YouTube
+  // video). Say noindex and stop: this is the bare-`/watch` soft-404 case.
+  if (!sourceId) {
+    return watchHtmlResponse(shell, renderWatchNoIndexHtml(await shell.text()));
+  }
+
+  // Over budget: answer from the shell, unchanged and still indexable, exactly
+  // as if this section did not exist. The client hydrates it as before. It is a
+  // degraded render, so it must not be stored at the CDN.
+  if (!watchSeoRateLimitAllowed(request)) {
+    return watchDegradedShellResponse(shell);
+  }
+
+  const index = createIndexContext(ctx, env);
+  const resolved = await resolveWatchVideo(index, sourceId, env.YOUTUBE_API_KEY || "");
+
+  // We could not find out. Serve the shell exactly as it is — no metadata, and
+  // crucially no `noindex`, because a quota error or a dead D1 is not evidence
+  // that the video is gone. Not stored at the CDN, so the next request retries
+  // instead of replaying the generic head.
+  //
+  // Checked BEFORE the body is read, because this branch hands back the shell's
+  // own unread body rather than a rewritten copy.
+  if (resolved.status === "unavailable") {
+    return watchDegradedShellResponse(shell);
+  }
+
+  const html = await shell.text();
+
+  // Authoritatively gone from YouTube: the same verdict the client reaches, and
+  // the same one /api/video reports as 404. Still no fabricated metadata.
+  if (resolved.status === "missing") {
+    return watchHtmlResponse(shell, renderWatchNoIndexHtml(html));
+  }
+
+  return watchHtmlResponse(shell, renderWatchSeoHtml(html, resolved.video, videoId));
+}
+
+// GET /watch.html?id=... -> 301 GET /watch?id=...
+//
+// watch.html is the file on disk, so the static binding serves it as a second,
+// fully indexable URL for the exact same video. That is the duplicate-URL half
+// of the watch canonical problem, so it is collapsed here rather than left to a
+// client-side canonical that may never be executed.
+//
+// Only the path changes, so this can never loop: `/watch` is rendered by
+// handleWatchPage and always answers 200/304, never a redirect. The `id` value is
+// re-serialized through URLSearchParams, which percent-encodes the `yt:` colon
+// exactly as watch.js and the sitemap generator do, so the redirect target is the
+// canonical URL string and not merely an equivalent one.
+function handleWatchHtml(url) {
+  const target = new URL(`${url.origin}/watch`);
+
+  for (const [key, value] of url.searchParams) {
+    if (key === "id") {
+      continue;
+    }
+
+    target.searchParams.append(key, value);
+  }
+
+  const videoId = normalizeWatchId(url.searchParams.get("id"));
+
+  if (videoId) {
+    target.searchParams.set("id", videoId);
+  }
+
+  return new Response(null, {
+    status: 301,
+    headers: {
+      Location: `${target.pathname}${target.search}`,
+      "Cache-Control": "public, max-age=3600"
+    }
+  });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // The two watch routes answer for themselves and return early: the watch
+    // HTML deliberately keeps the header surface the static ASSETS binding gives
+    // it, so it must not be run through withSecurityHeaders() (see the section
+    // comment above). Anything else — /api/* and every other asset — is
+    // completely unchanged.
+    if (url.pathname === "/watch") {
+      return handleWatchPage(request, env, ctx, url);
+    }
+
+    if (url.pathname === "/watch.html") {
+      return handleWatchHtml(url);
+    }
 
     const response = url.pathname.startsWith("/api/")
       ? await handleAPI(request, env, ctx)
@@ -2381,6 +2866,32 @@ const MAINTENANCE_DELETE_SQL = "DELETE FROM videos WHERE source_id = ?";
 // behind it.
 const MAINTENANCE_RENEW_SQL =
   "UPDATE videos SET metadata_fetched_at_ms = ?, last_seen_at_ms = ? WHERE source_id = ?";
+
+// Read-only view of the maintenance policy, for tests/testMaintenance.js.
+//
+// These values used to be named exports, but a Worker module may only export
+// functions and classes: workerd aborts at load time with "Incorrect type for map
+// entry ... not of type function or ExportedHandler" if any named export is a
+// plain value, which made `wrangler dev` fail to start on this file alone.
+// Exposing them through a function keeps the exact values assertable — the tests
+// still pin 30-day retention, the 20/1 per-run caps and the exact
+// videos.listResponse kind — without a single non-function export.
+//
+// This is a getter. It is read by tests only; no handler calls it, so the
+// maintenance behaviour is unchanged.
+function maintenanceConfig() {
+  return {
+    retentionMs: MAINTENANCE_RETENTION_MS,
+    refreshWindowMs: MAINTENANCE_REFRESH_WINDOW_MS,
+    maxVideosPerRun: MAINTENANCE_MAX_VIDEOS_PER_RUN,
+    maxYtRequestsPerRun: MAINTENANCE_MAX_YT_REQUESTS_PER_RUN,
+    missStateKey: MAINTENANCE_MISS_STATE_KEY,
+    missTombstoneMs: MAINTENANCE_MISS_TOMBSTONE_MS,
+    missTombstoneMax: MAINTENANCE_MISS_TOMBSTONE_MAX,
+    deleteSql: MAINTENANCE_DELETE_SQL,
+    videoListKind: YT_VIDEO_LIST_KIND
+  };
+}
 
 function createMaintenanceIndexContext(env) {
   const db = env?.mytube_index;
@@ -2881,15 +3392,16 @@ export async function scheduled(event, env, ctx) {
   await recordMaintenanceRun(index, summary);
 }
 
+// Named exports of a Worker module must all be functions: workerd rejects the
+// whole module at load time if a named export is a plain value (see
+// maintenanceConfig() above). WATCH_ORIGIN and the maintenance constants are
+// therefore read through functions instead of re-exported directly.
 export {
-  MAINTENANCE_RETENTION_MS,
-  MAINTENANCE_REFRESH_WINDOW_MS,
-  MAINTENANCE_MAX_VIDEOS_PER_RUN,
-  MAINTENANCE_MAX_YT_REQUESTS_PER_RUN,
-  MAINTENANCE_MISS_STATE_KEY,
-  MAINTENANCE_MISS_TOMBSTONE_MS,
-  MAINTENANCE_DELETE_SQL,
-  YT_VIDEO_LIST_KIND,
+  setVideoCanonical,
+  normalizeWatchId,
+  renderWatchSeoHtml,
+  renderWatchNoIndexHtml,
+  maintenanceConfig,
   isAuthoritativeVideoList,
   prunePendingMisses,
   runIndexMaintenance

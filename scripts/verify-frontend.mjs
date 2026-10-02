@@ -34,6 +34,10 @@ for(const raw of process.argv.slice(2)){
 const ORIGIN = (args.get("origin") || "http://localhost:3456").replace(/\/+$/, "");
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
+// The served frontend lives in public/. It used to be read from the repository
+// root, which no longer holds index.html/youtube.js, so every static check read
+// a missing file and crashed before it could report anything.
+const publicDir = path.join(repoRoot, "public");
 
 const failures = [];
 const notes = [];
@@ -123,8 +127,20 @@ console.log("origin:  " + ORIGIN);
 console.log("");
 console.log("=== Static wiring ===");
 
-const html = await readFile(path.join(repoRoot, "index.html"), "utf8");
-const youtubeClient = await readFile(path.join(repoRoot, "youtube.js"), "utf8");
+async function readFrontend(name){
+  try{
+    return await readFile(path.join(publicDir, name), "utf8");
+  }
+  catch{
+    throw new Error(
+      "verify-frontend: expected " + name + " in " + publicDir +
+      " (the served frontend directory)"
+    );
+  }
+}
+
+const html = await readFrontend("index.html");
+const youtubeClient = await readFrontend("youtube.js");
 
 const inlineMatch = html.match(/<script>\n([\s\S]*?)\n<\/script>/);
 check("index.html inline <script> found", Boolean(inlineMatch));
