@@ -2246,5 +2246,239 @@ export default {
       : await env.ASSETS.fetch(request);
 
     return withSecurityHeaders(response);
+  },
+
+  // Cloudflare dispatches the cron trigger to the module's `scheduled`
+  // handler. It is a no-op when the D1 binding is absent or malformed, so a
+  // missing index can never turn a cron tick into an error loop.
+  scheduled
+};
+
+// -----------------------------------------------------------------------------
+// D1 INDEX MAINTENANCE (Scheduled Event) — retention/revalidation
+// -----------------------------------------------------------------------------
+// Cloudflare Worker Scheduled Event handler, wired to the cron `0 */6 * * *`
+// (every 6 hours). It enforces the official YouTube 30-calendar-day retention
+// rule for Non-Authorized API Data: rows whose metadata is approaching the
+// limit are refreshed against the current YouTube data, and rows that YouTube
+// definitively reports as unavailable are deleted.
+//
+// Boundaries this handler deliberately keeps:
+//   * fetch() behavior, read-through /api/video TTL (VIDEO_INDEX_TTL_MS = 6
+//     minutes) and the feed/search architecture are untouched. 6 minutes is a
+//     serving freshness rule; 30 days is a retention rule. They never share
+//     state.
+//   * It reuses ONLY existing columns (metadata_fetched_at_ms,
+//     last_seen_at_ms, refresh_priority) and existing indexes
+//     (idx_videos_metadata_fetched_at_ms). No migration is required.
+//   * index_state stores one lightweight run summary, no queue.
+//   * At most MAINTENANCE_MAX_VIDEOS_PER_RUN (20) rows are chosen per run and
+//     at most one upstream videos.list request is made. A run never storms.
+//   * A missing/malformed binding makes the handler a no-op.
+//   * A transient upstream failure NEVER deletes a row; the next run retries
+//     it because candidates are always selected oldest-first.
+const MAINTENANCE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const MAINTENANCE_REFRESH_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const MAINTENANCE_MAX_VIDEOS_PER_RUN = 20;
+const MAINTENANCE_MAX_YT_REQUESTS_PER_RUN = 1;
+const MAINTENANCE_STATE_KEY = "maintenance:last_run";
+
+function createMaintenanceIndexContext(env) {
+  const db = env?.mytube_index;
+
+  if (!db || typeof db.prepare !== "function") {
+    return null;
   }
+
+  return { db };
+}
+
+async function recordMaintenanceRun(index, summary) {
+  if (!index) {
+    return;
+  }
+
+  try {
+    await index.db
+      .prepare(
+        "INSERT INTO index_state (key, value, updated_at_ms) VALUES (?, ?, ?) " +
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at_ms = excluded.updated_at_ms"
+      )
+      .bind(MAINTENANCE_STATE_KEY, JSON.stringify(summary), Date.now())
+      .run();
+  } catch (error) {
+    console.error("[mytube] D1 maintenance bookkeeping failed", error?.message || error);
+  }
+}
+
+// Oldest rows first, live rows and non-YouTube rows excluded, then keep only
+// rows inside the refresh window of the 30-day limit. Oldest-first ordering is
+// what makes a failed run resume safely: the next run re-selects from the same
+// head of the list, so no state/cursor is needed.
+async function selectMaintenanceCandidates(index, now) {
+  const result = await index.db
+    .prepare(
+      "SELECT source_id, video_id, metadata_fetched_at_ms FROM videos " +
+      "WHERE type = ? AND is_live != 1 " +
+      "ORDER BY metadata_fetched_at_ms ASC LIMIT ?"
+    )
+    .bind(VIDEO_TYPE_YOUTUBE, MAINTENANCE_MAX_VIDEOS_PER_RUN)
+    .all();
+
+  if (!result || !Array.isArray(result.results)) {
+    throw new Error("maintenance: candidate selection received no result set");
+  }
+
+  const threshold = now - (MAINTENANCE_RETENTION_MS - MAINTENANCE_REFRESH_WINDOW_MS);
+  const due = [];
+
+  for (const row of result.results) {
+    const fetchedAt = Number(row.metadata_fetched_at_ms);
+
+    if (!Number.isFinite(fetchedAt)) {
+      continue;
+    }
+
+    if (fetchedAt <= threshold) {
+      due.push(row);
+    }
+  }
+
+  return due;
+}
+
+// One maintenance pass. Returns a summary; never throws for an upstream
+// failure (that is recorded and retried next run).
+async function runIndexMaintenance(index, env, now = Date.now()) {
+  const summary = {
+    lastRun: now,
+    selected: 0,
+    refreshed: 0,
+    deleted: 0
+  };
+
+  const due = await selectMaintenanceCandidates(index, now);
+  summary.selected = due.length;
+
+  if (due.length === 0) {
+    return summary;
+  }
+
+  const byVideoId = new Map();
+
+  for (const row of due) {
+    const videoId = String(row.video_id || "").trim();
+
+    if (!videoId || !/^[A-Za-z0-9_-]{1,64}$/.test(videoId)) {
+      continue;
+    }
+
+    if (!byVideoId.has(videoId)) {
+      byVideoId.set(videoId, row);
+    }
+  }
+
+  const ids = [...byVideoId.keys()].slice(0, MAINTENANCE_MAX_VIDEOS_PER_RUN);
+
+  if (ids.length === 0) {
+    return summary;
+  }
+
+  // Exactly one upstream request per run. ytFetch stamps each returned item
+  // with the real arrival time (markFetchedAt), which is the timestamp that
+  // reaches metadata_fetched_at_ms. skipCache keeps this maintenance read out
+  // of the request-path response cache.
+  let result;
+
+  try {
+    result = await ytFetch(
+      "videos",
+      { part: VIDEO_PARTS_FULL, id: ids.join(",") },
+      env?.YOUTUBE_API_KEY,
+      { skipCache: true }
+    );
+  } catch (error) {
+    // Network, quota, rate limit, 5xx, ambiguous 403, missing/invalid key:
+    // every one of these is transient for retention purposes. Delete nothing;
+    // the same rows are re-selected next run.
+    summary.error = error?.type || error?.message || "upstream_error";
+    return summary;
+  }
+
+  const items = Array.isArray(result?.data?.items) ? result.data.items : [];
+  const returned = new Map();
+
+  for (const item of items) {
+    const videoId = typeof item?.id === "string" ? item.id.trim() : "";
+
+    if (videoId) {
+      returned.set(videoId, item);
+    }
+  }
+
+  const toUpsert = [];
+  const toDelete = [];
+
+  for (const videoId of ids) {
+    const item = returned.get(videoId);
+
+    if (item) {
+      // Still available: refreshing renews the 30-day window and resets
+      // refresh_priority to the schema default (0) through the existing upsert.
+      toUpsert.push(item);
+      continue;
+    }
+
+    // Absent from a SUCCESSFUL videos.list for an id we explicitly requested:
+    // definitive not-found/unavailable. Safe to delete. (A failed request
+    // never reaches here, so transient errors cannot delete.)
+    const sourceId = String(byVideoId.get(videoId)?.source_id || "").trim();
+
+    if (sourceId) {
+      toDelete.push(sourceId);
+    }
+  }
+
+  if (toUpsert.length > 0) {
+    await upsertVideos(index.db, toUpsert);
+    summary.refreshed = toUpsert.length;
+  }
+
+  for (const sourceId of toDelete) {
+    await index.db
+      .prepare("DELETE FROM videos WHERE source_id = ?")
+      .bind(sourceId)
+      .run();
+
+    summary.deleted += 1;
+  }
+
+  return summary;
+}
+
+export async function scheduled(event, env, ctx) {
+  const index = createMaintenanceIndexContext(env);
+
+  if (!index) {
+    return;
+  }
+
+  let summary;
+
+  try {
+    summary = await runIndexMaintenance(index, env);
+  } catch (error) {
+    summary = { lastRun: Date.now(), error: error?.message || "maintenance_failed" };
+    console.error("[mytube] D1 maintenance failed", error?.message || error);
+  }
+
+  await recordMaintenanceRun(index, summary);
+}
+
+export {
+  MAINTENANCE_RETENTION_MS,
+  MAINTENANCE_REFRESH_WINDOW_MS,
+  MAINTENANCE_MAX_VIDEOS_PER_RUN,
+  MAINTENANCE_MAX_YT_REQUESTS_PER_RUN,
+  runIndexMaintenance
 };
