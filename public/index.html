@@ -784,7 +784,11 @@ async function loadHomeFeed(){
     homeNextToken = "";
     homeVideos = [];
     searchSeq++;
-    box.replaceChildren();
+    // NOT cleared here on purpose. The server ships the first feed page's cards
+    // inside #videoList as real /watch?id=... links, so a crawler (and a human on
+    // a slow connection) sees content immediately. renderVideoList() replaces
+    // these children the moment live data arrives, so leaving them up costs
+    // nothing and avoids a visible content -> blank -> content flicker.
 
     if(!client){
         // The YouTube module is deferred (type="module"), so it may not be ready

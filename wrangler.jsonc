@@ -6,13 +6,17 @@
   "assets": {
     "directory": "public",
     "binding": "ASSETS",
-    // The Worker runs first only for the API and for the watch page. /watch needs
-    // it to render per-video <title>/canonical/og metadata into public/watch.html
-    // before the response leaves the edge; /watch.html is listed so the Worker can
-    // 301 the on-disk filename onto the canonical /watch URL. Every other asset
-    // (including watch.js itself, which is NOT matched by these exact paths) is
-    // still served straight from the asset binding without invoking the Worker.
-    "run_worker_first": ["/api/*", "/watch", "/watch.html"]
+    // The Worker runs first only for the API and for the two HTML pages it
+    // rewrites. /watch needs it to render per-video <title>/canonical/og
+    // metadata into public/watch.html before the response leaves the edge;
+    // /watch.html is listed so the Worker can 301 the on-disk filename onto the
+    // canonical /watch URL. / is listed so the Worker can inject the first feed
+    // page's watch links into public/index.html — a crawler that does not run JS
+    // otherwise sees an empty grid and no internal path to any video. Every other
+    // asset (including watch.js and index.html's own script tags, which are NOT
+    // matched by these exact paths) is still served straight from the asset
+    // binding without invoking the Worker.
+    "run_worker_first": ["/api/*", "/watch", "/watch.html", "/"]
   },
   "d1_databases": [
     {

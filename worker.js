@@ -2331,13 +2331,24 @@ async function handleAPI(request, env, ctx) {
 // have to be byte-identical strings, so they must be derived the same way.
 const WATCH_ORIGIN = "https://mytube.farqas007.workers.dev";
 
-// The one canonical form of a watch URL, in one place.
+// The site-relative form of a watch URL, in one place.
 //
 // `encodeURIComponent("yt:<sourceId>")` is the encoding convention shared with
 // public/watch.js (setVideoPageMeta) and scripts/generate-sitemap.mjs (watchUrl).
 // Keep all three identical or the sitemap and the page disagree again.
+//
+// Relative rather than absolute on purpose: this is what the homepage's own
+// buildCard() puts in an href, so a server-rendered card and a client-rendered
+// card are the same string, and the link keeps working on any host the site is
+// reached through (a preview deployment, not just the canonical origin).
+function watchPath(videoId) {
+  return `/watch?id=${encodeURIComponent(videoId)}`;
+}
+
+// The one canonical form of a watch URL, in one place. Derived from watchPath()
+// so the canonical and the hrefs on a page can never drift apart.
 function setVideoCanonical(videoId) {
-  return `${WATCH_ORIGIN}/watch?id=${encodeURIComponent(videoId)}`;
+  return `${WATCH_ORIGIN}${watchPath(videoId)}`;
 }
 
 // A YouTube video id is always exactly 11 URL-safe base64 characters.
@@ -2830,11 +2841,245 @@ function handleWatchHtml(url) {
   });
 }
 
+// -----------------------------------------------------------------------------
+// HOMEPAGE SERVER-RENDERED WATCH LINKS
+// -----------------------------------------------------------------------------
+// The homepage delivered an empty <main id="videoList">: every video card, and
+// therefore every internal link to a watch page, was created by JavaScript. A
+// crawler that does not execute JS saw a page with no path to any video at all.
+//
+// This renders the first pageful of the EXISTING homepage feed into that <main>
+// as ordinary <a href="/watch?id=…"> anchors, using the real videos the feed pool
+// already holds. What this deliberately does NOT do:
+//
+//   * Redesign the homepage. The markup is the same DOM buildCard() already
+//     produces (same classes, same thumbnail, same badge, same meta line), so the
+//     page is visually identical with JS on or off.
+//   * Change the feed. It renders getTrending()'s deterministic page — the exact
+//     call /api/trending?max=50 makes and the exact one scripts/generate-sitemap.mjs
+//     consumes, so the homepage, the sitemap and the watch canonical all name the
+//     same videos.
+//   * Add an upstream request. getTrending() reads the module-level feed pool,
+//     which is already cached for FEED_POOL_TTL_MS and already de-duplicates
+//     concurrent builds. The client's own /api/trending call a moment later hits
+//     that same warm pool. Worst case this change decides WHO pays for the first
+//     pool build per isolate per 15 minutes, never how many happen.
+//   * Spend rate-limit budget. There is deliberately no limiter here: the work is
+//     a cached map lookup, and unlike the watch-page render a crawler being
+//     refused the homepage would be a worse outcome than the cost of letting it in.
+//
+// Every failure mode returns the untouched asset, byte for byte, with its own
+// ETag and Cache-Control intact — so an unreachable YouTube, an exhausted quota, a
+// dead D1 or a future edit to index.html degrades to exactly today's behaviour
+// rather than to a broken page. Nothing is ever fabricated: an empty pool simply
+// produces no links.
+const HOMEPAGE_FEED_ID = "videoList";
+
+// The server-rendered first pageful. Deliberately the same 12 the client asks
+// for in loadHomeFeed(), so the grid does not visibly resize when hydration
+// replaces these cards with the live ones.
+const HOMEPAGE_SSR_VIDEO_COUNT = 12;
+
+// The SSR body is a point-in-time snapshot of a pool that lives
+// FEED_POOL_TTL_MS (15 min). A short edge lifetime plus SWR means the stored HTML
+// can trail the pool by at most one stale window, and every link in it is still a
+// real, currently-popular video — so a few minutes of staleness is free.
+// Browsers always revalidate, exactly as the untouched asset does.
+const HOMEPAGE_HTML_CACHE_CONTROL =
+  "public, max-age=0, s-maxage=300, stale-while-revalidate=600";
+
+// The `<main id="videoList">` the cards go into, captured with its current
+// contents so a second render (or a hand-edited file that already has cards)
+// replaces rather than appends. Returns null when the anchor is absent, which is
+// the signal to serve the shell untouched.
+function homepageFeedContainerRe() {
+  return new RegExp(
+    `(<main\\b[^>]*\\bid="${escapeRegExp(HOMEPAGE_FEED_ID)}"[^>]*>)[\\s\\S]*?(</main>)`,
+    "i"
+  );
+}
+
+// The card meta line, mirroring cardMeta() in public/index.html so the
+// server-rendered and client-rendered cards read identically.
+function homepageCardMeta(video) {
+  return [video.channel, video.views, video.topic].filter(Boolean).join(" • ");
+}
+
+// One card, in the exact shape buildCard() produces.
+//
+// An <img> is emitted only for a real absolute http(s) URL and a <span> badge
+// only when there is a duration, so a partial payload yields a smaller card
+// instead of a broken image or an empty badge. Every interpolated value goes
+// through escapeHtml(), which covers both text nodes and double-quoted
+// attributes.
+function renderHomepageCard(video) {
+  const parts = [`<div class="card">`, `<div class="thumb">`];
+
+  if (isHttpUrl(video.thumb)) {
+    parts.push(
+      `<img src="${escapeHtml(video.thumb)}" alt="${escapeHtml(video.title)}" loading="lazy" decoding="async">`
+    );
+  }
+
+  if (video.time) {
+    parts.push(`<span>${escapeHtml(video.time)}</span>`);
+  }
+
+  parts.push(`</div>`);
+
+  parts.push(
+    `<h3><a class="card-title-link" href="${escapeHtml(watchPath(video.id))}">${escapeHtml(video.title)}</a></h3>`
+  );
+
+  const meta = homepageCardMeta(video);
+
+  if (meta) {
+    parts.push(`<p>${escapeHtml(meta)}</p>`);
+  }
+
+  parts.push(`</div>`);
+
+  return parts.join("");
+}
+
+// The cards for one feed page, skipping anything that is not a resolvable
+// /watch?id=... URL. `watchSourceId()` is the same gate the watch page applies,
+// so the homepage can never advertise a link that page would answer noindex.
+//
+// Duplicate ids are collapsed as well: the pool is region-merged, and a link that
+// appears twice is a link a crawler wastes a fetch on.
+function renderHomepageCards(videos) {
+  const seen = new Set();
+  const cards = [];
+
+  for (const video of Array.isArray(videos) ? videos : []) {
+    const id = String(video?.id || "");
+    const sourceId = watchSourceId(id);
+
+    if (!sourceId || seen.has(sourceId)) {
+      continue;
+    }
+
+    seen.add(sourceId);
+    cards.push(renderHomepageCard(video));
+  }
+
+  return cards;
+}
+
+// Rebuild the asset response around a modified body.
+//
+// Same contract as watchHtmlResponse(): the shell's own headers are kept so the
+// page's header surface is unchanged, and Content-Encoding/Content-Length/ETag
+// are dropped because the bytes no longer match the asset that was read. Unlike
+// the watch page this response DOES keep flowing through withSecurityHeaders(),
+// because the homepage has always had that header set.
+//
+// This is only ever called when cards were actually injected. When they were not,
+// homepageUnmodifiedResponse() is used instead.
+function homepageHtmlResponse(shell, html) {
+  const headers = new Headers(shell.headers);
+
+  headers.delete("Content-Encoding");
+  headers.delete("Content-Length");
+  headers.delete("ETag");
+  headers.set("Content-Type", "text/html; charset=utf-8");
+  headers.set("Cache-Control", HOMEPAGE_HTML_CACHE_CONTROL);
+
+  return new Response(html, {
+    status: shell.status,
+    statusText: shell.statusText,
+    headers
+  });
+}
+
+// The render found nothing to inject but the shell body had to be read to find
+// that out (the container is gone). The bytes are byte-identical to the asset, so
+// every header the asset set still describes them — ETag and Content-Length
+// included — and are deliberately left alone.
+function homepageUnmodifiedResponse(shell, html) {
+  return new Response(html, {
+    status: shell.status,
+    statusText: shell.statusText,
+    headers: new Headers(shell.headers)
+  });
+}
+
+// GET / — the homepage, with the first feed page's watch links in the HTML.
+//
+// Non-GET is not ours to interpret and is handed straight to the asset binding.
+// HEAD is too: there is no body to fill in, so it stays a bodiless asset read
+// rather than paying for a pool lookup nobody will see the result of.
+async function handleHomepagePage(request, env, ctx, url) {
+  if (request.method !== "GET") {
+    return env.ASSETS.fetch(request);
+  }
+
+  // Requested by its real asset path rather than by `/`, so this handler does
+  // not depend on the static binding's html_handling setting — the same reason
+  // handleWatchPage fetches /watch.html rather than /watch.
+  const shell = await env.ASSETS.fetch(
+    new Request(`${url.origin}/index.html`, { method: "GET" })
+  );
+
+  if (!shell.ok) {
+    return shell;
+  }
+
+  let videos = [];
+
+  try {
+    const index = createIndexContext(ctx, env);
+    const page = await getTrending(
+      String(HOMEPAGE_SSR_VIDEO_COUNT),
+      "",
+      env.YOUTUBE_API_KEY || "",
+      null,
+      // seed "" is the deterministic pool order — the same page /api/trending
+      // returns to the sitemap generator and the rest of the repo.
+      { seed: "", topic: "", index }
+    );
+
+    videos = renderHomepageCards(page?.videos);
+  } catch (error) {
+    console.error(
+      "[mytube] homepage links skipped",
+      error?.message || error
+    );
+
+    videos = [];
+  }
+
+  // Checked BEFORE the body is read: this branch hands back the shell's own
+  // unread body, ETag and all, so a failed render is indistinguishable from a
+  // page that was never touched.
+  if (!videos.length) {
+    return shell;
+  }
+
+  const html = await shell.text();
+  const container = homepageFeedContainerRe();
+  const match = container.exec(html);
+
+  // A future edit to index.html that moves or renames the container degrades to
+  // "no server-rendered links" instead of a page whose markup was mangled.
+  if (!match) {
+    return homepageUnmodifiedResponse(shell, html);
+  }
+
+  const out = html.replace(
+    container,
+    () => `${match[1]}${videos.join("")}${match[2]}`
+  );
+
+  return homepageHtmlResponse(shell, out);
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // The two watch routes answer for themselves and return early: the watch
+    // The three HTML routes answer for themselves and return early: the watch
     // HTML deliberately keeps the header surface the static ASSETS binding gives
     // it, so it must not be run through withSecurityHeaders() (see the section
     // comment above). Anything else — /api/* and every other asset — is
@@ -2845,6 +3090,13 @@ export default {
 
     if (url.pathname === "/watch.html") {
       return handleWatchHtml(url);
+    }
+
+    // The homepage is rendered here but keeps the asset binding's own headers and
+    // still gets the security header set, so wrapping it is exactly equivalent to
+    // the plain ASSETS passthrough it used to be.
+    if (url.pathname === "/") {
+      return withSecurityHeaders(await handleHomepagePage(request, env, ctx, url));
     }
 
     const response = url.pathname.startsWith("/api/")
