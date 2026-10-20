@@ -349,6 +349,12 @@ function videoFromIndexRow(row) {
     date: formatPublishedDate(
       Number.isFinite(publishedAtMs) ? publishedAtMs : null
     ),
+    // Raw RFC 3339 instant, the same slot and type normalizeSearchItem() emits.
+    // The row already stores the exact epoch, so an index-served video carries
+    // the identical publishedAt a fresh videos.list response would produce.
+    publishedAt: formatIndexedTimestamp(
+      Number.isFinite(publishedAtMs) ? publishedAtMs : null
+    ),
     description: String(row.description || ""),
     embeddable,
     isLive: Number(row.is_live) === 1,
@@ -3080,16 +3086,16 @@ export default {
     const url = new URL(request.url);
 
     // The three HTML routes answer for themselves and return early: the watch
-    // HTML deliberately keeps the header surface the static ASSETS binding gives
-    // it, so it must not be run through withSecurityHeaders() (see the section
-    // comment above). Anything else — /api/* and every other asset — is
-    // completely unchanged.
+    // HTML was previously served without withSecurityHeaders() by design, but
+    // the same security header set used by the homepage and other assets is now
+    // applied to /watch and /watch.html to close the header gap. Anything else —
+    // /api/* and every other asset — is completely unchanged.
     if (url.pathname === "/watch") {
-      return handleWatchPage(request, env, ctx, url);
+      return withSecurityHeaders(await handleWatchPage(request, env, ctx, url));
     }
 
     if (url.pathname === "/watch.html") {
-      return handleWatchHtml(url);
+      return withSecurityHeaders(handleWatchHtml(url));
     }
 
     // The homepage is rendered here but keeps the asset binding's own headers and

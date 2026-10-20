@@ -203,6 +203,11 @@ function normalizeSearchItem(item, details = null) {
     likeCount,
     commentCount,
     date: formatPublishedDate(snippet.publishedAt),
+    // Raw RFC 3339 publication instant, kept alongside the human "3d ago" string
+    // so clients can sort (e.g. the unified Subscriptions Feed) without reverse-
+    // engineering the lossy label. "" when the upstream item carries none —
+    // never null/undefined, so the key is always present and always a string.
+    publishedAt: snippet.publishedAt || "",
     description: snippet.description || "",
     embeddable: status.embeddable !== false,
     isLive: live.isLive,

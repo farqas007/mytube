@@ -728,6 +728,7 @@ function renderYtSubViews(v){
 async function loadYoutubeChannel(channelId){
     const subsEl = document.getElementById("channelSubs");
     const link = document.getElementById("ytChannelLink");
+    const mytubeChannelLink = document.getElementById("myTubeChannelLink");
     if(!subsEl || !channelId){
         return;
     }
@@ -760,6 +761,13 @@ async function loadYoutubeChannel(channelId){
     if(link){
         link.href = "https://www.youtube.com/channel/" + encodeURIComponent(channelId);
         link.setAttribute("aria-label", "Open " + (c ? c.title : "channel") + " on YouTube");
+    }
+    // MyTube's own channel page for the same channel. Kept separate from the
+    // external YouTube link above so both entry points stay available.
+    if(mytubeChannelLink){
+        mytubeChannelLink.href = "/channel.html?id=" + encodeURIComponent(channelId);
+        mytubeChannelLink.setAttribute("aria-label", "View " + (c ? c.title : "channel") + " on MyTube");
+        mytubeChannelLink.style.display = "";
     }
 }
 

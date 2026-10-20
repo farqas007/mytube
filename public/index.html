@@ -288,6 +288,10 @@ function buildCard(v){
     thumb.appendChild(img);
     thumb.appendChild(badge);
 
+    // Desktop-only muted hover preview. Wired here, but nothing is fetched
+    // until a qualifying hover actually happens (see shared/hoverPreview.js).
+    attachHoverPreviewHere(thumb, v.id);
+
     // Real anchor so crawlers can follow the title into the watch page. The
     // heading text is unchanged; only the wrapper is new, and the card's own
     // click/keyboard handlers still fire because the click bubbles up to them.
@@ -576,6 +580,40 @@ function renderVideoList(list){
     if(noResultsEl){
         noResultsEl.style.display = (activeFilter && list.length === 0) ? "block" : "none";
     }
+}
+
+// Attach the shared desktop hover preview to a card thumbnail.
+//
+// The homepage's card renderer is an inline (parse-time) script, but the helper
+// arrives with a deferred module, so an early render can happen before it
+// exists. In that case the video id is remembered on the element and replayed
+// when the module announces readiness (see mytube-hover-ready below), so no
+// card is ever permanently left without a preview.
+function attachHoverPreviewHere(thumb, videoId){
+    if(!thumb || !videoId){
+        return;
+    }
+    thumb.dataset.hoverPreviewId = videoId;
+    applyHoverPreviewHere(thumb);
+}
+
+function applyHoverPreviewHere(thumb){
+    const helper = window.MyTubeHoverPreview;
+    if(!helper || typeof helper.attachHoverPreview !== "function"){
+        return false;
+    }
+    const videoId = thumb.dataset.hoverPreviewId;
+    if(!videoId){
+        return false;
+    }
+    helper.attachHoverPreview(thumb, videoId);
+    return true;
+}
+
+// Once the module is loaded, finish wiring any cards rendered before it arrived.
+function applyHoverPreviewsToRenderedCards(){
+    const thumbs = document.querySelectorAll(".thumb[data-hover-preview-id]");
+    thumbs.forEach(applyHoverPreviewHere);
 }
 
 // Build the card's meta text once (works for local and youtube cards).
@@ -1188,6 +1226,9 @@ makeSideItemInteractive(sideLikedVideos, () => {
         applySearchFilterCatalogues();
         buildSearchFilters();
     });
+    // The hover-preview helper also ships in a deferred module, so re-attach it
+    // to any cards this initial render produced.
+    window.addEventListener("mytube-hover-ready", applyHoverPreviewsToRenderedCards, { once: true });
 })();
 
 
@@ -1243,6 +1284,14 @@ window.MyTubeYouTube = {
   SEARCH_DURATION_OPTIONS: SEARCH_DURATION_OPTIONS,
   SEARCH_UPLOAD_DATE_OPTIONS: SEARCH_UPLOAD_DATE_OPTIONS
 };
+// Desktop thumbnail hover preview (muted embed), shared with the subscriptions
+// and channel pages. Exposed on window because the homepage's own card renderer
+// is an inline (non-module) script.
+import { attachHoverPreview } from "./shared/hoverPreview.js";
+window.MyTubeHoverPreview = { attachHoverPreview: attachHoverPreview };
+// Cards may already have been rendered by the inline script before this module
+// executed, so announce the helper's arrival and let the page finish wiring.
+window.dispatchEvent(new Event("mytube-hover-ready"));
 // Signal readiness. This module is deferred, so the inline homepage script may
 // have already run its initial render before this executes; it listens for this
 // event to retry dynamic loading (search + home discovery) with the client set.

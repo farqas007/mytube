@@ -1063,19 +1063,21 @@ test("F5 a non-GET/HEAD /watch is handed to the binding", async () => {
   assert.equal(response.status, 200);
 });
 
-test("F6 the watch HTML deliberately keeps the asset header surface", async () => {
-  // The watch page is served by the ASSETS binding and has never gone through
-  // withSecurityHeaders(), so it carries none of that header set. That is
-  // intentional and must stay pinned: putting a CSP on /watch for the first
-  // time would newly restrict the Firebase module graph the page loads
-  // (watch.js -> firebase.js), which is a security-posture change, not a
-  // rendering one.
+test("F6 the watch HTML carries the full security header set", async () => {
+  // The watch page is rendered by the Worker and now goes through
+  // withSecurityHeaders() like the homepage and every other asset, so it must
+  // carry the whole security header set. This is the complement of
+  // tests/testWorkerIndex.js A4 and tests/testHomepageLinks.js D2: all three
+  // pin the same hardened surface, so a refactor that drops a header on any one
+  // of them fails here instead of silently shipping a weaker page.
   //
-  // tests/testWorkerIndex.js asserts the opposite for /api/*, so the two suites
-  // together pin which endpoints get the hardening and which deliberately do
-  // not. This test documents the exemption so a future refactor that routes
-  // /watch through withSecurityHeaders() fails here instead of silently
-  // breaking the module graph in production.
+  // The old version of this test pinned the OPPOSITE (no CSP on /watch) on the
+  // theory that a CSP would restrict the Firebase module graph the page loads
+  // (watch.js -> firebase.js, both importing the SDK from gstatic). That theory
+  // does not hold for the CSP this project actually ships, which already allows
+  // the graph: script-src permits https://www.gstatic.com and connect-src
+  // permits the Firebase auth/Firestore endpoints. Both are asserted below so
+  // the allow-list cannot regress into a load-bearing omission.
   const sourceId = nextSourceId();
 
   await withYouTube(videoResponder(sourceId, videoItem(sourceId)), async () => {
@@ -1086,8 +1088,18 @@ test("F6 the watch HTML deliberately keeps the asset header surface", async () =
     );
 
     assert.equal(response.status, 200);
-    assert.equal(response.headers.get("Content-Security-Policy"), null);
-    assert.equal(response.headers.get("X-Frame-Options"), null);
+
+    const csp = response.headers.get("Content-Security-Policy") || "";
+    assert.match(csp, /default-src 'self'/);
+    // The Firebase SDK the watch page imports is served from gstatic, so
+    // script-src must keep allowing it.
+    assert.match(csp, /script-src[^;]*https:\/\/www\.gstatic\.com/);
+    // Firestore is where every per-user write lands, so connect-src must keep
+    // allowing it.
+    assert.match(csp, /connect-src[^;]*https:\/\/firestore\.googleapis\.com/);
+
+    assert.equal(response.headers.get("X-Frame-Options"), "SAMEORIGIN");
+    assert.equal(response.headers.get("X-Content-Type-Options"), "nosniff");
   });
 });
 

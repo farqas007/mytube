@@ -98,7 +98,24 @@ Refresh
 </button>
 </div>
 
+<!-- View toggle: Feed is the unified newest-first list; Channels preserves the
+     per-channel shelves. Both read the same cached channel data. -->
+<div class="lib-tabs" role="tablist" aria-label="Subscriptions view">
+<button id="subsViewFeed" type="button" class="lib-tab active" role="tab" aria-selected="true">Feed</button>
+<button id="subsViewChannels" type="button" class="lib-tab" role="tab" aria-selected="false">Channels</button>
+</div>
+
+<!-- FEED VIEW -->
+<div id="feedView">
+<p id="feedStatus" class="feed-status" role="status" aria-live="polite"></p>
+<div id="subscriptionsFeed" class="channel-section-grid"></div>
+<button id="feedMoreBtn" type="button" class="load-more" style="display:none;">Load more</button>
+</div>
+
+<!-- SHELVES VIEW (preserved as-is; hidden by default) -->
+<div id="shelvesView" hidden>
 <div id="channelSections" class="channel-sections"></div>
+</div>
 
 </div>
 

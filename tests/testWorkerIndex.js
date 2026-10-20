@@ -478,6 +478,15 @@ test("B2 the index-served DTO keeps the exact canonical shape", async () => {
     assert.equal(body.video.isLive, false);
     assert.equal(body.video.embeddable, true);
     assert.match(body.video.date, /y ago|mo ago/);
+
+    // publishedAt is the raw instant the feed sorts on, and an index-served
+    // video must carry the byte-identical string a fresh videos.list response
+    // would — the row stores the same snippet.publishedAt.
+    assert.equal(body.video.publishedAt, "2024-03-05T10:11:12Z");
+    assert.equal(
+      body.video.publishedAt,
+      normalizeVideoItem(item).publishedAt
+    );
   });
 });
 

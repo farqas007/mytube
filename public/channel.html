@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<meta name="robots" content="noindex, follow">
+
+<title>Channel - MyTube</title>
+
+<link rel="icon" type="image/png" href="mytube-icon.png">
+
+<link rel="stylesheet" href="style.css">
+
+</head>
+
+
+<body>
+
+
+<header>
+
+<div class="logo">
+MyTube 🔴
+</div>
+
+
+<input 
+id="search"
+placeholder="Search videos..."
+aria-label="Search videos"
+>
+
+
+<button type="button" class="voice-search-btn" aria-label="Search with your voice" aria-pressed="false" title="Search with your voice">
+<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"></path><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"></path></svg>
+</button>
+
+<button type="button" onclick="goHome()">
+Home
+</button>
+
+<button id="loginBtn" type="button">
+Login
+</button>
+
+<button id="logoutBtn" type="button" style="display:none;">
+Logout
+</button>
+
+</header>
+
+
+<div class="watch-container profile-container">
+
+
+<!-- INVALID / MISSING ID -->
+<div id="channelInvalid" class="state-panel" style="display:none;">
+<h2>Channel not found</h2>
+<p>The channel link is missing a valid channel id.</p>
+<button type="button" class="back-home" onclick="goHome()">Browse Videos</button>
+</div>
+
+
+<!-- LOADING STATE -->
+<div id="channelLoading" class="state-panel" style="display:none;">
+<div class="spinner"></div>
+<p>Loading channel...</p>
+</div>
+
+
+<!-- ERROR STATE -->
+<div id="channelError" class="state-panel" style="display:none;">
+<h2>Something went wrong</h2>
+<p id="channelErrorText">Could not load this channel.</p>
+<button type="button" class="back-home" onclick="goHome()">Back to Home</button>
+</div>
+
+
+<!-- EMPTY STATE -->
+<div id="channelEmpty" class="state-panel" style="display:none;">
+<h2>No videos found</h2>
+<p>This channel has no public videos available right now.</p>
+<button type="button" class="back-home" onclick="goHome()">Browse Videos</button>
+</div>
+
+
+<!-- CONTENT -->
+<div id="channelContent" class="profile-content" style="display:none;">
+
+<div class="channel-section">
+
+<div class="channel-section-header">
+
+<div id="channelPageAvatar" class="channel-avatar" aria-hidden="true"></div>
+
+<div class="channel-section-info">
+<h3 id="channelPageName">Loading channel...</h3>
+<p id="channelPageSubs" class="channel-section-subs">&nbsp;</p>
+</div>
+
+<button 
+id="channelPageSubscribeBtn"
+type="button"
+class="channel-section-unsub"
+aria-label="Subscribe to channel"
+aria-pressed="false">
+Subscribe
+</button>
+
+</div>
+
+<p id="channelPageStatus" class="action-msg" role="status" aria-live="polite"></p>
+
+<div class="subs-toolbar">
+<h2>Videos</h2>
+<select id="channelSort" class="search-filter-select" aria-label="Sort channel videos">
+<option value="newest">Newest</option>
+<option value="oldest">Oldest</option>
+</select>
+</div>
+
+<div id="channelVideoGrid" class="channel-section-grid"></div>
+
+<button id="channelMoreBtn" type="button" class="load-more" style="display:none;">
+Load more
+</button>
+
+</div>
+
+</div>
+
+
+</div>
+
+
+<script>
+
+function goHome(){
+    window.location.href = "index.html";
+}
+
+function goLogin(){
+    window.location.href = "login.html";
+}
+
+function searchVideo(){
+    const raw = document.getElementById("search").value;
+    const query = raw.trim();
+    if(!query) return;
+    window.location.href = "index.html?q=" + encodeURIComponent(query);
+}
+
+document.getElementById("search")?.addEventListener("keydown",(e)=>{
+    if(e.key === "Enter"){
+        searchVideo();
+    }
+});
+
+</script>
+
+<script type="module" src="auth.js"></script>
+<script type="module" src="channel.js"></script>
+
+<!-- Voice search (progressive enhancement; no-op where Speech Recognition is unsupported) -->
+<script src="voice-search.js"></script>
+
+
+</body>
+
+</html>
