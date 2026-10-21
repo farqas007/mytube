@@ -1,5 +1,7 @@
 # Secrets — never commit or serve these
-.env
+.env*
+!.env.example
+.dev.vars*
 
 # Node
 node_modules/
@@ -14,7 +16,7 @@ Thumbs.db
 videos/
 
 # Local backup files
-youtube-server/server.js.backup-*
+youtube-server/server.js.backup*
 
 # Wrangler local state
 .wrangler/

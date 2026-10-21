@@ -2465,7 +2465,13 @@ async function handleOAuthCallback(request, env, url) {
   // carry a verified Firebase token, and it binds the grant to that verified
   // uid. See consumeOauthState().
   const now = Date.now();
-  const row = await consumeOauthState(db, state, now);
+  let row;
+
+  try {
+    row = await consumeOauthState(db, state, now);
+  } catch {
+    return oauthLandingRedirect(OAUTH_LANDING_STATUS.error);
+  }
 
   if (!row) {
     // Missing, already consumed (replay), or expired — all refused identically.
