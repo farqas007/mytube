@@ -1592,6 +1592,72 @@ function liveChatRateLimitAllowed(request) {
   return bucket.count <= LIVE_CHAT_RATE_MAX_PER_WINDOW;
 }
 
+// --- OAuth route rate limiting ---------------------------------------------
+//
+// The OAuth routes are dispatched BEFORE the shared general limiter (see
+// handleAPI), so without this they would be entirely unmetered. This is a
+// best-effort, per-IP, in-memory limiter in the same style as
+// liveChatRateLimitAllowed: enforcement is per Worker isolate and therefore
+// approximate, not global.
+//
+// THRESHOLDS ARE PROVISIONAL. They are deliberately conservative starting
+// values, chosen so a normal connect -> consent -> callback -> status ->
+// disconnect flow (well under ten requests in total) is never throttled. They
+// have not been tuned against real traffic.
+const OAUTH_RATE_WINDOW_MS = 5 * 60 * 1000;
+
+// Per-IP, per-route budget per window. Each route keeps its OWN counter, so
+// traffic on one route can never consume another route's allowance (e.g. a
+// burst of /api/oauth/status polls must not eat the /api/oauth/start budget).
+// /callback is the most exposed (it is hit by a header-less browser redirect
+// and can be retried), so it gets the tighter budget of the four while still
+// allowing a failed consent plus a retry.
+const OAUTH_RATE_MAX_PER_WINDOW = Object.freeze({
+  "oauth/start": 10,
+  "oauth/callback": 20,
+  "oauth/status": 60,
+  "oauth/disconnect": 10
+});
+
+const oauthRateBuckets = new Map();
+
+function oauthRateLimitAllowed(request, route) {
+  const max = OAUTH_RATE_MAX_PER_WINDOW[route];
+
+  // Only the known OAuth routes are metered; anything else in the oauth/ prefix
+  // falls through to the 404 handler unmetered, matching prior behavior.
+  if (!max) {
+    return true;
+  }
+
+  const ip = clientIp(request);
+  // One counter per (IP, route) pair. JSON.stringify gives a collision-safe
+  // key: the two parts are unambiguously separated, so an IP that happens to
+  // contain a separator can never collide with another IP or route.
+  const bucketKey = JSON.stringify([ip, route]);
+  const now = Date.now();
+  const bucket = oauthRateBuckets.get(bucketKey) || { count: 0, windowStart: now };
+
+  if (now - bucket.windowStart >= OAUTH_RATE_WINDOW_MS) {
+    bucket.count = 0;
+    bucket.windowStart = now;
+  }
+
+  bucket.count++;
+  oauthRateBuckets.set(bucketKey, bucket);
+
+  if (oauthRateBuckets.size > 5000) {
+    // Crude but effective: drop any entry whose window has fully expired.
+    for (const [key, entry] of oauthRateBuckets) {
+      if (now - entry.windowStart >= OAUTH_RATE_WINDOW_MS) {
+        oauthRateBuckets.delete(key);
+      }
+    }
+  }
+
+  return bucket.count <= max;
+}
+
 function clampPollingInterval(value) {
   const interval = Number(value);
 
@@ -2709,6 +2775,18 @@ async function handleAPI(request, env, ctx) {
   if (route.startsWith("oauth/")) {
     if (request.method === "OPTIONS") {
       return oauthPreflight(request);
+    }
+
+    // Best-effort per-IP metering, applied before any handler work (no D1, no
+    // crypto, no network). OPTIONS preflight has already returned above so it
+    // is never throttled. See oauthRateLimitAllowed for the provisional limits.
+    if (!oauthRateLimitAllowed(request, route)) {
+      return oauthError(
+        "Too many requests. Please slow down and try again shortly.",
+        "RATE_LIMITED",
+        429,
+        request
+      );
     }
 
     return handleOAuthRoute(request, env, url, route);
