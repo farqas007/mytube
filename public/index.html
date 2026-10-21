@@ -27,6 +27,7 @@
 <link rel="icon" type="image/png" href="mytube-icon.png">
 
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="shared/accountMenu.css">
 
 </head>
 
@@ -174,6 +175,34 @@ Logout
         </p>
         </a>
 
+        <div class="sidebar-divider"></div>
+
+        <p class="sidebar-section-title">
+            <span>Legal</span>
+        </p>
+
+        <a class="sidebar-nav-link" href="/privacy">
+        <p class="sidebar-item">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 3 5 6v5c0 4.4 3 8.4 7 10 4-1.6 7-5.6 7-10V6l-7-3Z"></path>
+                <path d="M9.5 12.5 11 14l3.5-3.5"></path>
+            </svg>
+            <span>Privacy Policy</span>
+        </p>
+        </a>
+
+        <a class="sidebar-nav-link" href="/terms">
+        <p class="sidebar-item">
+            <svg class="sidebar-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M7 3h7l4 4v14H7z"></path>
+                <path d="M14 3v4h4"></path>
+                <path d="M10 12h6"></path>
+                <path d="M10 16h6"></path>
+            </svg>
+            <span>Terms of Service</span>
+        </p>
+        </a>
+
     </nav>
 
 </aside>
@@ -220,6 +249,18 @@ No videos found 😕
      renderVideoList()'s replaceChildren() can never delete it. Watched by the
      same single IntersectionObserver to load the next search page. -->
 <div id="searchScrollSentinel" aria-hidden="true"></div>
+
+
+<!-- Site footer: keeps the Privacy Policy and Terms of Service discoverable
+     from the homepage, as required for the Google OAuth brand/verification
+     review. Styled with existing classes only (no new CSS). -->
+<footer class="site-footer" style="padding:24px 20px 40px;color:#aaa;font-size:13px;">
+<nav aria-label="Site information" style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;">
+<a href="privacy.html" style="color:#aaa;">Privacy Policy</a>
+<span aria-hidden="true">·</span>
+<a href="terms.html" style="color:#aaa;">Terms of Service</a>
+</nav>
+</footer>
 
 
 </div>
@@ -1259,6 +1300,9 @@ function applySearchFilterCatalogues(){
 <!-- Firebase Auth -->
 
 <script type="module" src="auth.js"></script>
+
+<!-- Top-right account menu + cached notifications (additive, no fetch) -->
+<script type="module" src="shared/accountMenu.js"></script>
 
 
 <!-- Phase 7: YouTube dynamic discovery (backend proxy client) -->

@@ -1410,6 +1410,7 @@ const liveChatState = {
     status: null,
     meta: null,
     badge: null,
+    attrib: null,
     // Id of the video whose chat we are currently following.
     sourceId: "",
     // Message ids already rendered, so a re-poll or an overlapping server delta
@@ -1445,9 +1446,35 @@ function liveChatEls(){
         liveChatState.status = document.getElementById("liveChatStatus");
         liveChatState.meta = document.getElementById("liveChatMeta");
         liveChatState.badge = document.getElementById("liveChatBadge");
+        liveChatState.attrib = document.getElementById("liveChatAttrib");
     }
 
     return liveChatState;
+}
+
+
+// Point the attribution link at THIS stream's chat instead of YouTube's generic
+// live-chat landing page. YouTube's supported live-chat URL accepts the video id
+// as `?v=<id>`, so the link is only rewritten once a REAL video id is known -
+// never blindly. With no valid id the href is left as the generic fallback.
+function liveChatSetAttrib(sourceId){
+    const els = liveChatEls();
+
+    if(!els.attrib){
+        return;
+    }
+
+    const id = String(sourceId || "").trim();
+
+    // Video ids are [A-Za-z0-9_-]{1,64} (the same shape the backend accepts).
+    if(/^[A-Za-z0-9_-]{1,64}$/.test(id)){
+        els.attrib.href = "https://www.youtube.com/live_chat?v=" + encodeURIComponent(id);
+        els.attrib.setAttribute("aria-label", "Open this stream's chat on YouTube");
+    }
+    else{
+        els.attrib.href = "https://www.youtube.com/live_chat";
+        els.attrib.removeAttribute("aria-label");
+    }
 }
 
 
@@ -1721,6 +1748,10 @@ function liveChatStop(hidePanel){
     if(hidePanel && liveChatState.panel){
         liveChatState.panel.hidden = true;
     }
+
+    // Never leave a previous stream's chat link behind once we are no longer
+    // following that stream.
+    liveChatSetAttrib("");
 }
 
 
@@ -1790,6 +1821,8 @@ function liveChatStart(sourceId, isLive){
     liveChatState.sourceId = sourceId;
 
     els.panel.hidden = false;
+    // Aim the "Chat provided by YouTube" link at this exact stream.
+    liveChatSetAttrib(sourceId);
     liveChatSetBadge("LIVE", false);
     liveChatSetMeta("");
     liveChatSetStatus("Connecting to live chat...");
@@ -1849,6 +1882,25 @@ function liveChatStart(sourceId, isLive){
 
         if(result.chatStatus === "ended" || result.chatStatus === "disabled" || result.chatStatus === "not_found"){
             liveChatFinish(result.chatStatus);
+            return;
+        }
+
+        // Live, but YouTube reports no active chat: the broadcaster has chat
+        // off, or the chat has not opened yet. Say so plainly instead of waiting
+        // forever behind a "waiting" message; keep a slow poll in case it opens.
+        if(result.chatStatus === "no_chat"){
+            if(els2.list && els2.list.childElementCount === 0){
+                liveChatSetStatus(
+                    "Live chat is turned off for this broadcast, or has not started yet."
+                );
+            }
+            liveChatState.timer = setTimeout(poll, 15000);
+            return;
+        }
+
+        // The broadcast stopped being live between renders.
+        if(result.chatStatus === "not_live"){
+            liveChatFinish("ended");
             return;
         }
 

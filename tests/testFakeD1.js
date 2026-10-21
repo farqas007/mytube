@@ -89,7 +89,8 @@ test("fake-d1 loads the same migrations the deployed D1 has", async () => {
   assert.deepEqual(files, [
     "0001_init.sql",
     "0002_video_id_lookup_index.sql",
-    "0003_fts_tokenizer.sql"
+    "0003_fts_tokenizer.sql",
+    "0004_oauth.sql"
   ]);
   assert.equal((await db.prepare("SELECT COUNT(*) AS c FROM videos").first()).c, 0);
   db.close();

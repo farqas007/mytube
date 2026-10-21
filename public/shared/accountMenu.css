@@ -1,0 +1,327 @@
+/* ================= ACCOUNT MENU + NOTIFICATIONS ================= */
+/* Additive top-right cluster injected by shared/accountMenu.js.
+   Loaded by EVERY page that renders a <header> — including watch.html and
+   profile.html, which do not load style.css. Every selector is namespaced
+   `mytube-` so no existing header rule or page style is affected. */
+
+.mytube-account-area{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    margin-left:auto;
+    position:relative;
+}
+
+.mytube-menu{
+    position:relative;
+}
+
+.mytube-icon-btn{
+    position:relative;
+    background:none;
+    border:none;
+    color:#e5e5e5;
+    width:40px;
+    height:40px;
+    padding:0;
+    border-radius:50%;
+    font-size:20px;
+    line-height:1;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    cursor:pointer;
+    flex-shrink:0;
+    transition:background .2s;
+}
+
+.mytube-icon-btn:hover{
+    background:rgba(255,255,255,.12);
+}
+
+.mytube-icon-btn:focus-visible,
+.mytube-avatar-btn:focus-visible,
+.mytube-menu-item:focus-visible,
+.mytube-mark-read:focus-visible,
+.mytube-avatar-feedback:focus-visible{
+    outline:2px solid red;
+    outline-offset:2px;
+}
+
+/* The local profile picture sits on top of the initials inside the same button;
+   the initials stay in the DOM as the fallback and are simply covered. */
+.mytube-avatar-img{
+    position:absolute;
+    inset:0;
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    border-radius:50%;
+    display:block;
+}
+
+.mytube-avatar-btn.mytube-has-avatar .mytube-avatar-initials{
+    visibility:hidden;
+}
+
+/* The native <input type=file> is driven by the menu item, never shown, and
+   kept out of the tab order so keyboard users only meet the menu entry. */
+.mytube-visually-hidden{
+    position:absolute;
+    width:1px;
+    height:1px;
+    margin:-1px;
+    padding:0;
+    border:0;
+    overflow:hidden;
+    clip:rect(0 0 0 0);
+    clip-path:inset(50%);
+    white-space:nowrap;
+}
+
+.mytube-avatar-feedback{
+    margin:0;
+    padding:8px 14px 10px;
+    font-size:12px;
+    line-height:1.4;
+    color:#aaa;
+}
+
+.mytube-avatar-feedback-error{
+    color:#ff6b6b;
+}
+
+.mytube-avatar-btn{
+    position:relative;
+    background:#3a3a3a;
+    border:none;
+    color:#fff;
+    width:40px;
+    height:40px;
+    padding:0;
+    border-radius:50%;
+    font-size:15px;
+    font-weight:bold;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    cursor:pointer;
+    flex-shrink:0;
+    overflow:hidden;
+    transition:background .2s;
+}.mytube-avatar-btn:hover{
+    background:#4d4d4d;
+}
+
+.mytube-badge{
+    position:absolute;
+    top:2px;
+    right:2px;
+    min-width:16px;
+    height:16px;
+    padding:0 4px;
+    background:red;
+    color:#fff;
+    border-radius:8px;
+    font-size:11px;
+    font-weight:bold;
+    line-height:16px;
+    text-align:center;
+    box-sizing:border-box;
+}
+
+.mytube-panel{
+    position:absolute;
+    top:calc(100% + 8px);
+    right:0;
+    width:320px;
+    max-width:calc(100vw - 24px);
+    max-height:min(70vh, 520px);
+    overflow-y:auto;
+    background:#212121;
+    color:#fff;
+    border:1px solid #3a3a3a;
+    border-radius:12px;
+    box-shadow:0 8px 28px rgba(0,0,0,.5);
+    z-index:2000;
+    padding:8px 0;
+}
+
+.mytube-panel[hidden]{
+    display:none;
+}
+
+.mytube-panel-head{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:8px;
+    padding:8px 14px;
+}
+
+.mytube-menu-head{
+    padding:8px 14px 10px;
+}
+
+.mytube-menu-title{
+    margin:0;
+    font-size:15px;
+    font-weight:bold;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}
+
+.mytube-menu-sub{
+    margin:2px 0 0;
+    font-size:13px;
+    color:#aaa;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}
+
+.mytube-menu-item{
+    display:block;
+    width:100%;
+    box-sizing:border-box;
+    padding:11px 14px;
+    background:none;
+    border:none;
+    color:#e5e5e5;
+    font-size:14px;
+    text-align:left;
+    text-decoration:none;
+    cursor:pointer;
+    border-radius:0;
+}
+
+.mytube-menu-item:hover{
+    background:rgba(255,255,255,.10);
+    color:#fff;
+}
+
+.mytube-menu-danger{
+    color:#ff6b6b;
+}
+
+.mytube-menu-sep{
+    height:1px;
+    margin:6px 0;
+    background:#3a3a3a;
+}
+
+.mytube-mark-read{
+    background:none;
+    border:none;
+    color:#3ea6ff;
+    font-size:13px;
+    padding:4px 6px;
+    cursor:pointer;
+    border-radius:6px;
+}
+
+.mytube-mark-read:hover{
+    background:rgba(62,166,255,.12);
+}
+
+.mytube-notif-list{
+    display:flex;
+    flex-direction:column;
+}
+
+.mytube-notif-item{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    padding:8px 14px;
+    text-decoration:none;
+    color:inherit;
+    position:relative;
+}
+
+.mytube-notif-item:hover{
+    background:rgba(255,255,255,.10);
+}
+
+.mytube-notif-thumb{
+    width:72px;
+    height:40px;
+    flex-shrink:0;
+    background:#121212;
+    border-radius:6px;
+    overflow:hidden;
+}
+
+.mytube-notif-thumb img{
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    display:block;
+}
+
+.mytube-notif-info{
+    min-width:0;
+    flex:1;
+}
+
+.mytube-notif-title{
+    margin:0;
+    font-size:13px;
+    line-height:1.3;
+    display:-webkit-box;
+    -webkit-line-clamp:2;
+    -webkit-box-orient:vertical;
+    overflow:hidden;
+}
+
+.mytube-notif-meta{
+    margin:3px 0 0;
+    font-size:12px;
+    color:#aaa;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}
+
+.mytube-notif-dot{
+    width:8px;
+    height:8px;
+    border-radius:50%;
+    background:red;
+    flex-shrink:0;
+}
+
+.mytube-notif-empty{
+    margin:0;
+    padding:12px 14px 16px;
+    font-size:13px;
+    color:#aaa;
+    line-height:1.4;
+}
+
+@media (max-width:520px){
+
+    .mytube-panel{
+        /* Anchor to the trigger's right edge and never exceed the viewport. The
+           header's own padding already insets the trigger, so a fixed negative
+           offset (the previous `right:-6px`) could push the panel past the
+           viewport once the header wraps to a 10px padding. right:0 plus the
+           viewport-clamped width is reliably contained at every width. */
+        width:min(320px, calc(100vw - 20px));
+        right:0;
+    }
+
+    .mytube-account-area{
+        gap:4px;
+    }
+}
+
+@media (prefers-reduced-motion: reduce){
+
+    .mytube-icon-btn,
+    .mytube-avatar-btn{
+        transition:none;
+    }
+}
+

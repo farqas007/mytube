@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<meta name="description" content="MyTube Privacy Policy: what data MyTube stores, how it is used, and the third-party services involved.">
+<meta name="robots" content="index, follow">
+
+<link rel="canonical" href="https://mytube.farqas007.workers.dev/privacy.html">
+
+<meta property="og:site_name" content="MyTube">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Privacy Policy - MyTube">
+<meta property="og:description" content="MyTube Privacy Policy: what data MyTube stores, how it is used, and the third-party services involved.">
+<meta property="og:url" content="https://mytube.farqas007.workers.dev/privacy.html">
+
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Privacy Policy - MyTube">
+<meta name="twitter:description" content="MyTube Privacy Policy: what data MyTube stores, how it is used, and the third-party services involved.">
+
+<title>Privacy Policy - MyTube</title>
+<link rel="icon" type="image/png" href="mytube-icon.png">
+
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="shared/accountMenu.css">
+
+</head>
+
+
+<body>
+
+
+<header>
+
+<div class="logo">
+MyTube 🔴
+</div>
+
+
+<input 
+id="search"
+placeholder="Search videos..."
+aria-label="Search videos"
+role="searchbox"
+>
+
+
+<button type="button" class="voice-search-btn" aria-label="Search with your voice" aria-pressed="false" title="Search with your voice">
+<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"></path><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"></path></svg>
+</button>
+
+<button type="button" onclick="goHome()">
+Home
+</button>
+
+</header>
+
+
+<div class="watch-container profile-container">
+
+<div class="profile-content">
+
+<div class="profile-section">
+<h1>Privacy Policy</h1>
+<p class="profile-empty">Last updated: 20 October 2026</p>
+<p>
+MyTube is a video browsing and playback website. This page explains, in plain
+language, what information MyTube handles and how. It describes only the
+behaviour that is actually implemented in the current site.
+</p>
+</div>
+
+<div class="profile-section">
+<h3>Information you provide</h3>
+<p>
+When you create an account or sign in, MyTube uses Firebase Authentication, a
+Google service, with an email address and password. Sign-in is by email and
+password only; MyTube does not offer "Sign in with Google". The password is
+handled by Firebase Authentication and is never received or stored by MyTube.
+</p>
+<p>
+When you are signed in, MyTube associates your activity with the user ID that
+Firebase Authentication issues, so that your own data is shown back to you.
+</p>
+<div class="profile-list">
+<div class="profile-video"><div class="profile-video-info"><h4>Account email and password</h4><p>Sign-in is processed by Firebase Authentication, a Google service, using email and password only (no "Sign in with Google"). MyTube does not store your password.</p></div></div>
+<div class="profile-video"><div class="profile-video-info"><h4>Your comments</h4><p>Comments you post on MyTube are stored in Cloud Firestore alongside the ID of the account that posted them.</p></div></div>
+</div>
+</div>
+
+<div class="profile-section">
+<h3>Data stored in your account</h3>
+<p>
+MyTube stores the following items in Cloud Firestore under your own user ID,
+so they are available across your sessions and devices:
+</p>
+<div class="profile-list">
+<div class="profile-video"><div class="profile-video-info"><h4>Subscriptions</h4><p>The channels you subscribe to inside MyTube.</p></div></div>
+<div class="profile-video"><div class="profile-video-info"><h4>Watch history</h4><p>The videos you have watched through MyTube.</p></div></div>
+<div class="profile-video"><div class="profile-video-info"><h4>Saved / Watch Later</h4><p>The videos you have saved.</p></div></div>
+<div class="profile-video"><div class="profile-video-info"><h4>Liked videos</h4><p>The videos you have liked.</p></div></div>
+<div class="profile-video"><div class="profile-video-info"><h4>Playlists</h4><p>Playlists you create and the videos added to them.</p></div></div>
+</div>
+<p>
+Firestore security rules restrict each of these records so that it can only be
+read or written by the signed-in account that owns it. MyTube comments are
+stored in a shared collection so they can be shown publicly, and only the
+account that created a comment can change or delete it.
+</p>
+</div>
+
+<div class="profile-section">
+<h3>Data stored in your browser</h3>
+<p>
+Some information stays only in your browser and is not sent to MyTube's
+servers:
+</p>
+<div class="profile-list">
+<div class="profile-video"><div class="profile-video-info"><h4>Preferences</h4><p>Your browser's local storage keeps small, non-sensitive settings such as the display name used next to your comments.</p></div></div>
+<div class="profile-video"><div class="profile-video-info"><h4>Profile picture</h4><p>If you choose a profile picture, it is resized in your browser and saved in your browser's IndexedDB storage, keyed to your account.</p></div></div>
+</div>
+<p>
+Profile pictures are stored locally in your browser and are not uploaded to
+MyTube's servers. Clearing your browser storage removes them.
+</p>
+</div>
+
+<div class="profile-section">
+<h3>Video content and third-party services</h3>
+<p>
+MyTube does not host video files. Videos are discovered through the YouTube
+Data API and played using YouTube's embedded player. This means the following
+third parties are involved when you use the site:
+</p>
+<div class="profile-list">
+<div class="profile-video"><div class="profile-video-info"><h4>YouTube Data API</h4><p>Video searches, trending lists, related videos and video details are requested from Google's YouTube Data API through MyTube's own server, using a server-side key that is not exposed to your browser.</p></div></div>
+<div class="profile-video"><div class="profile-video-info"><h4>YouTube embedded player</h4><p>Videos are played through YouTube's embedded player, and live streams use YouTube's privacy-enhanced embed domain. When a video or its chat is shown, Google/YouTube may receive technical information such as your IP address and may apply its own policies.</p></div></div>
+<div class="profile-video"><div class="profile-video-info"><h4>Firebase</h4><p>Sign-in and account data storage are provided by Firebase, a Google service (Firebase Authentication and Cloud Firestore). Only email/password sign-in is enabled.</p></div></div>
+</div>
+<p>
+Your use of those third-party services is governed by their own terms and
+privacy policies, not by this page. YouTube embeds and Google/YouTube services
+can receive technical information about your visit, such as your IP address,
+and these third-party services may collect and process data in line with their
+own privacy policies and practices. This page makes no claim about any
+tracking performed by MyTube's own code.</p>
+</div>
+
+<div class="profile-section">
+<h3>What MyTube does not do</h3>
+<div class="profile-list">
+<div class="profile-video"><div class="profile-video-info"><h4>No passwords</h4><p>MyTube never stores your account password.</p></div></div>
+<div class="profile-video"><div class="profile-video-info"><h4>No selling of personal information</h4><p>MyTube does not sell users' personal information. This is a policy commitment by the site owner; it is not a technical feature enforced by the site's code.</p></div></div>
+</div>
+</div>
+
+<div class="profile-section">
+<h3>Changes and contact</h3>
+<p>
+If the way MyTube handles data changes, this page will be updated and the
+"Last updated" date above will change.
+</p>
+<p>
+For questions about this policy or your data, contact:
+<a href="mailto:farqas007@gmail.com">farqas007@gmail.com</a>.
+</p>
+</div>
+
+</div>
+
+</div>
+
+
+<script>
+
+function goHome(){
+    window.location.href = "index.html";
+}
+
+function searchVideo(){
+    const raw = document.getElementById("search").value;
+    const query = raw.trim();
+    if(!query) return;
+    window.location.href = "index.html?q=" + encodeURIComponent(query);
+}
+
+document.getElementById("search")?.addEventListener("keydown",(e)=>{
+    if(e.key === "Enter"){
+        searchVideo();
+    }
+});
+
+</script>
+
+<script src="voice-search.js"></script>
+
+
+</body>
+
+</html>

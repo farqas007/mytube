@@ -15,6 +15,7 @@
 
 <link rel="stylesheet" href="player.css">
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="shared/accountMenu.css">
 
 </head>
 
@@ -89,6 +90,24 @@ Logout
 </section>
 
 
+<section class="profile-section">
+
+<h3>YouTube Account</h3>
+
+<p class="profile-empty" id="ytConnectHelp">
+Connect your YouTube account to enable posting comments and live chat messages in a later update. Connecting only grants permission; nothing is posted automatically.
+</p>
+
+<div id="ytConnectStatus" class="yt-connect-status" role="status" aria-live="polite"></div>
+
+<div class="yt-connect-actions">
+<button type="button" id="ytConnectBtn">Connect YouTube</button>
+<button type="button" id="ytDisconnectBtn" class="yt-disconnect-btn" style="display:none;">Disconnect</button>
+</div>
+
+</section>
+
+
 </div>
 
 
@@ -109,7 +128,9 @@ function goLogin(){
 
 
 <script type="module" src="auth.js"></script>
+<script type="module" src="shared/accountMenu.js"></script>
 <script type="module" src="profile.js"></script>
+<script type="module" src="youtube-connect.js"></script>
 
 
 </body>

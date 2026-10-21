@@ -6,8 +6,17 @@ export default $config({
       name: "mytube",
       removal: input?.stage === "production" ? "retain" : "remove",
       protect: ["production"].includes(input?.stage),
-      home: "cloudflare",
+      home: "local",
+      providers: {
+        cloudflare: {
+          package: "@pulumi/cloudflare",
+          version: "6.20.0",
+        },
+      },
     };
   },
-  async run() {},
+
+  async run() {
+    return {};
+  },
 });

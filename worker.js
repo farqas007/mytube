@@ -32,6 +32,21 @@ import {
   markFetchedAt,
   upsertVideos
 } from "./shared/index-store.js";
+import {
+  FIREBASE_JWKS_URL,
+  GOOGLE_REVOKE_ENDPOINT,
+  GOOGLE_TOKEN_ENDPOINT,
+  GOOGLE_YOUTUBE_SCOPE,
+  buildAuthorizationUrl,
+  createCodeChallenge,
+  createCodeVerifier,
+  createState,
+  decryptToken,
+  deriveAesKey,
+  encryptToken,
+  redirectUriMatches,
+  verifyFirebaseIdToken
+} from "./shared/oauth.js";
 
 const YT_API_BASE = "https://www.googleapis.com/youtube/v3";
 
@@ -1930,6 +1945,748 @@ async function getLiveChat(videoId, apiKey, options = {}) {
   };
 }
 
+// =============================================================================
+// GOOGLE OAUTH FOUNDATION (Testing-mode authorization-code flow)
+// =============================================================================
+// This is the secure half of "users authorize their YouTube account". It does
+// NOT post comments or live-chat messages; it only establishes and tears down a
+// grant. Nothing here changes any existing read route.
+//
+// Flow, end to end (browser-compatible):
+//
+//   1. Page JS, on a page where the user is already signed in to MyTube
+//      (Firebase), calls GET /api/oauth/start via fetch() with
+//      `Authorization: Bearer <Firebase ID token>`. This is a fetch(), NOT a
+//      top-level navigation — a navigation cannot carry the header, which is
+//      exactly why the header-authenticated step is a fetch.
+//   2. The Worker verifies that ID token, mints a PKCE verifier + single-use
+//      state, stores them in D1 keyed to the VERIFIED uid, and answers 200 with
+//      { authorizationUrl }. No token and no secret is in that URL.
+//   3. Page JS navigates the browser to `authorizationUrl`
+//      (window.location.assign). This is a plain navigation to Google, so no
+//      Authorization header is needed or possible.
+//   4. Google redirects the browser back to GET /api/oauth/callback?code=...&state=...
+//      with NO Authorization header (Google cannot send one). The stored state
+//      IS the proof that step 1 authenticated: the state row's uid becomes the
+//      grant owner. There is therefore nothing to compare a header against at
+//      the callback, and none is required — the single-use state is the binding.
+//   5. The Worker atomically consumes the state (replay/expiry defence),
+//      checks the redirect_uri byte-for-byte, exchanges the code server-side
+//      (with the client secret and the stored PKCE verifier) for a refresh
+//      token, AES-GCM-encrypts it, and upserts it against the state's uid.
+//   6. The Worker 302s the browser to a FIXED MyTube page with a non-sensitive
+//      status query param (see OAUTH_LANDING_PATH). No token/secret is ever in
+//      that URL, and the target is a constant, so it can never be an open
+//      redirect.
+//   7. GET /api/oauth/status reports whether a grant exists (never the token).
+//   8. POST /api/oauth/disconnect revokes the grant at Google and deletes it.
+//
+// Security rules kept everywhere below:
+//   * The client secret, refresh token and access token NEVER leave the Worker.
+//     No token is ever put in a URL, a log line, or a response body.
+//   * /start (a fetch) requires a valid Firebase token; /callback (a navigation)
+//     requires a valid single-use state instead. Each step has exactly one
+//     authentication mechanism, and neither can be skipped.
+//   * A state is single-use: consumed before the code exchange, so a replayed
+//     callback cannot mint a second grant.
+//   * The redirect_uri is compared byte-for-byte to the configured value.
+//   * If the Google client env or the encryption secret is absent, every route
+//     fails closed with a clear error — never an unauthenticated success.
+// -----------------------------------------------------------------------------
+
+// How long a started flow may be completed. Short enough that a leaked state is
+// near-useless, long enough for a user to get through the consent screen.
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+
+// Bound on how many abandoned states are pruned per start, so pruning can never
+// become an unbounded write.
+const OAUTH_STATE_PRUNE_LIMIT = 50;
+
+// Where the callback returns the browser after consent.
+//
+// A FIXED, hardcoded path — never taken from the request — so the redirect can
+// never be bent toward an attacker origin (no open redirect). The query param
+// carries only a non-sensitive status word; never a token, code or secret.
+const OAUTH_LANDING_PATH = "/profile.html";
+const OAUTH_STATUS_PARAM = "youtube";
+
+// The only status values ever placed in the landing URL. A closed set means the
+// landing page can never receive an arbitrary string from us.
+const OAUTH_LANDING_STATUS = Object.freeze({
+  connected: "connected",
+  cancelled: "cancelled",
+  error: "error"
+});
+
+// The Firebase project whose ID tokens are accepted. This is public (it is in
+// public/firebase.js) and therefore safe to default; an env override exists so
+// the project can change without editing code.
+const DEFAULT_FIREBASE_PROJECT_ID = "mytube-827d2";
+
+// JWKS cache. Firebase rotates signing keys rarely; a short in-memory TTL keeps
+// a live isolate from fetching on every request while still recovering from a
+// rotation without a redeploy.
+const FIREBASE_JWKS_TTL_MS = 60 * 60 * 1000;
+let firebaseJwksCache = { at: 0, value: null };
+
+// Read the OAuth configuration out of env. Returns null (fail closed) unless ALL
+// of the client id, secret, redirect uri and encryption key are present and the
+// key is a usable 32-byte base64url value.
+//
+// Nothing here logs or returns a secret. The returned object is only used inside
+// the handler.
+async function readOAuthConfig(env) {
+  const clientId = env?.GOOGLE_OAUTH_CLIENT_ID || "";
+  const clientSecret = env?.GOOGLE_OAUTH_CLIENT_SECRET || "";
+  const redirectUri = env?.GOOGLE_OAUTH_REDIRECT_URI || "";
+  const keySecret = env?.OAUTH_TOKEN_ENCRYPTION_KEY || "";
+
+  if (!clientId || !clientSecret || !redirectUri || !keySecret) {
+    return null;
+  }
+
+  let encryptionKey;
+
+  try {
+    encryptionKey = await deriveAesKey(keySecret);
+  } catch {
+    // A bad key is "not configured", never "continue without encryption".
+    return null;
+  }
+
+  return { clientId, clientSecret, redirectUri, encryptionKey };
+}
+
+// The D1 handle for OAuth work. Unlike the video index (where an absent binding
+// degrades to "answer from YouTube"), the OAuth tables ARE the feature, so a
+// missing binding is a hard "not available" rather than a silent no-op.
+function oauthDb(env) {
+  const db = env?.mytube_index;
+
+  if (!db || typeof db.prepare !== "function") {
+    return null;
+  }
+
+  return db;
+}
+
+function oauthPreflight(request) {
+  const headers = {
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Max-Age": "600"
+  };
+
+  if (originAllowed(request)) {
+    headers["Access-Control-Allow-Origin"] = request.headers.get("Origin");
+    headers["Vary"] = "Origin";
+  }
+
+  return new Response(null, { status: 204, headers });
+}
+
+// A JSON error that never carries a token. `code` is for the client; `error` is
+// a safe, human message.
+function oauthError(message, code, status, request) {
+  return json({ error: message, code }, status, request);
+}
+
+// Build the fixed landing redirect used by the callback.
+//
+// `status` MUST come from OAUTH_LANDING_STATUS; anything else is coerced to
+// "error" so an unknown value can never be reflected into the Location header.
+// The param value is drawn from a closed set and the path is a constant, so the
+// resulting URL is always a safe, same-site, non-sensitive destination.
+function oauthLandingRedirect(status) {
+  const safeStatus =
+    status === OAUTH_LANDING_STATUS.connected ||
+    status === OAUTH_LANDING_STATUS.cancelled
+      ? status
+      : OAUTH_LANDING_STATUS.error;
+
+  const location = `${OAUTH_LANDING_PATH}?${OAUTH_STATUS_PARAM}=${safeStatus}`;
+
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: location,
+      "Cache-Control": "no-store"
+    }
+  });
+}
+
+// Fetch (and briefly cache) the Firebase signing keys.
+//
+// `force` bypasses the cache. It exists for one real scenario: Firebase rotates
+// its signing keys, and a token signed by a brand-new key would fail against a
+// cached set that predates the rotation. The caller retries once with `force`
+// so a rotation self-heals within a single request instead of waiting out the
+// TTL. A caller that forces on every request would be a fetch amplifier, so
+// forcing is opt-in and only ever the second attempt.
+async function fetchFirebaseJwks(force = false) {
+  const now = Date.now();
+
+  if (
+    !force &&
+    firebaseJwksCache.value &&
+    now - firebaseJwksCache.at < FIREBASE_JWKS_TTL_MS
+  ) {
+    return firebaseJwksCache.value;
+  }
+
+  const response = await fetch(FIREBASE_JWKS_URL, {
+    headers: { Accept: "application/json" }
+  });
+
+  if (!response.ok) {
+    throw new Error("jwks_unavailable");
+  }
+
+  const value = await response.json();
+
+  firebaseJwksCache = { at: now, value };
+
+  return value;
+}
+
+// Pull the caller's Firebase ID token from `Authorization: Bearer <token>`.
+// Returns "" when absent, so callers can treat missing exactly like invalid.
+function bearerToken(request) {
+  const header = request.headers.get("Authorization") || "";
+  const match = header.match(/^Bearer\s+(.+)$/i);
+
+  return match ? match[1].trim() : "";
+}
+
+// Verify the caller's Firebase ID token. Returns { ok: true, uid } or
+// { ok: false, response }. The response is always a 401 with no detail beyond
+// "not authenticated" — the specific failure reason is deliberately not told to
+// the client (it is not secret, but a uniform answer leaks less).
+async function requireFirebaseUser(request, env) {
+  const token = bearerToken(request);
+
+  if (!token) {
+    return {
+      ok: false,
+      response: oauthError("Sign in required.", "UNAUTHENTICATED", 401, request)
+    };
+  }
+
+  const projectId = env?.FIREBASE_PROJECT_ID || DEFAULT_FIREBASE_PROJECT_ID;
+
+  let jwks;
+
+  try {
+    jwks = await fetchFirebaseJwks();
+  } catch {
+    return {
+      ok: false,
+      response: oauthError(
+        "Sign-in verification is temporarily unavailable. Please try again.",
+        "AUTH_UNAVAILABLE",
+        503,
+        request
+      )
+    };
+  }
+
+  let result = await verifyFirebaseIdToken(token, { projectId, jwks });
+
+  // A failure may be a key rotation rather than a bad token. Retry ONCE against
+  // freshly fetched keys before calling it invalid; the retry is what makes a
+  // rotation invisible to the user. A genuine forgery fails both times.
+  if (!result.valid && (result.reason === "unknown_kid" || result.reason === "bad_signature")) {
+    try {
+      jwks = await fetchFirebaseJwks(true);
+      result = await verifyFirebaseIdToken(token, { projectId, jwks });
+    } catch {
+      // Keep the original (invalid) verdict if the refetch failed.
+    }
+  }
+
+  if (!result.valid) {
+    return {
+      ok: false,
+      response: oauthError("Sign in required.", "UNAUTHENTICATED", 401, request)
+    };
+  }
+
+  return { ok: true, uid: result.uid };
+}
+
+// Atomic single-use consumption of a state.
+//
+// `UPDATE ... WHERE state = ? AND consumed = 0 AND expires_at_ms > ?` is the
+// whole replay defence: D1 reports the number of changed rows, and only exactly
+// one caller can ever observe `changes === 1` for a given state. A replayed
+// callback, an expired state, or a state reaped by the prune path all change
+// zero rows and are refused identically.
+async function consumeOauthState(db, state, nowMs) {
+  if (!state) {
+    return null;
+  }
+
+  const row = await db
+    .prepare(
+      "SELECT state, uid, code_verifier, redirect_uri, expires_at_ms, consumed " +
+        "FROM oauth_states WHERE state = ?"
+    )
+    .bind(state)
+    .first();
+
+  if (!row) {
+    return null;
+  }
+
+  if (Number(row.consumed) === 1) {
+    return null;
+  }
+
+  if (Number(row.expires_at_ms) <= nowMs) {
+    return null;
+  }
+
+  const update = await db
+    .prepare(
+      "UPDATE oauth_states SET consumed = 1 " +
+        "WHERE state = ? AND consumed = 0 AND expires_at_ms > ?"
+    )
+    .bind(state, nowMs)
+    .run();
+
+  if (!update || !update.success || Number(update.meta?.changes) !== 1) {
+    return null;
+  }
+
+  return row;
+}
+
+// Best-effort prune of expired/consumed states. Never throws; a pruning failure
+// must not fail the start request.
+async function pruneOauthStates(db, nowMs) {
+  try {
+    await db
+      .prepare(
+        "DELETE FROM oauth_states WHERE state IN (" +
+          "SELECT state FROM oauth_states " +
+          "WHERE expires_at_ms <= ? OR consumed = 1 " +
+          "ORDER BY expires_at_ms ASC LIMIT ?)"
+      )
+      .bind(nowMs, OAUTH_STATE_PRUNE_LIMIT)
+      .run();
+  } catch {
+    // Ignored on purpose: pruning is hygiene, not correctness.
+  }
+}
+
+// GET /api/oauth/start — begin the flow.
+async function handleOAuthStart(request, env) {
+  if (request.method !== "GET") {
+    return oauthError("Method not allowed.", "METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  const config = await readOAuthConfig(env);
+
+  if (!config) {
+    return oauthError(
+      "YouTube connection is not configured yet.",
+      "OAUTH_NOT_CONFIGURED",
+      503,
+      request
+    );
+  }
+
+  const db = oauthDb(env);
+
+  if (!db) {
+    return oauthError(
+      "YouTube connection is temporarily unavailable.",
+      "OAUTH_UNAVAILABLE",
+      503,
+      request
+    );
+  }
+
+  const auth = await requireFirebaseUser(request, env);
+
+  if (!auth.ok) {
+    return auth.response;
+  }
+
+  const now = Date.now();
+  const state = createState();
+  const codeVerifier = createCodeVerifier();
+  const codeChallenge = await createCodeChallenge(codeVerifier);
+
+  try {
+    await db
+      .prepare(
+        "INSERT INTO oauth_states " +
+          "(state, uid, code_verifier, redirect_uri, created_at_ms, expires_at_ms, consumed) " +
+          "VALUES (?, ?, ?, ?, ?, ?, 0)"
+      )
+      .bind(
+        state,
+        auth.uid,
+        codeVerifier,
+        config.redirectUri,
+        now,
+        now + OAUTH_STATE_TTL_MS
+      )
+      .run();
+  } catch {
+    return oauthError(
+      "Could not start the YouTube connection. Please try again.",
+      "OAUTH_START_FAILED",
+      500,
+      request
+    );
+  }
+
+  await pruneOauthStates(db, now);
+
+  const authorizationUrl = buildAuthorizationUrl({
+    clientId: config.clientId,
+    redirectUri: config.redirectUri,
+    scope: GOOGLE_YOUTUBE_SCOPE,
+    state,
+    codeChallenge
+  });
+
+  // 200 JSON, NOT a 302. This endpoint is reached by page JS via fetch() so it
+  // can carry the Firebase Authorization header (a top-level navigation cannot).
+  // The browser then navigates to `authorizationUrl` itself, which is the step
+  // that needs no header. `authorizationUrl` contains the public client id, the
+  // redirect_uri, the PKCE challenge and the state — never a secret or a token.
+  return json({ authorizationUrl }, 200, request);
+}
+
+// GET /api/oauth/callback — Google redirects here with ?code and ?state.
+async function handleOAuthCallback(request, env, url) {
+  if (request.method !== "GET") {
+    return oauthError("Method not allowed.", "METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  const config = await readOAuthConfig(env);
+
+  if (!config) {
+    return oauthLandingRedirect(OAUTH_LANDING_STATUS.error);
+  }
+
+  const db = oauthDb(env);
+
+  if (!db) {
+    return oauthLandingRedirect(OAUTH_LANDING_STATUS.error);
+  }
+
+  // Google's own failure redirect (user denied, etc.) carries `error`.
+  const googleError = url.searchParams.get("error");
+
+  if (googleError) {
+    return oauthLandingRedirect(OAUTH_LANDING_STATUS.cancelled);
+  }
+
+  const code = url.searchParams.get("code") || "";
+  const state = url.searchParams.get("state") || "";
+
+  if (!code || !state) {
+    return oauthLandingRedirect(OAUTH_LANDING_STATUS.error);
+  }
+
+  // NO Firebase Authorization header is required (or possible) here: Google
+  // redirected the browser and cannot attach one. The stored, single-use state
+  // IS the authentication for this step — it was created on a request that DID
+  // carry a verified Firebase token, and it binds the grant to that verified
+  // uid. See consumeOauthState().
+  const now = Date.now();
+  const row = await consumeOauthState(db, state, now);
+
+  if (!row) {
+    // Missing, already consumed (replay), or expired — all refused identically.
+    return oauthLandingRedirect(OAUTH_LANDING_STATUS.error);
+  }
+
+  // The redirect URI must be exactly the one the flow started with AND exactly
+  // the configured one. Two checks because two things could have drifted.
+  if (!redirectUriMatches(row.redirect_uri, config.redirectUri)) {
+    return oauthLandingRedirect(OAUTH_LANDING_STATUS.error);
+  }
+
+  // Exchange the code, server-side, presenting the PKCE verifier.
+  let tokenPayload;
+
+  try {
+    const body = new URLSearchParams({
+      client_id: config.clientId,
+      client_secret: config.clientSecret,
+      code,
+      code_verifier: row.code_verifier,
+      grant_type: "authorization_code",
+      redirect_uri: config.redirectUri
+    });
+
+    const tokenResponse = await fetch(GOOGLE_TOKEN_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json"
+      },
+      body: body.toString()
+    });
+
+    tokenPayload = await tokenResponse.json().catch(() => null);
+
+    if (!tokenResponse.ok || !tokenPayload?.refresh_token) {
+      return oauthLandingRedirect(OAUTH_LANDING_STATUS.error);
+    }
+  } catch {
+    return oauthLandingRedirect(OAUTH_LANDING_STATUS.error);
+  }
+
+  // Encrypt before storing. If encryption fails, nothing is written — a plain
+  // token must never be persisted as a fallback.
+  let encrypted;
+
+  try {
+    encrypted = await encryptToken(tokenPayload.refresh_token, config.encryptionKey);
+  } catch {
+    return oauthLandingRedirect(OAUTH_LANDING_STATUS.error);
+  }
+
+  try {
+    await db
+      .prepare(
+        "INSERT INTO oauth_grants " +
+          "(uid, refresh_token_enc, scope, token_type, connected_at_ms, updated_at_ms, revoked_at_ms) " +
+          "VALUES (?, ?, ?, ?, ?, ?, NULL) " +
+          "ON CONFLICT(uid) DO UPDATE SET " +
+          "refresh_token_enc = excluded.refresh_token_enc, " +
+          "scope = excluded.scope, " +
+          "token_type = excluded.token_type, " +
+          "updated_at_ms = excluded.updated_at_ms, " +
+          "revoked_at_ms = NULL"
+      )
+      .bind(
+        row.uid,
+        encrypted,
+        String(tokenPayload.scope || ""),
+        String(tokenPayload.token_type || ""),
+        now,
+        now
+      )
+      .run();
+  } catch {
+    return oauthLandingRedirect(OAUTH_LANDING_STATUS.error);
+  }
+
+  // Success: the browser lands on a fixed MyTube page with a non-sensitive
+  // status. The grant owner is the uid the state was minted for.
+  return oauthLandingRedirect(OAUTH_LANDING_STATUS.connected);
+}
+
+// GET /api/oauth/status — is there a live grant for this user?
+async function handleOAuthStatus(request, env) {
+  if (request.method !== "GET") {
+    return oauthError("Method not allowed.", "METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  if (!(await readOAuthConfig(env))) {
+    return oauthError(
+      "YouTube connection is not configured yet.",
+      "OAUTH_NOT_CONFIGURED",
+      503,
+      request
+    );
+  }
+
+  const db = oauthDb(env);
+
+  if (!db) {
+    return oauthError(
+      "YouTube connection is temporarily unavailable.",
+      "OAUTH_UNAVAILABLE",
+      503,
+      request
+    );
+  }
+
+  const auth = await requireFirebaseUser(request, env);
+
+  if (!auth.ok) {
+    return auth.response;
+  }
+
+  let row;
+
+  try {
+    row = await db
+      .prepare(
+        "SELECT scope, connected_at_ms, revoked_at_ms FROM oauth_grants WHERE uid = ?"
+      )
+      .bind(auth.uid)
+      .first();
+  } catch {
+    return oauthError(
+      "Could not read the YouTube connection.",
+      "OAUTH_STATUS_FAILED",
+      500,
+      request
+    );
+  }
+
+  if (!row || row.revoked_at_ms !== null && row.revoked_at_ms !== undefined) {
+    return json({ connected: false, scope: "" }, 200, request);
+  }
+
+  return json(
+    {
+      connected: true,
+      scope: String(row.scope || ""),
+      connectedAtMs: Number(row.connected_at_ms) || 0
+    },
+    200,
+    request
+  );
+}
+
+// POST /api/oauth/disconnect — revoke at Google, then delete locally.
+async function handleOAuthDisconnect(request, env) {
+  if (request.method !== "POST") {
+    return oauthError("Method not allowed.", "METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  const config = await readOAuthConfig(env);
+
+  if (!config) {
+    return oauthError(
+      "YouTube connection is not configured yet.",
+      "OAUTH_NOT_CONFIGURED",
+      503,
+      request
+    );
+  }
+
+  const db = oauthDb(env);
+
+  if (!db) {
+    return oauthError(
+      "YouTube connection is temporarily unavailable.",
+      "OAUTH_UNAVAILABLE",
+      503,
+      request
+    );
+  }
+
+  const auth = await requireFirebaseUser(request, env);
+
+  if (!auth.ok) {
+    return auth.response;
+  }
+
+  let row;
+
+  try {
+    row = await db
+      .prepare("SELECT refresh_token_enc FROM oauth_grants WHERE uid = ?")
+      .bind(auth.uid)
+      .first();
+  } catch {
+    return oauthError(
+      "Could not read the YouTube connection.",
+      "OAUTH_DISCONNECT_FAILED",
+      500,
+      request
+    );
+  }
+
+  // Revoke at Google when we can decrypt the token, and report truthfully
+  // whether Google accepted the revocation.
+  //
+  // `revoked` reflects the actual outcome:
+  //   true  — Google answered 2xx (or the token was already invalid, which
+  //           Google reports as 400 with error=invalid_token: the grant is not
+  //           live, so from the user's point of view it IS revoked)
+  //   false — any other HTTP status, or a network/decrypt failure
+  //
+  // The local delete happens regardless. Leaving a live grant on Google would be
+  // worse than leaving none, and the user explicitly asked to disconnect.
+  let revoked = false;
+
+  if (row?.refresh_token_enc) {
+    try {
+      const refreshToken = await decryptToken(
+        row.refresh_token_enc,
+        config.encryptionKey
+      );
+
+      const revokeResponse = await fetch(GOOGLE_REVOKE_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "application/json"
+        },
+        body: new URLSearchParams({ token: refreshToken }).toString()
+      });
+
+      if (revokeResponse.ok) {
+        revoked = true;
+      } else if (revokeResponse.status === 400) {
+        // Google returns 400 invalid_token for a token that is already gone.
+        // That is not a failure to revoke: there is nothing live left to revoke.
+        const detail = await revokeResponse.json().catch(() => null);
+        if (detail?.error === "invalid_token") {
+          revoked = true;
+        }
+      }
+    } catch {
+      // Token unreadable or Google unreachable: revoked stays false. The local
+      // delete below still runs.
+    }
+  } else {
+    // No stored grant: nothing to revoke, so "revoked" is vacuously true.
+    revoked = true;
+  }
+
+  try {
+    await db
+      .prepare("DELETE FROM oauth_grants WHERE uid = ?")
+      .bind(auth.uid)
+      .run();
+  } catch {
+    return oauthError(
+      "Could not remove the YouTube connection. Please try again.",
+      "OAUTH_DISCONNECT_FAILED",
+      500,
+      request
+    );
+  }
+
+  // `connected` is always false (the grant is gone locally). `revoked` tells the
+  // truth about Google's side so the caller can decide whether to warn.
+  return json({ connected: false, revoked }, 200, request);
+}
+
+// Dispatch one OAuth route. `route` is the path after "/api/".
+async function handleOAuthRoute(request, env, url, route) {
+  if (route === "oauth/start") {
+    return handleOAuthStart(request, env);
+  }
+
+  if (route === "oauth/callback") {
+    return handleOAuthCallback(request, env, url);
+  }
+
+  if (route === "oauth/status") {
+    return handleOAuthStatus(request, env);
+  }
+
+  if (route === "oauth/disconnect") {
+    return handleOAuthDisconnect(request, env);
+  }
+
+  return oauthError("API route not found.", "NOT_FOUND", 404, request);
+}
+
 async function handleAPI(request, env, ctx) {
   const url = new URL(request.url);
   const route = url.pathname.replace(/^\/api\/?/, "");
@@ -1940,10 +2697,31 @@ async function handleAPI(request, env, ctx) {
   // changes.
   const index = createIndexContext(ctx, env);
 
+  // --- Google OAuth foundation -------------------------------------------
+  // These routes are dispatched BEFORE the generic GET-only guard because the
+  // flow mixes methods: /oauth/start, /oauth/callback and /oauth/status are
+  // GETs (start/callback are navigations), /oauth/disconnect is a POST. They
+  // also manage their own auth (a Firebase ID token, not the YouTube API key),
+  // so they must not fall through to the YouTube-backed routes below.
+  //
+  // When the Google client is not configured these return a clean
+  // "not configured" error and never touch D1 or the network.
+  if (route.startsWith("oauth/")) {
+    if (request.method === "OPTIONS") {
+      return oauthPreflight(request);
+    }
+
+    return handleOAuthRoute(request, env, url, route);
+  }
+
   if (request.method === "OPTIONS") {
     const headers = {
-      "Access-Control-Allow-Methods": "GET, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
+      // POST was added for the OAuth disconnect endpoint. GET, OPTIONS stays for
+      // every pre-existing read route, so nothing existing changes.
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      // Authorization carries the caller's Firebase ID token to the OAuth
+      // endpoints. Content-Type stays for the JSON body of a POST.
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
       "Access-Control-Max-Age": "600"
     };
 

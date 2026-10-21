@@ -1,0 +1,20 @@
+/// <reference path="./.sst/platform/config.d.ts" />
+export default $config({
+  app(input) {
+    return {
+      name: "mytube",
+      removal: input?.stage === "production" ? "retain" : "remove",
+      protect: ["production"].includes(input?.stage),
+      home: "cloudflare",
+      providers: {
+        cloudflare: {
+          package: "@pulumi/cloudflare",
+          version: "6.20.0",
+          apiToken: process.env.CLOUDFLARE_API_TOKEN,
+          accountId: process.env.CLOUDFLARE_DEFAULT_ACCOUNT_ID,
+        },
+      },
+    };
+  },
+  async run() {},
+});

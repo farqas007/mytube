@@ -31,6 +31,7 @@
 <link rel="icon" type="image/png" href="mytube-icon.png">
 
 <link rel="stylesheet" href="player.css?v=4">
+<link rel="stylesheet" href="shared/accountMenu.css">
 
 </head>
 
@@ -478,7 +479,7 @@ YouTube Live Chat
 <p id="liveChatStatus" class="live-chat-status"></p>
 
 <footer class="live-chat-foot">
-<a href="https://www.youtube.com/live_chat" target="_blank" rel="noopener noreferrer" class="live-chat-attrib">
+<a id="liveChatAttrib" href="https://www.youtube.com/live_chat" target="_blank" rel="noopener noreferrer" class="live-chat-attrib">
 Chat provided by YouTube
 </a>
 </footer>
@@ -559,6 +560,8 @@ document.getElementById("search")?.addEventListener("keydown",(e)=>{
 
 
 <script type="module" src="auth.js"></script>
+
+<script type="module" src="shared/accountMenu.js"></script>
 
 <script type="module" src="watch.js"></script>
 

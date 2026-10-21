@@ -1045,6 +1045,51 @@ header input{
 }
 
 
+/* ================= PROFILE: YOUTUBE CONNECT ================= */
+
+.yt-connect-status{
+    font-size:14px;
+    color:#ccc;
+    margin:12px 0;
+    min-height:1em;
+}
+
+.yt-connect-status.ok{
+    color:#4caf50;
+}
+
+.yt-connect-status.error{
+    color:#f33;
+}
+
+.yt-connect-status.muted{
+    color:#999;
+}
+
+.yt-connect-actions{
+    display:flex;
+    gap:12px;
+    flex-wrap:wrap;
+}
+
+.yt-connect-actions button:disabled{
+    opacity:0.6;
+    cursor:default;
+}
+
+.yt-disconnect-btn{
+    background:none;
+    color:#f33;
+    border:none;
+    padding:10px 0;
+}
+
+.yt-disconnect-btn:hover{
+    background:none;
+    text-decoration:underline;
+}
+
+
 /* ================= SUBSCRIPTIONS ================= */
 
 .channel-sections{
