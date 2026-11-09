@@ -154,6 +154,7 @@ function readLiveState(item) {
 
   return {
     isLive,
+    channelId: typeof snippet.channelId === "string" ? snippet.channelId.trim() : "",
     liveChatId: isLive ? liveChatId : "",
     concurrentViewers:
       isLive && Number.isFinite(viewers) && viewers > 0 ? viewers : 0,

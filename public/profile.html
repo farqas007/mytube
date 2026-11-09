@@ -94,14 +94,16 @@ Logout
 
 <h3>YouTube Account</h3>
 
-<p class="profile-empty" id="ytConnectHelp">
-Connect your YouTube account to enable posting comments and live chat messages in a later update. Connecting only grants permission; nothing is posted automatically.
+<p class="profile-empty" id="ytConnectHelp" style="display:none;">
+Connect your YouTube account to identify the channel used for YouTube subscriptions and ratings. Connecting only grants permission; nothing is posted automatically.
 </p>
 
 <div id="ytConnectStatus" class="yt-connect-status" role="status" aria-live="polite"></div>
 
+<div id="ytChannelIdentity" class="yt-channel-identity" style="display:none;" aria-live="polite"></div>
+
 <div class="yt-connect-actions">
-<button type="button" id="ytConnectBtn">Connect YouTube</button>
+<button type="button" id="ytConnectBtn" style="display:none;">Connect YouTube</button>
 <button type="button" id="ytDisconnectBtn" class="yt-disconnect-btn" style="display:none;">Disconnect</button>
 </div>
 

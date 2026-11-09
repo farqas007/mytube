@@ -357,11 +357,28 @@ test("F3 the internal link points at the new page and is revealable", () => {
 // G) No accidental coupling: the change did not touch the Worker API surface
 // -----------------------------------------------------------------------------
 
-test("G1 channel.js adds no new /api route", () => {
-  assert.ok(
-    !/\/api\//.test(CHANNEL_JS),
-    "channel.js must talk to the backend only through youtube.js"
+test("G1 channel.js uses only the approved YouTube-account routes", () => {
+  // The channel page now drives the shared YouTube-account subscription
+  // controls directly (Phase 1), instead of routing through youtube.js. Pin the
+  // exact routes so the page cannot quietly invent a new API surface.
+  const routes = [...CHANNEL_JS.matchAll(/["'](\/api\/[A-Za-z0-9_/-]+)/g)].map(
+    match => match[1]
   );
+  const allowed = new Set([
+    "/api/youtube/subscription-status",
+    "/api/youtube/subscribe",
+    "/api/youtube/unsubscribe"
+  ]);
+
+  assert.ok(routes.length > 0, "the account controls must call the backend");
+
+  for (const route of routes) {
+    assert.ok(allowed.has(route), `unexpected /api route in channel.js: ${route}`);
+  }
+
+  // It must never touch Live Chat or the generic video proxy from this page.
+  assert.ok(!/\/api\/liveChat/.test(CHANNEL_JS), "channel.js must not use Live Chat");
+  assert.ok(!/\/api\/video/.test(CHANNEL_JS), "channel.js must not use the video proxy");
 });
 
 test("G2 the two existing channel endpoints are the ones used", () => {

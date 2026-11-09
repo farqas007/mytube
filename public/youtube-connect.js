@@ -8,11 +8,19 @@
 //   GET  /api/oauth/start      Authorization: Bearer <Firebase ID token>
 //                              -> 200 { authorizationUrl }
 //   GET  /api/oauth/status     Authorization: Bearer <Firebase ID token>
-//                              -> 200 { connected: boolean, scope: string }
+//                              -> 200 { connected: boolean, scope: string,
+//                                      connectEnabled: boolean }
 //   POST /api/oauth/disconnect Authorization: Bearer <Firebase ID token>
 //                              -> 200 { connected: false, revoked: boolean }
 // A 401 means the Firebase session needs re-login; 503 means the server's Google
-// OAuth env is not configured yet. Both are shown as safe, generic messages.
+// OAuth env is not configured yet, or the Connect flow is switched off. Both are
+// shown as safe, generic messages.
+//
+// The Connect flow is switched OFF on the server right now: /api/oauth/status
+// reports connectEnabled: false. The module removes the Connect button and its
+// help text as soon as it sees that flag. An existing connection stays visible
+// and stays revocable, because the user must always be able to remove a grant
+// from MyTube.
 //
 // The callback lands back on /profile.html?youtube=connected|cancelled|error;
 // that status is consumed here, shown once, and then stripped from the address
@@ -25,9 +33,11 @@ import {
     onAuthStateChanged
 }
 from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { createYoutubeAccountIdentity, broadcastYoutubeGrantChange } from "./youtube-account.js";
 
 
 const statusEl = document.getElementById("ytConnectStatus");
+const identityEl = document.getElementById("ytChannelIdentity");
 const connectBtn = document.getElementById("ytConnectBtn");
 const disconnectBtn = document.getElementById("ytDisconnectBtn");
 const helpEl = document.getElementById("ytConnectHelp");
@@ -42,12 +52,21 @@ const CALLBACK_STATUSES = {
     error: { text: "Could not connect YouTube. Please try again.", kind: "error" }
 };
 
-// Whether the current request could even reach a configured backend. When the
-// server reports "not configured" we stop offering the Connect button.
+// Whether the current request could even reach a configured backend, and
+// whether the server allows a new connection at all. When the server reports
+// "not configured" or "connect disabled" we stop offering the Connect button.
 let connectAvailable = true;
 
 // The signed-in user, kept so button handlers always use a fresh token.
 let currentUser = null;
+
+// Read-only identity resolved from the same grant as the rest of the YouTube
+// actions. Never inferred from the status endpoint or a cached name.
+const ytIdentity = createYoutubeAccountIdentity({
+    getUid: () => currentUser && currentUser.uid ? String(currentUser.uid) : "",
+    getToken: () => idToken(currentUser),
+    onChange: renderChannelIdentity
+});
 
 
 // ================= SAFE STATUS RENDERING =================
@@ -69,6 +88,81 @@ function setBusy(busy){
     if(disconnectBtn){
         disconnectBtn.disabled = busy;
     }
+}
+
+
+function renderChannelIdentity(){
+    if(!identityEl){
+        return;
+    }
+
+    const s = ytIdentity.state;
+
+    if(s.status === "ready" && s.channel){
+        identityEl.style.display = "flex";
+        identityEl.style.alignItems = "center";
+        identityEl.style.gap = "10px";
+        identityEl.style.marginTop = "8px";
+        identityEl.replaceChildren();
+
+        if(s.channel.thumbnail){
+            const img = document.createElement("img");
+            img.src = s.channel.thumbnail;
+            img.alt = "";
+            img.loading = "lazy";
+            img.decoding = "async";
+            img.referrerPolicy = "no-referrer";
+            img.style.width = "32px";
+            img.style.height = "32px";
+            img.style.borderRadius = "50%";
+            img.style.objectFit = "cover";
+            identityEl.appendChild(img);
+        }
+
+        const text = document.createElement("div");
+        const title = document.createElement("strong");
+        title.textContent = s.channel.title || "YouTube channel";
+        const id = document.createElement("span");
+        id.textContent = "Channel ID: " + s.channel.id;
+        id.style.display = "block";
+        id.style.fontSize = "12px";
+        id.style.color = "#888";
+        text.appendChild(title);
+        text.appendChild(id);
+        identityEl.appendChild(text);
+        return;
+    }
+
+    if(s.status === "multiple" || s.status === "none"){
+        identityEl.style.display = "block";
+        identityEl.style.marginTop = "8px";
+        identityEl.textContent = ytIdentity.blockedMessage();
+        return;
+    }
+
+    if(s.status === "error"){
+        identityEl.style.display = "block";
+        identityEl.style.marginTop = "8px";
+        identityEl.textContent = s.lastError || "Could not identify your connected YouTube account.";
+        return;
+    }
+
+    if(s.status === "disconnected"){
+        identityEl.style.display = "block";
+        identityEl.style.marginTop = "8px";
+        identityEl.textContent = "Reconnect your YouTube account to read its channel identity.";
+        return;
+    }
+
+    if(s.status === "loading"){
+        identityEl.style.display = "block";
+        identityEl.style.marginTop = "8px";
+        identityEl.textContent = "Checking connected YouTube account...";
+        return;
+    }
+
+    identityEl.style.display = "none";
+    identityEl.replaceChildren();
 }
 
 
@@ -146,12 +240,14 @@ async function refreshStatus(user){
 
         if(response.status === 401){
             connectAvailable = false;
+            ytIdentity.clear("signed_out");
             setStatus("Please sign in again to manage your YouTube connection.", "error");
             return;
         }
 
         if(response.status === 503){
             connectAvailable = false;
+            ytIdentity.clear("idle");
             if(connectBtn){
                 connectBtn.style.display = "none";
             }
@@ -163,16 +259,27 @@ async function refreshStatus(user){
         }
 
         if(!response.ok){
+            ytIdentity.clear("idle");
             setStatus("Could not check your YouTube connection. Please try again.", "error");
             return;
         }
 
-        connectAvailable = true;
-
         const connected = Boolean(body && body.connected);
+
+        // The server is the only authority on whether a NEW connection may be
+        // started. Only an explicit `true` enables it; a missing or malformed
+        // flag fails closed, so an older backend can never silently turn the
+        // button back on. An existing connection is still shown, and Disconnect
+        // still works.
+        const connectEnabled = Boolean(body && body.connectEnabled === true);
+
+        connectAvailable = connectEnabled;
 
         if(connected){
             setStatus("YouTube account connected.", "ok");
+            // Resolve the actual channel from the grant before showing it.
+            // Non-blocking so the connect/disconnect controls stay responsive.
+            void ytIdentity.load({ force: true });
             if(connectBtn){
                 connectBtn.style.display = "none";
             }
@@ -181,19 +288,31 @@ async function refreshStatus(user){
             }
         }
         else{
-            setStatus("No YouTube account connected.", "muted");
+            ytIdentity.clear("disconnected");
+            setStatus(
+                connectEnabled
+                    ? "No YouTube account connected."
+                    : "No YouTube account connected. YouTube connection is not available yet.",
+                "muted"
+            );
             if(connectBtn){
-                connectBtn.style.display = "";
+                connectBtn.style.display = connectEnabled ? "" : "none";
             }
             if(disconnectBtn){
                 disconnectBtn.style.display = "none";
             }
         }
+
+        if(helpEl){
+            helpEl.style.display = connectEnabled ? "" : "none";
+        }
     }
     catch(error){
         if(error && error.message === "not_authenticated"){
+            ytIdentity.clear("signed_out");
             return;
         }
+        ytIdentity.clear("idle");
         setStatus("Could not check your YouTube connection. Please try again.", "error");
     }
     finally{
@@ -271,6 +390,7 @@ async function handleDisconnect(){
         const body = await response.json().catch(() => null);
 
         if(response.status === 401){
+            ytIdentity.clear("signed_out");
             setStatus("Please sign in again to disconnect YouTube.", "error");
             return;
         }
@@ -279,6 +399,11 @@ async function handleDisconnect(){
             setStatus("Could not disconnect YouTube. Please try again.", "error");
             return;
         }
+
+        // The grant is gone locally: drop the cached identity immediately and
+        // let any other open page/tab re-read the grant.
+        ytIdentity.clear("disconnected");
+        broadcastYoutubeGrantChange();
 
         // The local grant is gone either way; `revoked` says whether Google's
         // side was actually revoked, so the message stays honest.
@@ -321,17 +446,20 @@ onAuthStateChanged(auth, (user) => {
 
     if(!user){
         // Logged out: the profile page already hides this section via
-        // #profileContent, but keep state clean for a later re-login.
-        connectAvailable = true;
+        // #profileContent, but keep state clean for a later re-login. The
+        // Connect button stays hidden — a signed-out visitor could not use it
+        // anyway, and the server decides when it may be shown.
+        connectAvailable = false;
+        ytIdentity.clear("signed_out");
         setStatus("", "");
         if(connectBtn){
-            connectBtn.style.display = "";
+            connectBtn.style.display = "none";
         }
         if(disconnectBtn){
             disconnectBtn.style.display = "none";
         }
         if(helpEl){
-            helpEl.style.display = "";
+            helpEl.style.display = "none";
         }
         return;
     }
@@ -342,6 +470,11 @@ onAuthStateChanged(auth, (user) => {
 
     if(callbackStatus){
         setStatus(callbackStatus.text, callbackStatus.kind);
+        // A completed connect/reconnect changes the grant. Notify other pages
+        // and tabs; the signal contains no tokens or channel identity.
+        if(callbackStatus === CALLBACK_STATUSES.connected){
+            broadcastYoutubeGrantChange();
+        }
     }
 
     refreshStatus(user);

@@ -3,6 +3,9 @@
   "name": "mytube",
   "main": "worker.js",
   "compatibility_date": "2026-09-01",
+  "vars": {
+    "CHAT_SEND_ENABLED": "true"
+  },
   "assets": {
     "directory": "public",
     "binding": "ASSETS",

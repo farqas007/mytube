@@ -169,7 +169,9 @@ test("RL1 the first 10 starts from one IP succeed and the 11th is rate limited",
     }
   );
 
-  // The first 10 must ALL succeed: the budget is not tighter than documented.
+  // The first 10 must NOT be rate limited: each one is a successful start that
+  // hands out a PKCE authorization URL. A 429 here would mean the budget is
+  // tighter than documented.
   for (let i = 0; i < 10; i += 1) {
     assert.equal(
       responses[i].status,
@@ -178,9 +180,10 @@ test("RL1 the first 10 starts from one IP succeed and the 11th is rate limited",
     );
 
     const body = await responses[i].json();
-    assert.ok(
-      body.authorizationUrl,
-      `start request ${i + 1} must return an authorizationUrl`
+    assert.equal(
+      typeof body.authorizationUrl,
+      "string",
+      `start request ${i + 1} must return an authorization URL`
     );
   }
 
@@ -260,7 +263,7 @@ test("RL3 IP A is rate limited while IP B has an independent bucket", async () =
       assert.equal(lastA.status, 429);
       assert.equal((await lastA.json()).code, "RATE_LIMITED");
 
-      // ipB should still be able to make requests (bucket independent)
+      // ipB should still be able to make requests (bucket independent).
       const response = await callWorker("/api/oauth/start", oauthEnv(db), {
         headers: {
           Authorization: `Bearer ${token}`,
@@ -268,10 +271,12 @@ test("RL3 IP A is rate limited while IP B has an independent bucket", async () =
         }
       });
 
-      // ipB's FIRST request must be an explicit success, not merely "not 429".
+      // ipB's FIRST request must be a successful start (200 + authorization
+      // URL), not merely "not 429". A 429 here would mean ipB shared ipA's
+      // exhausted bucket.
       assert.equal(response.status, 200);
       const body = await response.json();
-      assert.ok(body.authorizationUrl, "ipB must receive an authorizationUrl");
+      assert.equal(typeof body.authorizationUrl, "string");
     }
   );
 });
@@ -307,7 +312,9 @@ test("RL4 status traffic does not consume the start budget and vice versa", asyn
         assert.equal(body.scope, "");
       }
 
-      // The start route still has its full, untouched budget.
+      // The start route still has its full, untouched budget: a successful
+      // start (200 + authorization URL) proves status traffic never touched
+      // the start counter.
       const start = await callWorker("/api/oauth/start", oauthEnv(db), {
         headers: {
           Authorization: `Bearer ${token}`,
@@ -321,9 +328,10 @@ test("RL4 status traffic does not consume the start budget and vice versa", asyn
         "status traffic must not consume the start budget"
       );
       const startBody = await start.json();
-      assert.ok(
-        startBody.authorizationUrl,
-        "the start request must return an authorizationUrl"
+      assert.equal(
+        typeof startBody.authorizationUrl,
+        "string",
+        "the start request must reach the handler, not the limiter"
       );
 
       // --- Direction B: exhausting start must not block status ---

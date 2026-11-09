@@ -1147,6 +1147,29 @@ header input{
     cursor:default;
 }
 
+.channel-yt-account-sub{
+    margin: 8px 0 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-color, rgba(255,255,255,0.12));
+    border-radius: 10px;
+    background: rgba(255,255,255,0.03);
+}
+.channel-yt-account-sub-label{
+    font-size: 12px;
+    color: #aaa;
+    margin-bottom: 4px;
+}
+.channel-yt-account-sub-row{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+.channel-yt-account-sub-status{
+    font-size: 13px;
+    color: #ddd;
+}
+
 .channel-section-grid{
     display:grid;
     grid-template-columns:repeat(auto-fill,minmax(180px,1fr));
@@ -1216,6 +1239,52 @@ header input{
 .lib-clear-btn:disabled{
     opacity:0.6;
     cursor:default;
+}
+
+.history-search-wrap {
+    position: relative;
+    margin-bottom: 16px;
+    max-width: 420px;
+}
+
+.history-search-input {
+    width: 100%;
+    padding: 10px 36px 10px 12px;
+    border-radius: 8px;
+    border: 1px solid #333;
+    background: #1f1f1f;
+    color: #fff;
+    font-size: 14px;
+    box-sizing: border-box;
+}
+
+.history-search-input:focus {
+    outline: 2px solid #3ea6ff;
+    outline-offset: 1px;
+    border-color: #3ea6ff;
+}
+
+.history-search-clear {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: transparent;
+    border: none;
+    color: #aaa;
+    font-size: 18px;
+    cursor: pointer;
+    padding: 4px 8px;
+}
+
+.history-search-clear:hover {
+    color: #fff;
+}
+
+@media (max-width: 768px) {
+    .history-search-wrap {
+        max-width: 100%;
+    }
 }
 
 .lib-remove-btn{
@@ -1845,6 +1914,234 @@ header input{
     .sidebar-divider,
     .sidebar-section-title{
         display:none;
+    }
+}
+
+/* ================= YOUTUBE ACCOUNT SUBSCRIPTIONS (read-only) ================= */
+
+.yt-account-subs{
+    margin-bottom:28px;
+    padding:18px;
+    border:1px solid #2a2a2a;
+    border-radius:14px;
+    background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+}
+
+.yt-account-subs-header h2{
+    margin:0 0 6px;
+    font-size:22px;
+}
+
+.yt-account-subs-subtitle{
+    margin:0;
+    color:#aaa;
+    font-size:14px;
+    line-height:1.45;
+}
+
+.yt-account-subs-controls{
+    margin-top:12px;
+}
+
+.yt-account-subs-count{
+    margin:0;
+    color:#ddd;
+    font-size:14px;
+    font-weight:600;
+}
+
+.yt-account-subs-status{
+    margin:10px 0 0;
+    color:#ffb4b4;
+    font-size:14px;
+    min-height:0;
+}
+
+.yt-account-subs-status:empty{
+    display:none;
+}
+
+.yt-account-subs-inline-state{
+    margin-top:14px;
+    color:#bbb;
+    font-size:14px;
+}
+
+.yt-account-subs-inline-state .spinner{
+    width:28px;
+    height:28px;
+    border-width:3px;
+    margin:0 0 10px;
+}
+
+.yt-account-subs-inline-state p{
+    margin:0 0 10px;
+}
+
+.yt-account-subs-list{
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+    margin-top:14px;
+}
+
+.yt-account-sub-card{
+    border:1px solid #242424;
+    border-radius:12px;
+    background:#141414;
+    overflow:hidden;
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap:12px;
+    padding:12px;
+}
+
+.yt-account-sub-link{
+    display:flex;
+    align-items:flex-start;
+    gap:12px;
+    flex:1 1 auto;
+    min-width:0;
+    color:inherit;
+    text-decoration:none;
+}
+
+.yt-account-sub-actions{
+    flex:0 0 auto;
+    display:flex;
+    flex-direction:column;
+    align-items:flex-end;
+    gap:6px;
+    max-width:220px;
+}
+
+.yt-account-sub-action-status{
+    font-size:12px;
+    color:#aaa;
+    text-align:right;
+    line-height:1.3;
+}
+
+.yt-account-sub-action-btn{
+    background:#272727;
+    color:white;
+    border:none;
+    padding:8px 14px;
+    border-radius:20px;
+    cursor:pointer;
+    font-size:13px;
+    white-space:nowrap;
+}
+
+.yt-account-sub-action-btn:hover{
+    background:#444;
+}
+
+.yt-account-sub-action-btn:disabled{
+    opacity:0.6;
+    cursor:default;
+}
+
+.yt-account-sub-link:hover{
+    background:#1a1a1a;
+}
+
+.yt-account-sub-link:focus-visible{
+    outline:2px solid #fff;
+    outline-offset:-2px;
+}
+
+.yt-account-sub-avatar{
+    width:48px;
+    height:48px;
+    border-radius:50%;
+    background:#2a2a2a;
+    color:#fff;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-weight:700;
+    flex:0 0 auto;
+    overflow:hidden;
+}
+
+.yt-account-sub-avatar img{
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    display:block;
+}
+
+.yt-account-sub-info{
+    min-width:0;
+}
+
+.yt-account-sub-title{
+    margin:0;
+    font-size:16px;
+    line-height:1.3;
+    color:#fff;
+}
+
+.yt-account-sub-desc{
+    margin:4px 0 0;
+    font-size:13px;
+    line-height:1.4;
+    color:#aaa;
+    display:-webkit-box;
+    -webkit-line-clamp:2;
+    -webkit-box-orient:vertical;
+    overflow:hidden;
+}
+
+.local-subs-section{
+    margin-top:8px;
+}
+
+.local-subs-state{
+    margin-top:8px;
+}
+
+@media (max-width: 700px){
+    .yt-account-subs{
+        padding:14px;
+    }
+    .yt-account-subs-header h2{
+        font-size:20px;
+    }
+    .yt-account-sub-link{
+        align-items:flex-start;
+    }
+}
+
+@media (max-width: 600px){
+    .yt-account-sub-card{
+        flex-wrap:wrap;
+        overflow:visible;
+    }
+    .yt-account-sub-link{
+        flex:1 1 100%;
+    }
+    .yt-account-sub-actions{
+        flex:1 1 100%;
+        max-width:none;
+        align-items:stretch;
+    }
+    .yt-account-sub-action-status{
+        text-align:left;
+    }
+    .yt-account-sub-action-btn{
+        white-space:normal;
+        width:100%;
+    }
+    .yt-account-sub-title,
+    .yt-account-sub-desc{
+        overflow-wrap:anywhere;
+    }
+    .yt-account-sub-action-btn:focus-visible{
+        outline:2px solid #fff;
+        outline-offset:2px;
     }
 }
 

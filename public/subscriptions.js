@@ -1,42 +1,85 @@
 // ================= SUBSCRIPTIONS PAGE =================
-// Shows subscribed channels with their latest videos.
-// Reads subscriptions from Firestore; fetches channel videos via backend API.
+// Shows local MyTube subscribed channels (existing behavior) and the actual
+// subscriptions of the connected YouTube account (read-only, explicit page load).
+// Local/MyTube subscriptions remain separate from YouTube account subscriptions.
 
 import { auth } from "./firebase.js";
 import { onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 import { getSubscriptions, removeSubscription } from "./data.js";
 import { channelVideos, channel } from "./youtube.js";
+import { createYoutubeAccountIdentity, onYoutubeGrantChange } from "./youtube-account.js";
 import { attachHoverPreview } from "./shared/hoverPreview.js";
 
 
 // ================= ELEMENTS =================
 
 const loggedOutEl = document.getElementById("subsLoggedOut");
-const loadingEl = document.getElementById("subsLoading");
-const emptyEl = document.getElementById("subsEmpty");
-const errorEl = document.getElementById("subsError");
-const errorTextEl = document.getElementById("subsErrorText");
 const contentEl = document.getElementById("subsContent");
 const sectionsEl = document.getElementById("channelSections");
+
+// Local (MyTube) subscriptions UI — scoped so it does not affect the
+// YouTube Account Subscriptions section.
+const localLoadingEl = document.getElementById("localSubsLoading");
+const localEmptyEl = document.getElementById("localSubsEmpty");
+const localErrorEl = document.getElementById("localSubsError");
+const localErrorTextEl = document.getElementById("localSubsErrorText");
+const localViewsEl = document.getElementById("localSubsViews");
+// Backward-compatible aliases for existing local logic.
+const loadingEl = localLoadingEl;
+const emptyEl = localEmptyEl;
+const errorEl = localErrorEl;
+const errorTextEl = localErrorTextEl;
 
 
 // ================= STATE DISPLAY =================
 
-function showState(state){
-    [loggedOutEl, loadingEl, emptyEl, errorEl, contentEl].forEach(el => {
-        if(el){
-            el.style.display = "none";
-        }
+function showLocalState(state){
+    if(contentEl){
+        contentEl.style.display = "block";
+    }
+    [localLoadingEl, localEmptyEl, localErrorEl].forEach(el => {
+        if(el){ el.style.display = "none"; }
     });
+    if(localViewsEl){
+        localViewsEl.style.display = state === "content" ? "" : "none";
+    }
     const target = {
-        loggedOut: loggedOutEl,
-        loading: loadingEl,
-        empty: emptyEl,
-        error: errorEl,
-        content: contentEl
+        loading: localLoadingEl,
+        empty: localEmptyEl,
+        error: localErrorEl
     }[state];
     if(target){
-        target.style.display = state === "content" ? "block" : "";
+        target.style.display = "";
+    }
+}
+
+function showState(state){
+    // Preserve existing call sites/behavior for local MyTube subscriptions.
+    if(state === "loggedOut"){
+        if(loggedOutEl){ loggedOutEl.style.display = ""; }
+        if(contentEl){ contentEl.style.display = "none"; }
+        [localLoadingEl, localEmptyEl, localErrorEl].forEach(el => {
+            if(el){ el.style.display = "none"; }
+        });
+        if(localViewsEl){ localViewsEl.style.display = "none"; }
+        renderYoutubeAccountSignedOut();
+        return;
+    }
+    if(loggedOutEl){ loggedOutEl.style.display = "none"; }
+    if(state === "content"){
+        showLocalState("content");
+        return;
+    }
+    if(state === "loading"){
+        showLocalState("loading");
+        return;
+    }
+    if(state === "empty"){
+        showLocalState("empty");
+        return;
+    }
+    if(state === "error"){
+        showLocalState("error");
     }
 }
 
@@ -46,6 +89,888 @@ function showError(msg){
         errorTextEl.textContent = msg || "Could not load subscriptions.";
     }
     showState("error");
+}
+
+
+// ================= YOUTUBE ACCOUNT SUBSCRIPTIONS =================
+// Fetches actual subscriptions from the connected YouTube account via the
+// authenticated backend endpoint (read-only list). First page only on page
+// open/auth load. Per-item YT account status/subscribe/unsubscribe controls are
+// explicit, confirmed, and separate from MyTube-local subscriptions. Never
+// auto-subscribes/unsubscribes. Status fetches occur only on explicit user
+// request or uncertain-mutation recovery (read-only GET).
+
+const ytSubsEls = {
+    section: document.getElementById("youtubeAccountSubsSection"),
+    subtitle: document.querySelector("#youtubeAccountSubsSection .yt-account-subs-subtitle"),
+    status: document.getElementById("ytAccountSubsStatus"),
+    countWrap: document.getElementById("ytAccountSubsControls"),
+    count: document.getElementById("ytAccountSubsCount"),
+    loading: document.getElementById("ytAccountSubsLoading"),
+    state: document.getElementById("ytAccountSubsState"),
+    stateText: document.getElementById("ytAccountSubsStateText"),
+    actionBtn: document.getElementById("ytAccountSubsActionBtn"),
+    list: document.getElementById("ytAccountSubsList"),
+    loadMore: document.getElementById("ytAccountSubsLoadMore")
+};
+
+const ytSubsState = {
+    uid: "",
+    items: [],
+    nextPageToken: null,
+    totalResults: null,
+    requestInFlight: false,
+    seq: 0,
+    loadedFirstPage: false,
+    lastPageToken: "",
+    channelIds: new Set()
+};
+
+// Read-only identity of the account whose subscriptions are shown and whose
+// account will perform any per-item YouTube subscribe/unsubscribe action.
+const ytIdentity = createYoutubeAccountIdentity({
+    getUid: () => ytItemCurrentUid(),
+    getToken: () => getFirebaseIdTokenForYoutubeSubs(),
+    onChange: () => {
+        renderYoutubeAccountIdentity();
+        renderAllYtItemControls();
+    }
+});
+
+function renderYoutubeAccountIdentity(){
+    if(!ytSubsEls.subtitle){
+        return;
+    }
+    const base = "Subscriptions from your connected YouTube account. This list is separate from MyTube local subscriptions.";
+    const acting = ytIdentity.label();
+    if(acting){
+        ytSubsEls.subtitle.textContent = "Acting as " + acting + ". " + base;
+    }
+    else if(ytIdentity.state.status === "multiple" || ytIdentity.state.status === "none"){
+        ytSubsEls.subtitle.textContent = ytIdentity.blockedMessage() + " " + base;
+    }
+    else{
+        ytSubsEls.subtitle.textContent = base;
+    }
+}
+
+function ytSubsSetStatus(msg){
+    if(ytSubsEls.status){ ytSubsEls.status.textContent = msg || ""; }
+}
+
+function ytSubsShowLoading(show){
+    if(ytSubsEls.loading){ ytSubsEls.loading.style.display = show ? "" : "none"; }
+}
+
+function ytSubsShowState(show, msg, actionLabel, actionHref){
+    if(ytSubsEls.state){ ytSubsEls.state.style.display = show ? "" : "none"; }
+    if(ytSubsEls.stateText){ ytSubsEls.stateText.textContent = show ? (msg || "") : ""; }
+    if(ytSubsEls.actionBtn){
+        if(show && actionLabel){
+            ytSubsEls.actionBtn.style.display = "";
+            ytSubsEls.actionBtn.textContent = actionLabel;
+            ytSubsEls.actionBtn.onclick = actionHref ? () => { window.location.href = actionHref; } : null;
+        } else {
+            ytSubsEls.actionBtn.style.display = "none";
+            ytSubsEls.actionBtn.textContent = "";
+            ytSubsEls.actionBtn.onclick = null;
+        }
+    }
+}
+
+function ytSubsUpdateCount(){
+    if(!ytSubsEls.countWrap || !ytSubsEls.count){ return; }
+    if(ytSubsState.totalResults == null){
+        ytSubsEls.countWrap.style.display = "none";
+        ytSubsEls.count.textContent = "";
+        return;
+    }
+    const n = Number(ytSubsState.totalResults);
+    ytSubsEls.countWrap.style.display = "";
+    ytSubsEls.count.textContent = Number.isFinite(n)
+        ? ("Total YouTube subscriptions: " + n.toLocaleString())
+        : "Total YouTube subscriptions: unavailable";
+}
+
+function ytSubsRenderLoadMore(){
+    if(!ytSubsEls.loadMore){ return; }
+    const hasMore = typeof ytSubsState.nextPageToken === "string" && ytSubsState.nextPageToken.length > 0;
+    ytSubsEls.loadMore.style.display = hasMore ? "" : "none";
+    ytSubsEls.loadMore.disabled = ytSubsState.requestInFlight;
+    ytSubsEls.loadMore.textContent = ytSubsState.requestInFlight ? "Loading..." : "Load more";
+}
+
+function ytSubsThumbUrl(thumbnails){
+    if(!thumbnails || typeof thumbnails !== "object"){ return ""; }
+    const pick = thumbnails.medium || thumbnails.default || thumbnails.high || null;
+    return pick && typeof pick.url === "string" ? pick.url : "";
+}
+
+function ytSubsRenderItem(item){
+    if(!item || !item.channelId){ return null; }
+    const channelId = String(item.channelId);
+    const itemTitle = item.title || "YouTube channel";
+    const row = document.createElement("article");
+    row.className = "yt-account-sub-card";
+    row.setAttribute("data-channel-id", channelId);
+
+    const link = document.createElement("a");
+    link.className = "yt-account-sub-link";
+    link.href = "channel.html?id=" + encodeURIComponent(channelId);
+    link.setAttribute("aria-label", "Open channel " + (itemTitle || "on YouTube"));
+
+    const avatar = document.createElement("div");
+    avatar.className = "yt-account-sub-avatar";
+    const thumbUrl = ytSubsThumbUrl(item.thumbnails);
+    if(thumbUrl){
+        const img = document.createElement("img");
+        img.src = thumbUrl;
+        img.alt = "";
+        img.loading = "lazy";
+        img.decoding = "async";
+        img.referrerPolicy = "no-referrer";
+        avatar.appendChild(img);
+    } else {
+        avatar.textContent = getInitials(itemTitle || "C");
+    }
+
+    const info = document.createElement("div");
+    info.className = "yt-account-sub-info";
+    const title = document.createElement("h3");
+    title.className = "yt-account-sub-title";
+    title.textContent = itemTitle || "YouTube channel";
+    info.appendChild(title);
+    if(item.description){
+        const desc = document.createElement("p");
+        desc.className = "yt-account-sub-desc";
+        desc.textContent = String(item.description).slice(0, 140);
+        info.appendChild(desc);
+    }
+
+    link.appendChild(avatar);
+    link.appendChild(info);
+    row.appendChild(link);
+
+    // Explicit YT account controls (separate from MyTube-local). No auto status fetch.
+    if(isValidYoutubeChannelIdClient(channelId)){
+        row.appendChild(createYtItemActions(channelId, itemTitle));
+        renderYtItemControl(channelId, row);
+    }
+
+    return row;
+}
+
+function ytSubsAppendItems(items){
+    if(!ytSubsEls.list || !Array.isArray(items)){ return; }
+    for(const item of items){
+        const channelId = item && item.channelId ? String(item.channelId) : "";
+        if(!channelId || ytSubsState.channelIds.has(channelId)){ continue; }
+        ytSubsState.channelIds.add(channelId);
+        ytSubsState.items.push(item);
+        const row = ytSubsRenderItem(item);
+        if(row){ ytSubsEls.list.appendChild(row); }
+    }
+}
+
+function resetYtItemControlsForViewReset(){
+    // Preserve pending mutation locks across auth/list resets. Only the original
+    // mutation owner may release its lock after settlement.
+    for(const [channelId, state] of ytItemControlStates.entries()){
+        if(state && state.mutationInFlight){
+            state.status = "mutating";
+            state.lastError = "";
+            // Keep mutationSeq/mutationInFlight/uid/channelId ownership intact.
+            continue;
+        }
+        ytItemControlStates.delete(channelId);
+    }
+}
+
+function ytSubsResetView(){
+    ytSubsState.items = [];
+    ytSubsState.nextPageToken = null;
+    ytSubsState.totalResults = null;
+    ytSubsState.loadedFirstPage = false;
+    ytSubsState.lastPageToken = "";
+    ytSubsState.channelIds = new Set();
+    if(ytSubsEls.list){ ytSubsEls.list.replaceChildren(); }
+    resetYtItemControlsForViewReset();
+    ytSubsUpdateCount();
+    ytSubsRenderLoadMore();
+    ytSubsSetStatus("");
+    ytSubsShowLoading(false);
+    ytSubsShowState(false);
+}
+
+async function getFirebaseIdTokenForYoutubeSubs(){
+    const user = auth && auth.currentUser;
+    if(!user || typeof user.getIdToken !== "function"){
+        return null;
+    }
+    try{
+        if(typeof auth.authStateReady === "function"){
+            await auth.authStateReady();
+        }
+    } catch(e){ /* ignore */ }
+    const freshUser = (auth && auth.currentUser) || user;
+    if(!freshUser || typeof freshUser.getIdToken !== "function"){
+        return null;
+    }
+    try{
+        return await freshUser.getIdToken();
+    } catch(e){
+        return null;
+    }
+}
+
+function ytSubsSafeErrorMessage(result){
+    const code = result && result.body && result.body.code ? String(result.body.code) : "";
+    const fallback = "Could not load YouTube account subscriptions right now. Please try again.";
+    if(!result){
+        return fallback;
+    }
+    if(result.status === 401 || code === "UNAUTHENTICATED"){
+        return "Sign in to view your YouTube account subscriptions.";
+    }
+    if(code === "YOUTUBE_NOT_CONNECTED"){
+        return "Connect your YouTube account in Profile to view your YouTube subscriptions here.";
+    }
+    if(code === "YOUTUBE_SCOPE_REQUIRED" || code === "YOUTUBE_REAUTH_REQUIRED"){
+        return "Reconnect your YouTube account in Profile to view your YouTube subscriptions.";
+    }
+    if(code === "QUOTA_EXCEEDED"){
+        return "YouTube's daily limit has been reached. Please try again later.";
+    }
+    if(code === "RATE_LIMITED"){
+        return "You're making requests too quickly. Please wait a moment and try again.";
+    }
+    if(code === "UPSTREAM_TIMEOUT" || code === "UPSTREAM_ERROR" || code === "TOKEN_EXCHANGE_FAILED" || code === "OAUTH_UNAVAILABLE"){
+        return "YouTube account subscriptions are temporarily unavailable. Please try again.";
+    }
+    if(code === "INVALID_PAGE_TOKEN" || code === "INVALID_REQUEST"){
+        return "Could not load more YouTube subscriptions. Please refresh and try again.";
+    }
+    if(result.body && typeof result.body.error === "string" && result.body.error){
+        return result.body.error;
+    }
+    return fallback;
+}
+
+function ytSubsIsConnectState(result){
+    const code = result && result.body && result.body.code ? String(result.body.code) : "";
+    return code === "YOUTUBE_NOT_CONNECTED" || code === "YOUTUBE_SCOPE_REQUIRED" || code === "YOUTUBE_REAUTH_REQUIRED";
+}
+
+// Per-item YouTube account controls (explicit, confirmed; separate from MyTube-local).
+// State keyed by channelId. Never auto-subscribes/unsubscribes. Status GET occurs
+// only on explicit user request or uncertain-mutation recovery. Pending mutation
+// locks are never released by auth/list resets; only the original mutation owner
+// releases its lock on settlement. Stale results must not update other contexts.
+const ytItemControlStates = new Map();
+
+function isValidYoutubeChannelIdClient(value){
+    const id = String(value || "").trim();
+    return id.length > 0 && id.length <= 128 && /^[A-Za-z0-9_-]+$/.test(id);
+}
+
+function ytItemCurrentUid(){
+    const user = (auth && auth.currentUser) || null;
+    return user && user.uid ? String(user.uid) : "";
+}
+
+function getYtItemControlState(channelId, title){
+    const id = String(channelId || "").trim();
+    if(!id) return null;
+    let state = ytItemControlStates.get(id);
+    if(!state){
+        state = {
+            seq: 0,
+            mutationSeq: 0,
+            channelId: id,
+            uid: ytItemCurrentUid(),
+            title: String(title || ""),
+            status: "unknown", // unknown | signed_out | disconnected | loading | ready | unavailable | mutating
+            subscribed: null,
+            statusInFlight: false,
+            mutationInFlight: false,
+            lastError: ""
+        };
+        ytItemControlStates.set(id, state);
+    }
+    if(title) state.title = String(title);
+    return state;
+}
+
+function findYtItemRow(channelId){
+    if(!ytSubsEls.list || !channelId) return null;
+    return ytSubsEls.list.querySelector('.yt-account-sub-card[data-channel-id="' + String(channelId).replace(/"/g, '\\"') + '"]');
+}
+
+function renderYtItemControl(channelId, rowOverride){
+    const state = getYtItemControlState(channelId);
+    if(!state) return;
+    const row = rowOverride || findYtItemRow(channelId);
+    if(!row) return;
+    const statusEl = row.querySelector(".yt-account-sub-action-status");
+    const btn = row.querySelector(".yt-account-sub-action-btn");
+    if(!statusEl || !btn) return;
+
+    const uid = ytItemCurrentUid();
+    const busy = state.statusInFlight || state.mutationInFlight || state.status === "loading" || state.status === "mutating";
+    const identityStatus = ytIdentity.state.status;
+    const identityBlocked = ytIdentity.isBlocked()
+        || identityStatus === "loading"
+        || identityStatus === "error"
+        || identityStatus === "idle";
+    let statusText = "YouTube status unknown.";
+    let btnText = "Check YouTube status";
+    let btnDisabled = busy || identityBlocked;
+
+    if(identityBlocked){
+        statusText = ytIdentity.identityMessage();
+        btnText = "Check YouTube status";
+        btnDisabled = busy;
+    } else if(!uid){
+        statusText = "Sign in to manage YouTube account.";
+        btnText = "Sign in";
+        btnDisabled = false;
+    } else if(state.status === "loading"){
+        statusText = "Checking status...";
+        btnText = "Checking...";
+    } else if(state.status === "mutating"){
+        statusText = "Updating YouTube subscription...";
+        btnText = "Updating...";
+    } else if(state.status === "disconnected"){
+        statusText = "YouTube account not connected.";
+        btnText = "Open Profile";
+        btnDisabled = false;
+    } else if(state.status === "ready"){
+        if(state.subscribed === true){
+            statusText = "Subscribed on YouTube.";
+            btnText = "Unsubscribe on YouTube";
+            btnDisabled = busy;
+        } else if(state.subscribed === false){
+            statusText = "Not subscribed on YouTube.";
+            btnText = "Subscribe on YouTube";
+            btnDisabled = busy;
+        } else {
+            statusText = "Status unavailable.";
+            btnText = "Check YouTube status";
+            btnDisabled = busy;
+        }
+    } else if(state.status === "unavailable"){
+        statusText = state.lastError || "Status unavailable.";
+        btnText = "Retry check";
+        btnDisabled = busy;
+    } else if(state.status === "signed_out"){
+        statusText = "Sign in to manage YouTube account.";
+        btnText = "Sign in";
+        btnDisabled = false;
+    } else { // unknown
+        statusText = "Check your YouTube account status.";
+        btnText = "Check YouTube status";
+        btnDisabled = busy;
+    }
+
+    statusEl.textContent = statusText;
+    btn.textContent = btnText;
+    btn.disabled = Boolean(btnDisabled);
+}
+
+function renderAllYtItemControls(){
+    if(!ytSubsEls.list) return;
+    const rows = ytSubsEls.list.querySelectorAll(".yt-account-sub-card[data-channel-id]");
+    rows.forEach(row => {
+        const channelId = row.getAttribute("data-channel-id");
+        if(channelId) renderYtItemControl(channelId);
+    });
+}
+
+function ytItemIsListContextCurrent(uid){
+    const currentUid = ytItemCurrentUid();
+    // Stale if auth changed or the list is no longer for this signed-in user.
+    if(!currentUid || !uid || currentUid !== uid) return false;
+    if(ytSubsState.uid && ytSubsState.uid !== currentUid) return false;
+    return true;
+}
+
+function ytItemSetUnavailable(channelId, msg){
+    const state = getYtItemControlState(channelId);
+    if(!state) return;
+    state.status = "unavailable";
+    state.lastError = msg || "";
+    renderYtItemControl(channelId);
+}
+
+async function fetchYtItemSubscriptionStatus(channelId, options){
+    const opts = options || {};
+    const id = String(channelId || "").trim();
+    if(!isValidYoutubeChannelIdClient(id)) return;
+    const state = getYtItemControlState(id);
+    if(!state) return;
+
+    const uid = ytItemCurrentUid();
+    if(!uid){
+        // Mutate existing state in place (do not replace object): preserves owner
+        // references held by in-flight requests and avoids stale-map overwrites.
+        state.seq += 1; // Invalidate prior status-request ownership.
+        state.channelId = id;
+        state.uid = "";
+        state.statusInFlight = false; // Old status request no longer owns state.
+        // Never release mutationInFlight on auth/status transitions.
+        state.mutationSeq = state.mutationSeq;
+        state.mutationInFlight = state.mutationInFlight;
+        state.status = state.mutationInFlight ? "mutating" : "signed_out";
+        state.subscribed = state.mutationInFlight ? state.subscribed : null;
+        state.lastError = "";
+        renderYtItemControl(id);
+        return;
+    }
+
+    if(state.statusInFlight || state.mutationInFlight) return;
+    if(!opts.force && state.status === "ready" && state.uid === uid) return;
+
+    const seq = ++state.seq;
+    state.uid = uid;
+    state.channelId = id;
+    state.statusInFlight = true;
+    state.status = "loading";
+    state.lastError = "";
+    renderYtItemControl(id);
+
+    let result;
+    try{
+        const token = await getFirebaseIdTokenForYoutubeSubs();
+        if(!token){
+            result = { ok: false, status: 401, body: { code: "UNAUTHENTICATED" } };
+        } else {
+            const res = await fetch("/api/youtube/subscription-status?channelId=" + encodeURIComponent(id), {
+                method: "GET",
+                headers: { Authorization: "Bearer " + token },
+                cache: "no-store"
+            });
+            let body = null;
+            try{ body = await res.json(); } catch(e){ body = null; }
+            result = { ok: res.ok, status: res.status, body };
+        }
+    } catch(e){
+        result = { ok: false, status: 0, body: { code: "UPSTREAM_ERROR" } };
+    }
+
+    // Only owner may settle; guard against stale account/channel/list context.
+    if(seq !== state.seq || state.statusInFlight !== true || !ytItemIsListContextCurrent(uid) || ytItemCurrentUid() !== uid){
+        return;
+    }
+
+    state.statusInFlight = false;
+    const body = result && result.body ? result.body : {};
+    const code = String(body.code || "");
+
+    if(result.ok && body.ok === true && body.available === true && (body.subscribed === true || body.subscribed === false)){
+        state.status = "ready";
+        state.subscribed = body.subscribed === true;
+        state.lastError = "";
+        renderYtItemControl(id);
+        return;
+    }
+
+    if(result.status === 401 || code === "UNAUTHENTICATED"){
+        state.status = "signed_out";
+        state.subscribed = null;
+        state.lastError = "";
+        ytIdentity.clear("signed_out");
+    } else if(ytSubsIsConnectState(result)){
+        state.status = "disconnected";
+        state.subscribed = null;
+        state.lastError = "";
+        ytIdentity.clear("disconnected");
+    } else if(code === "RATE_LIMITED"){
+        ytItemSetUnavailable(id, "Requests are too fast. Please wait and retry.");
+        return;
+    } else if(code === "QUOTA_EXCEEDED"){
+        ytItemSetUnavailable(id, "YouTube daily limit reached. Try again later.");
+        return;
+    } else {
+        ytItemSetUnavailable(id, (body && body.error) ? String(body.error) : "Could not check YouTube status.");
+        return;
+    }
+    renderYtItemControl(id);
+}
+
+async function mutateYtItemSubscription(channelId, action){
+    const id = String(channelId || "").trim();
+    if(!isValidYoutubeChannelIdClient(id)) return;
+    if(action !== "subscribe" && action !== "unsubscribe") return;
+    const state = getYtItemControlState(id);
+    if(!state) return;
+    if(state.mutationInFlight || state.statusInFlight) return;
+
+    const uid = ytItemCurrentUid();
+    if(!uid){
+        state.status = "signed_out";
+        state.subscribed = null;
+        renderYtItemControl(id);
+        return;
+    }
+    if(!ytItemIsListContextCurrent(uid)){
+        renderYtItemControl(id);
+        return;
+    }
+    if(state.status === "disconnected"){
+        renderYtItemControl(id);
+        return;
+    }
+
+    // Capture the identity the user is currently shown. It must survive the
+    // immediate pre-write refresh, and the backend verifies it again.
+    const expected = ytIdentity.mutationGuard();
+    if(!expected.uid || !expected.channelId){
+        state.status = "unavailable";
+        state.lastError = ytIdentity.identityMessage();
+        renderYtItemControl(id);
+        return;
+    }
+
+    const chName = state.title || "this channel";
+    const confirmText = action === "subscribe"
+        ? ("Subscribe to \"" + chName + "\" using your connected YouTube account?")
+        : ("Unsubscribe from \"" + chName + "\" using your connected YouTube account?");
+    if(!window.confirm(confirmText)){
+        return;
+    }
+
+    // Separate mutation ownership: auth/list resets/status seq must not release lock.
+    const mutationSeqToken = ++state.mutationSeq;
+    state.uid = uid;
+    state.channelId = id;
+    state.mutationInFlight = true;
+    state.status = "mutating";
+    state.lastError = "";
+    renderYtItemControl(id);
+
+    // Refresh and verify immediately before the write. If the grant, user or
+    // channel changed, block instead of silently acting on another account.
+    const guard = await ytIdentity.verifyForMutation(expected);
+    if(mutationSeqToken !== state.mutationSeq){
+        return;
+    }
+    if(!guard.ok){
+        state.mutationInFlight = false;
+        state.status = "unavailable";
+        state.lastError = ytIdentity.mutationFailureMessage(guard.reason);
+        renderYtItemControl(id);
+        return;
+    }
+
+    let result;
+    try{
+        const token = await getFirebaseIdTokenForYoutubeSubs();
+        if(!token){
+            result = { ok: false, status: 401, body: { code: "UNAUTHENTICATED" }, uncertain: false };
+        } else {
+            const endpoint = action === "subscribe" ? "/api/youtube/subscribe" : "/api/youtube/unsubscribe";
+            // Never abort or blindly retry an already-sent mutation request.
+            const res = await fetch(endpoint, {
+                method: "POST",
+                headers: {
+                    Authorization: "Bearer " + token,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({ channelId: id, expectedChannelId: expected.channelId, expectedUid: expected.uid }),
+                cache: "no-store"
+            });
+            let body = null;
+            try{ body = await res.json(); } catch(e){ body = null; }
+            const code = body && body.code ? String(body.code) : "";
+            const uncertain = (code === "UPSTREAM_TIMEOUT" || code === "UPSTREAM_ERROR" || res.status >= 500 || res.status === 504);
+            result = { ok: res.ok, status: res.status, body, uncertain };
+        }
+    } catch(e){
+        result = { ok: false, status: 0, body: { code: "UPSTREAM_ERROR" }, uncertain: true };
+    }
+
+    // Original owner must always release its own lock when settled.
+    if(mutationSeqToken !== state.mutationSeq){
+        return;
+    }
+
+    const uiStale = !ytItemIsListContextCurrent(uid) || ytItemCurrentUid() !== uid;
+    state.mutationInFlight = false;
+    if(uiStale){
+        // Never apply subscribed/error/success to another account/channel/list context.
+        state.uid = ytItemCurrentUid();
+        state.subscribed = null;
+        state.lastError = "";
+        if(!ytItemCurrentUid()){
+            state.status = "signed_out";
+            renderYtItemControl(id);
+            return;
+        }
+        // Signed-in current context unknown for this item; fresh read-only GET only
+        // after lock release, and only if row still exists in current list.
+        state.status = "unknown";
+        renderYtItemControl(id);
+        if(findYtItemRow(id)){
+            void fetchYtItemSubscriptionStatus(id, { force: true });
+        }
+        return;
+    }
+
+    const body = result && result.body ? result.body : {};
+    const code = String(body.code || "");
+
+    if(result.ok && body.ok === true && body.available === true && (body.subscribed === true || body.subscribed === false)){
+        state.status = "ready";
+        state.subscribed = body.subscribed === true;
+        state.lastError = "";
+        renderYtItemControl(id);
+        return;
+    }
+
+    // Uncertain outcome: read-only status check for this channel; never retry mutation.
+    if(result.uncertain || code === "UPSTREAM_TIMEOUT" || code === "UPSTREAM_ERROR"){
+        state.status = "unknown";
+        state.lastError = "";
+        renderYtItemControl(id);
+        void fetchYtItemSubscriptionStatus(id, { force: true });
+        return;
+    }
+
+    if(result.status === 401 || code === "UNAUTHENTICATED"){
+        state.status = "signed_out";
+        state.subscribed = null;
+        state.lastError = "";
+        ytIdentity.clear("signed_out");
+    } else if(ytSubsIsConnectState(result)){
+        state.status = "disconnected";
+        state.subscribed = null;
+        state.lastError = "";
+        ytIdentity.clear("disconnected");
+    } else if(code === "YOUTUBE_IDENTITY_CHANGED" || code === "MULTIPLE_CHANNELS" || code === "YOUTUBE_IDENTITY_UNVERIFIED"){
+        state.status = "unavailable";
+        state.lastError = (body && body.error) ? String(body.error) : "Could not verify your connected YouTube channel.";
+        ytIdentity.clear("idle");
+        void ytIdentity.load({ force: true });
+    } else if(code === "RATE_LIMITED"){
+        state.status = "unavailable";
+        state.lastError = "Requests are too fast. Please wait and retry.";
+    } else if(code === "QUOTA_EXCEEDED"){
+        state.status = "unavailable";
+        state.lastError = "YouTube daily limit reached. Try again later.";
+    } else {
+        state.status = "unavailable";
+        state.lastError = (body && body.error) ? String(body.error) : "Could not update YouTube subscription.";
+    }
+    renderYtItemControl(id);
+}
+
+function handleYtItemControlClick(channelId){
+    const id = String(channelId || "").trim();
+    if(!isValidYoutubeChannelIdClient(id)) return;
+    const uid = ytItemCurrentUid();
+    if(!uid){
+        window.location.href = "login.html";
+        return;
+    }
+    const state = getYtItemControlState(id);
+    if(!state) return;
+    if(state.statusInFlight || state.mutationInFlight) return;
+    if(state.status === "disconnected"){
+        window.location.href = "profile.html";
+        return;
+    }
+
+    // Read-only status checks stay available even when identity is ambiguous
+    // or temporarily unavailable; only the mutation path is gated.
+    const guard = ytIdentity.mutationGuard();
+    if(!guard.uid || !guard.channelId){
+        state.lastError = ytIdentity.identityMessage();
+        void fetchYtItemSubscriptionStatus(id, { force: true });
+        return;
+    }
+    if(state.status === "ready" && state.subscribed === true){
+        void mutateYtItemSubscription(id, "unsubscribe");
+        return;
+    }
+    if(state.status === "ready" && state.subscribed === false){
+        void mutateYtItemSubscription(id, "subscribe");
+        return;
+    }
+    // Explicit status check (only on user request) / retry.
+    void fetchYtItemSubscriptionStatus(id, { force: true });
+}
+
+function createYtItemActions(channelId, title){
+    const actions = document.createElement("div");
+    actions.className = "yt-account-sub-actions";
+
+    const status = document.createElement("span");
+    status.className = "yt-account-sub-action-status";
+    status.setAttribute("aria-live", "polite");
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "yt-account-sub-action-btn channel-section-unsub";
+    btn.setAttribute("aria-label", "Manage YouTube account subscription for " + (title || "channel"));
+    btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        handleYtItemControlClick(channelId);
+    });
+
+    actions.appendChild(status);
+    actions.appendChild(btn);
+
+    // Initialize state/UI (no status fetch - explicit request only).
+    getYtItemControlState(channelId, title);
+    return actions;
+}
+
+async function fetchYoutubeAccountSubscriptions(pageToken){
+    const token = await getFirebaseIdTokenForYoutubeSubs();
+    if(!token){
+        return { ok: false, status: 401, body: { code: "UNAUTHENTICATED" } };
+    }
+    const qs = new URLSearchParams();
+    if(pageToken){
+        qs.set("pageToken", String(pageToken));
+    }
+    const path = "/api/youtube/subscriptions" + (qs.toString() ? ("?" + qs.toString()) : "");
+    const res = await fetch(path, {
+        method: "GET",
+        headers: { Authorization: "Bearer " + token },
+        cache: "no-store"
+    });
+    let body = null;
+    try{ body = await res.json(); } catch(e){ body = null; }
+    return { ok: res.ok, status: res.status, body };
+}
+
+async function loadYoutubeAccountSubscriptions(options){
+    const opts = options || {};
+    const pageToken = typeof opts.pageToken === "string" ? opts.pageToken : "";
+    const user = auth && auth.currentUser;
+    if(!user){
+        renderYoutubeAccountSignedOut();
+        return;
+    }
+    if(ytSubsState.requestInFlight){
+        return;
+    }
+    if(pageToken && (!ytSubsState.nextPageToken || ytSubsState.nextPageToken !== pageToken)){
+        return;
+    }
+
+    const seq = ++ytSubsState.seq;
+    ytSubsState.uid = user.uid;
+    ytSubsState.requestInFlight = true;
+    ytSubsRenderLoadMore();
+    ytSubsShowState(false);
+    ytSubsSetStatus("");
+    if(!pageToken){
+        ytSubsShowLoading(true);
+        // Clear stale items only when loading first page explicitly.
+        // Preserve pending mutation locks (owner-only release on settlement).
+        if(ytSubsEls.list){ ytSubsEls.list.replaceChildren(); }
+        resetYtItemControlsForViewReset();
+        ytSubsState.items = [];
+        ytSubsState.channelIds = new Set();
+        ytSubsState.nextPageToken = null;
+        ytSubsState.totalResults = null;
+        ytSubsUpdateCount();
+    }
+
+    let result;
+    try{
+        result = await fetchYoutubeAccountSubscriptions(pageToken);
+    } catch(e){
+        result = { ok: false, status: 0, body: { code: "UPSTREAM_ERROR" } };
+    }
+
+    // Request ownership: only the request that started this load may settle or
+    // mutate YT subscriptions UI/state. Auth resets/new requests supersede it.
+    if(seq !== ytSubsState.seq || ytSubsState.uid !== (auth && auth.currentUser && auth.currentUser.uid)){
+        if(seq === ytSubsState.seq){
+            // Same sequence but no longer valid for current auth/user context;
+            // settle only if we still own the in-flight state.
+            ytSubsState.requestInFlight = false;
+            ytSubsShowLoading(false);
+            ytSubsRenderLoadMore();
+        }
+        return;
+    }
+
+    ytSubsState.requestInFlight = false;
+    ytSubsShowLoading(false);
+
+    if(result.ok && result.body && result.body.ok === true && result.body.available === true){
+        ytSubsState.loadedFirstPage = true;
+        ytSubsState.nextPageToken = typeof result.body.nextPageToken === "string" && result.body.nextPageToken
+            ? result.body.nextPageToken
+            : null;
+        ytSubsState.totalResults = result.body.pageInfo && Number.isFinite(Number(result.body.pageInfo.totalResults))
+            ? Number(result.body.pageInfo.totalResults)
+            : (Array.isArray(result.body.items) ? result.body.items.length : 0);
+        ytSubsAppendItems(Array.isArray(result.body.items) ? result.body.items : []);
+        ytSubsUpdateCount();
+        ytSubsRenderLoadMore();
+        if(ytSubsState.items.length === 0){
+            ytSubsShowState(true, "No YouTube account subscriptions were found for this connected account.");
+        } else {
+            ytSubsShowState(false);
+        }
+        return;
+    }
+
+    ytSubsRenderLoadMore();
+    if(ytSubsState.items.length > 0 && pageToken){
+        ytSubsSetStatus(ytSubsSafeErrorMessage(result));
+        return;
+    }
+
+    const msg = ytSubsSafeErrorMessage(result);
+    if(ytSubsIsConnectState(result)){
+        ytIdentity.clear("disconnected");
+        ytSubsShowState(true, msg, "Open Profile", "profile.html");
+    } else if(result && (result.status === 401 || (result.body && result.body.code === "UNAUTHENTICATED"))){
+        ytSubsShowState(true, msg, "Log In", "login.html");
+    } else {
+        ytSubsShowState(true, msg);
+    }
+}
+
+function renderYoutubeAccountSignedOut(){
+    ytSubsState.seq += 1;
+    ytSubsState.requestInFlight = false;
+    ytSubsState.loadedFirstPage = false;
+    ytIdentity.clear("signed_out");
+    ytSubsResetView();
+    ytSubsShowState(true, "Sign in to view subscriptions from your connected YouTube account.", "Log In", "login.html");
+}
+
+function initYoutubeAccountSubscriptions(user){
+    if(!ytSubsEls.section){ return; }
+    ytSubsState.uid = user && user.uid ? user.uid : "";
+    ytSubsState.seq += 1;
+    ytSubsState.requestInFlight = false;
+    ytSubsResetView();
+    if(!user){
+        renderYoutubeAccountSignedOut();
+        return;
+    }
+    // Fetch first page only on page open/auth load; identity is read-only.
+    void ytIdentity.load({ force: true });
+    loadYoutubeAccountSubscriptions();
+}
+
+function setupYoutubeAccountSubscriptionsUi(){
+    if(!ytSubsEls.loadMore || ytSubsEls.loadMore.dataset.ytSubsWired === "1"){ return; }
+    ytSubsEls.loadMore.dataset.ytSubsWired = "1";
+    ytSubsEls.loadMore.addEventListener("click", () => {
+        if(ytSubsState.requestInFlight){ return; }
+        if(!ytSubsState.nextPageToken){ return; }
+        void loadYoutubeAccountSubscriptions({ pageToken: ytSubsState.nextPageToken });
+    });
 }
 
 
@@ -944,13 +1869,27 @@ function setupFeedSeenMarker(){
 
 // ================= AUTH STATE =================
 
+setupYoutubeAccountSubscriptionsUi();
+
+// Grant changes (connect/disconnect/reconnect) invalidate identity immediately
+// and re-read the account list. The cross-tab signal carries no tokens or
+// channel identity.
+onYoutubeGrantChange(() => {
+    ytIdentity.clear("idle");
+    initYoutubeAccountSubscriptions(auth && auth.currentUser ? auth.currentUser : null);
+});
+
 onAuthStateChanged(auth, (user) => {
     if(user){
+        setupYoutubeAccountSubscriptionsUi();
         setupRefreshButton();
         setupFeedMoreButton();
         setupFeedToggle();
         setupFeedViewSwitch();
         setupFeedSeenMarker();
+        // Actual connected YouTube account subscriptions (read-only). First page
+        // only on page open/auth load; separate from local MyTube subscriptions.
+        initYoutubeAccountSubscriptions(user);
         // Load both views' data through the one shared fetch path. The shelves
         // render into their (hidden) container so switching is instant; the feed
         // renders when it is the active view.
@@ -962,6 +1901,7 @@ onAuthStateChanged(auth, (user) => {
         }
     }
     else{
+        initYoutubeAccountSubscriptions(null);
         showState("loggedOut");
     }
 });

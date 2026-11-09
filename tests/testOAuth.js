@@ -11,9 +11,23 @@
 // exactly like tests/testWorkerIndex.js stubs the YouTube API.
 //
 // What is pinned:
-//   * the real browser flow: fetch-an-authenticated-start, then a header-less
-//     Google callback whose stored single-use state is the authentication;
-//   * state validation: missing, expired, consumed (replay), redirect mismatch;
+//   * the Connect flow is ENABLED (the approved contract): an unauthenticated
+//     start is refused, while an authenticated start writes exactly one state
+//     row and returns a PKCE authorization URL as JSON (never a redirect);
+//   * the callback exchanges the code server-side, verifies the returned scope,
+//     stores only an encrypted refresh token, and redirects to a fixed landing;
+//   * the browser-bound state cookie is enforced BEFORE the code exchange, so a
+//     missing/mismatched cookie neither exchanges the code nor writes a grant;
+//   * a state that passes browser binding but is refused is burned: it can
+//     never be redeemed by a replay;
+//   * an EXISTING grant survives a refused callback untouched, stays visible
+//     on /api/oauth/status, and stays revocable through /api/oauth/disconnect;
+//   * the status body reports the flow as enabled in both the connected and
+//     the disconnected case;
+//   * the scheduled handler prunes expired/redeemed flow state, and never a
+//     stored grant;
+//   * state validation: missing, expired, consumed (replay), redirect mismatch,
+//     and a missing or mismatched browser-bound state cookie;
 //   * callback UX: a fixed, non-sensitive 302 landing with a closed status set;
 //   * Firebase token validation: signature, alg, kid, issuer, audience, expiry;
 //   * token encryption/decryption round-trips and wrong-key failure;
@@ -28,11 +42,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import worker from "../worker.js";
+import worker, { scheduled } from "../worker.js";
 import {
   FIREBASE_JWT_ALG,
   GOOGLE_REVOKE_ENDPOINT,
   GOOGLE_TOKEN_ENDPOINT,
+  GOOGLE_YOUTUBE_SCOPE,
   base64UrlEncode,
   buildAuthorizationUrl,
   constantTimeEqual,
@@ -46,6 +61,11 @@ import {
   verifyFirebaseIdToken,
   verifyPkce
 } from "../shared/oauth.js";
+import {
+  _resetTokenState,
+  _testInternals,
+  getAccessTokenForUser
+} from "../shared/oauth-tokens.js";
 import { createFakeD1 } from "./helpers/fake-d1.js";
 
 // -----------------------------------------------------------------------------
@@ -503,7 +523,7 @@ test("D2 an unconfigured disconnect POST is refused too", async () => {
   assert.equal((await response.json()).code, "OAUTH_NOT_CONFIGURED");
 });
 
-test("D3 a missing Firebase token is a 401 on start", async () => {
+test("D3 an unauthenticated start is refused before any state is written", async () => {
   const db = createFakeD1();
 
   const response = await callWorker(
@@ -511,15 +531,35 @@ test("D3 a missing Firebase token is a 401 on start", async () => {
     oauthEnv(db)
   );
 
+  // Connect is enabled, so the flow reaches the Firebase gate. Without a token
+  // it stops there: no authorization URL is handed out and no state row exists
+  // for an anonymous caller to redeem.
+  assert.equal(response.status, 401);
+  const body = await response.json();
+  assert.equal(body.code, "UNAUTHENTICATED");
+  assert.ok(!body.authorizationUrl, "no authorization URL for an anonymous caller");
+  assert.ok(!/ya29|1\/\//.test(JSON.stringify(body)), "no token in the error");
+
+  const states = db._sqlite.prepare("SELECT COUNT(*) AS n FROM oauth_states").get().n;
+  assert.equal(states, 0, "an unauthenticated start writes no state row");
+});
+
+test("D3b the routes that stay open still require a Firebase token", async () => {
+  const db = createFakeD1();
+
+  // The start route now enforces the same gate as the rest of the OAuth API:
+  // without a token it is a 401. Status keeps the identical gate.
+  const response = await callWorker("/api/oauth/status", oauthEnv(db));
+
   assert.equal(response.status, 401);
   assert.equal((await response.json()).code, "UNAUTHENTICATED");
 });
 
 // =============================================================================
-// E) Worker: start
+// E) Worker: start — the Connect flow is enabled
 // =============================================================================
 
-test("E1 start fetches a JSON authorization URL and stores a bound state", async () => {
+test("E1 an authenticated start writes one state row and returns an authorization URL", async () => {
   const db = createFakeD1();
   const key = await makeSigningKey();
   const token = await mintIdToken(key, { sub: "uid-start" });
@@ -532,33 +572,43 @@ test("E1 start fetches a JSON authorization URL and stores a bound state", async
         headers: { Authorization: `Bearer ${token}` }
       });
 
-      // A fetch() caller gets JSON, not a 302 (the page navigates itself).
       assert.equal(response.status, 200);
       const body = await response.json();
-      assert.ok(body.authorizationUrl, "the URL must be returned");
+      assert.equal(typeof body.authorizationUrl, "string");
 
-      const location = new URL(body.authorizationUrl);
-      assert.equal(location.searchParams.get("client_id"), CLIENT_ID);
-      assert.equal(location.searchParams.get("code_challenge_method"), "S256");
-      assert.equal(location.searchParams.get("redirect_uri"), REDIRECT_URI);
-      // The returned URL must never carry a token or a secret.
-      assert.ok(!/secret/i.test(body.authorizationUrl), "no client secret in URL");
+      const url = new URL(body.authorizationUrl);
+      assert.equal(url.origin, "https://accounts.google.com");
+      assert.equal(url.searchParams.get("response_type"), "code");
+      assert.equal(url.searchParams.get("code_challenge_method"), "S256");
+      assert.equal(url.searchParams.get("access_type"), "offline");
+      assert.equal(url.searchParams.get("redirect_uri"), REDIRECT_URI);
+      assert.ok(url.searchParams.get("state"), "a state is carried");
+      assert.ok(url.searchParams.get("code_challenge"), "a PKCE challenge is carried");
+      assert.ok(
+        !/client_secret|refresh_token/i.test(JSON.stringify(body)),
+        "the start body must never carry a secret or token"
+      );
 
-      const state = location.searchParams.get("state");
-      assert.ok(state && state.length > 20, "a real state must be present");
+      // Exactly one state row, owned by the authenticated uid, with the exact
+      // redirect URI the authorization URL was built with.
+      const states = db._sqlite.prepare("SELECT * FROM oauth_states").all();
+      assert.equal(states.length, 1, "exactly one state row may be created");
+      assert.equal(states[0].uid, "uid-start");
+      assert.equal(states[0].redirect_uri, REDIRECT_URI);
+      assert.equal(states[0].consumed, 0);
+      assert.equal(states[0].state, url.searchParams.get("state"));
 
-      const row = db._sqlite
-        .prepare("SELECT * FROM oauth_states WHERE state = ?")
-        .get(state);
-      assert.ok(row, "the state must be persisted");
-      assert.equal(row.uid, "uid-start");
-      assert.equal(row.consumed, 0);
-      assert.ok(row.expires_at_ms > Date.now());
+      // The browser-bound cookie is set on the same response, before the
+      // browser leaves for Google.
+      const cookie = response.headers.get("Set-Cookie") || "";
+      assert.match(cookie, /mytube_oauth_state=/);
+      assert.match(cookie, new RegExp(states[0].state));
+      assert.match(cookie, /HttpOnly/i);
     }
   );
 });
 
-test("E2 start returns JSON, never a redirect, so no header is lost", async () => {
+test("E2 an authenticated start returns JSON, never a redirect", async () => {
   const db = createFakeD1();
   const key = await makeSigningKey();
   const token = await mintIdToken(key, { sub: "uid-x" });
@@ -572,12 +622,22 @@ test("E2 start returns JSON, never a redirect, so no header is lost", async () =
       });
       assert.equal(response.status, 200);
       assert.equal(response.headers.get("Location"), null, "no redirect");
+      const body = await response.json();
+      assert.equal(typeof body.authorizationUrl, "string");
     }
   );
 });
 
 // =============================================================================
-// F) Worker: callback — happy path and every error branch
+// F) Worker: callback — the success path, the browser-binding guard and every
+//    error branch
+// -----------------------------------------------------------------------------
+// /start is covered by section E. This section covers /callback: the browser-
+// bound state cookie is checked BEFORE the single-use state is consumed and
+// before the authorization code is exchanged. A valid callback exchanges the
+// code server-side, verifies the returned YouTube scope, stores only an
+// encrypted refresh token, and redirects to the fixed landing. Status and
+// disconnect stay open, so an existing grant remains visible and revocable.
 // =============================================================================
 
 // Seed a state row directly, returning the verifier for reuse.
@@ -605,56 +665,69 @@ function seedState(db, overrides = {}) {
   return { state, verifier };
 }
 
-test("F1 a valid header-less callback stores an encrypted grant and lands connected", async () => {
+// The callback requires the browser-bound cookie that /start would have set.
+function stateCookieHeaders(state) {
+  return { Cookie: `mytube_oauth_state=${state}` };
+}
+
+test("F1 a valid header-less callback exchanges the code and stores an encrypted grant", async () => {
   const db = createFakeD1();
   const { state } = seedState(db, { uid: "uid-1" });
 
   // NOTE: no Authorization header. Google redirects the browser and cannot send
-  // one; the stored state is the whole authentication for this step.
+  // one; the stored state and its browser-bound cookie authenticate this step.
   await withStubbedFetch(
     parsed => {
       if (parsed.href.startsWith(GOOGLE_TOKEN_ENDPOINT)) {
         return {
           refresh_token: "1//refresh-abc",
           access_token: "ya29.access",
-          scope: "https://www.googleapis.com/auth/youtube.force-ssl",
+          scope: GOOGLE_YOUTUBE_SCOPE,
           token_type: "Bearer"
         };
       }
       return null;
     },
-    async () => {
+    async calls => {
       const response = await callWorker(
         `/api/oauth/callback?code=CODE&state=${encodeURIComponent(state)}`,
-        oauthEnv(db)
+        oauthEnv(db),
+        { headers: stateCookieHeaders(state) }
       );
 
       const location = assertLanding(response, "connected");
       // The landing URL must carry no token, code or secret.
       assert.ok(!/1\/\/|ya29|refresh|code=/i.test(location.href), "no secret in URL");
 
-      // The grant is owned by the STATE's uid, not by any request header.
+      // The authorization code is exchanged exactly once, server-side.
+      const tokenCalls = calls.filter(call =>
+        call.url.href.startsWith(GOOGLE_TOKEN_ENDPOINT)
+      );
+      assert.equal(tokenCalls.length, 1, "the code is exchanged once");
+
+      // The stored grant belongs to the state's uid, carries the verified
+      // scope, and holds only the encrypted refresh token — never plaintext.
       const row = db._sqlite
         .prepare("SELECT * FROM oauth_grants WHERE uid = ?")
         .get("uid-1");
-      assert.ok(row, "the grant must be stored against the state uid");
-      assert.match(row.refresh_token_enc, /^v1\./);
-      assert.ok(
-        !row.refresh_token_enc.includes("1//refresh-abc"),
-        "the raw refresh token must never be stored"
-      );
-
-      // And it decrypts back to the original token.
+      assert.ok(row, "a grant is stored for the state's uid");
+      assert.equal(row.scope, GOOGLE_YOUTUBE_SCOPE);
+      assert.equal(row.token_type, "Bearer");
+      assert.equal(row.revoked_at_ms, null);
+      assert.notEqual(row.refresh_token_enc, "1//refresh-abc");
       const encKey = await deriveAesKey(ENC_KEY_SECRET);
-      assert.equal(
-        await decryptToken(row.refresh_token_enc, encKey),
-        "1//refresh-abc"
-      );
+      assert.equal(await decryptToken(row.refresh_token_enc, encKey), "1//refresh-abc");
+
+      // The single-use state is burned.
+      const stateRow = db._sqlite
+        .prepare("SELECT consumed FROM oauth_states WHERE state = ?")
+        .get(state);
+      assert.equal(stateRow.consumed, 1);
     }
   );
 });
 
-test("F2 the same state cannot be redeemed twice (replay)", async () => {
+test("F2 a refused state is burned: it cannot be redeemed twice", async () => {
   const db = createFakeD1();
   const { state } = seedState(db, { uid: "uid-1" });
 
@@ -668,13 +741,24 @@ test("F2 the same state cannot be redeemed twice (replay)", async () => {
   await withStubbedFetch(handlers, async () => {
     const first = await callWorker(
       `/api/oauth/callback?code=C&state=${encodeURIComponent(state)}`,
-      oauthEnv(db)
+      oauthEnv(db),
+      { headers: stateCookieHeaders(state) }
     );
-    assertLanding(first, "connected");
+    assertLanding(first, "error");
+
+    // The state was CONSUMED before the refusal, so it is dead. A second
+    // attempt finds consumed = 1 and is refused the same way — and it could
+    // never be redeemed later either, not even if the switch were turned back
+    // on, because the single-use latch is already closed.
+    const row = db._sqlite
+      .prepare("SELECT consumed FROM oauth_states WHERE state = ?")
+      .get(state);
+    assert.equal(row.consumed, 1, "a refused state must be burned");
 
     const second = await callWorker(
       `/api/oauth/callback?code=C&state=${encodeURIComponent(state)}`,
-      oauthEnv(db)
+      oauthEnv(db),
+      { headers: stateCookieHeaders(state) }
     );
     // A replayed state lands on the fixed error status, not a second grant.
     assertLanding(second, "error");
@@ -682,7 +766,7 @@ test("F2 the same state cannot be redeemed twice (replay)", async () => {
     const count = db._sqlite
       .prepare("SELECT COUNT(*) AS n FROM oauth_grants")
       .get().n;
-    assert.equal(count, 1, "a replay must not mint a second grant");
+    assert.equal(count, 0, "a replay must not mint a second grant");
   });
 });
 
@@ -692,7 +776,8 @@ test("F3 an expired state is refused", async () => {
 
   const response = await callWorker(
     `/api/oauth/callback?code=C&state=${encodeURIComponent(state)}`,
-    oauthEnv(db)
+    oauthEnv(db),
+    { headers: stateCookieHeaders(state) }
   );
 
   assertLanding(response, "error");
@@ -703,7 +788,8 @@ test("F4 an unbound callback (state never stored) is refused", async () => {
 
   const response = await callWorker(
     "/api/oauth/callback?code=C&state=never-stored",
-    oauthEnv(db)
+    oauthEnv(db),
+    { headers: stateCookieHeaders("never-stored") }
   );
 
   assertLanding(response, "error");
@@ -739,7 +825,8 @@ test("F7 a redirect_uri mismatch is refused", async () => {
 
   const response = await callWorker(
     `/api/oauth/callback?code=C&state=${encodeURIComponent(state)}`,
-    oauthEnv(db)
+    oauthEnv(db),
+    { headers: stateCookieHeaders(state) }
   );
 
   assertLanding(response, "error");
@@ -754,6 +841,10 @@ test("F8 a failed token exchange lands on error and stores nothing", async () =>
   const db = createFakeD1();
   const { state } = seedState(db, { uid: "uid-1" });
 
+  // NOTE: while OAUTH_CONNECT_ENABLED is false the exchange is never reached
+  // at all (see F1/F11). This test stays as the regression for the branch
+  // that runs if the switch is ever turned back on: a failed exchange must
+  // land on the fixed error status and must not store anything.
   const original = globalThis.fetch;
 
   globalThis.fetch = async url => {
@@ -771,7 +862,8 @@ test("F8 a failed token exchange lands on error and stores nothing", async () =>
   try {
     const response = await callWorker(
       `/api/oauth/callback?code=C&state=${encodeURIComponent(state)}`,
-      oauthEnv(db)
+      oauthEnv(db),
+      { headers: stateCookieHeaders(state) }
     );
 
     assertLanding(response, "error");
@@ -789,8 +881,10 @@ test("F9 the callback never requires a Firebase header", async () => {
   const db = createFakeD1();
   const { state } = seedState(db, { uid: "uid-1" });
 
-  // With a valid stored state and a working exchange, a request with NO
-  // Authorization header must still succeed. This is the core browser-flow fix.
+  // With a valid stored state, its browser-bound cookie and NO Authorization
+  // header, the callback must still answer with the fixed landing redirect —
+  // never a 401 and never a 500. No Firebase session is involved, and none is
+  // needed.
   await withStubbedFetch(
     parsed =>
       parsed.href.startsWith(GOOGLE_TOKEN_ENDPOINT)
@@ -799,12 +893,54 @@ test("F9 the callback never requires a Firebase header", async () => {
     async () => {
       const response = await callWorker(
         `/api/oauth/callback?code=C&state=${encodeURIComponent(state)}`,
-        oauthEnv(db)
+        oauthEnv(db),
+        { headers: stateCookieHeaders(state) }
       );
 
-      assertLanding(response, "connected");
+      assert.equal(response.status, 302, "the callback answers with a redirect");
+      assertLanding(response, "error");
     }
   );
+});
+
+test("F9a a callback without the state cookie is refused without burning the state", async () => {
+  const db = createFakeD1();
+  const { state } = seedState(db, { uid: "uid-1" });
+
+  const response = await callWorker(
+    `/api/oauth/callback?code=C&state=${encodeURIComponent(state)}`,
+    oauthEnv(db)
+  );
+
+  assertLanding(response, "error");
+  assert.match(
+    response.headers.get("Set-Cookie") || "",
+    /mytube_oauth_state=;/,
+    "the callback clears the state cookie"
+  );
+
+  const row = db._sqlite
+    .prepare("SELECT consumed FROM oauth_states WHERE state = ?")
+    .get(state);
+  assert.equal(row.consumed, 0, "a missing browser binding must not consume state");
+});
+
+test("F9b a callback with a mismatched state cookie is refused without burning the state", async () => {
+  const db = createFakeD1();
+  const { state } = seedState(db, { uid: "uid-1" });
+
+  const response = await callWorker(
+    `/api/oauth/callback?code=C&state=${encodeURIComponent(state)}`,
+    oauthEnv(db),
+    { headers: stateCookieHeaders("wrong-state") }
+  );
+
+  assertLanding(response, "error");
+
+  const row = db._sqlite
+    .prepare("SELECT consumed FROM oauth_states WHERE state = ?")
+    .get(state);
+  assert.equal(row.consumed, 0, "a mismatched browser binding must not consume state");
 });
 
 test("F10 an unconfigured callback still redirects safely, never 500s", async () => {
@@ -814,6 +950,189 @@ test("F10 an unconfigured callback still redirects safely, never 500s", async ()
   });
 
   assertLanding(response, "error");
+});
+
+// -----------------------------------------------------------------------------
+// The callback guard — the regression tests for the switch being off.
+//
+// The gap this closes: OAUTH_CONNECT_ENABLED = false used to block only
+// /api/oauth/start. A state that was minted before the flip could still be
+// redeemed by /api/oauth/callback, which would exchange the authorization code
+// and INSERT a fresh oauth_grants row. These tests pin that no grant can be
+// created any more, that a refused state is dead for good, and that an
+// EXISTING grant is neither touched nor stranded.
+// -----------------------------------------------------------------------------
+
+test("F11 the callback guard blocks the code exchange and the grant write", async () => {
+  const db = createFakeD1();
+  const { state } = seedState(db, { uid: "uid-1" });
+
+  await withStubbedFetch(
+    parsed => {
+      if (parsed.href.startsWith(GOOGLE_TOKEN_ENDPOINT)) {
+        return {
+          refresh_token: "1//refresh-abc",
+          access_token: "ya29.access",
+          scope: GOOGLE_YOUTUBE_SCOPE,
+          token_type: "Bearer"
+        };
+      }
+      return null;
+    },
+    async calls => {
+      // The state exists, but this browser did not start it: a mismatched
+      // browser-bound cookie must be refused BEFORE anything is exchanged.
+      const response = await callWorker(
+        `/api/oauth/callback?code=CODE&state=${encodeURIComponent(state)}`,
+        oauthEnv(db),
+        { headers: stateCookieHeaders("some-other-browser-state") }
+      );
+
+      assertLanding(response, "error");
+
+      // 1. Google is never contacted: the code is not exchanged, so no token
+      //    is minted and no Google-side grant is created for MyTube.
+      const tokenCalls = calls.filter(call =>
+        call.url.href.startsWith(GOOGLE_TOKEN_ENDPOINT)
+      );
+      assert.equal(tokenCalls.length, 0, "no token exchange may happen");
+
+      // 2. No grant row exists afterwards — not for the state's uid, not for
+      //    anybody else.
+      const count = db._sqlite
+        .prepare("SELECT COUNT(*) AS n FROM oauth_grants")
+        .get().n;
+      assert.equal(count, 0, "no grant may be created");
+
+      // 3. The guard runs before consumeOauthState, so a mismatched cookie
+      //    cannot burn the legitimate state: the real browser can still
+      //    complete the flow.
+      const row = db._sqlite
+        .prepare("SELECT consumed FROM oauth_states WHERE state = ?")
+        .get(state);
+      assert.equal(row.consumed, 0, "a mismatched binding must not burn the state");
+    }
+  );
+});
+
+test("F12 a refused callback leaves an existing grant intact and still revocable", async () => {
+  const db = createFakeD1();
+  const key = await makeSigningKey();
+  const token = await mintIdToken(key, { sub: "uid-1" });
+  const encKey = await deriveAesKey(ENC_KEY_SECRET);
+  const envelope = await encryptToken("1//existing-grant", encKey);
+  const { state } = seedState(db, { uid: "uid-1" });
+
+  // A grant that already exists from an earlier connection.
+  db._sqlite
+    .prepare(
+      "INSERT INTO oauth_grants " +
+        "(uid, refresh_token_enc, scope, token_type, connected_at_ms, updated_at_ms, revoked_at_ms) " +
+        "VALUES (?, ?, ?, ?, ?, ?, NULL)"
+    )
+    .run("uid-1", envelope, GOOGLE_YOUTUBE_SCOPE, "Bearer", 111, 111);
+
+  await withStubbedFetch(
+    parsed => {
+      if (parsed.href.includes("securetoken")) return { keys: [key.jwk] };
+      if (parsed.href.startsWith(GOOGLE_TOKEN_ENDPOINT)) {
+        return {
+          refresh_token: "1//refresh-abc",
+          scope: GOOGLE_YOUTUBE_SCOPE,
+          token_type: "Bearer"
+        };
+      }
+      if (parsed.href.startsWith(GOOGLE_REVOKE_ENDPOINT)) return {};
+      return null;
+    },
+    async () => {
+      // A pending state for the same uid is refused because this browser did
+      // not start it (mismatched binding cookie) ...
+      const response = await callWorker(
+        `/api/oauth/callback?code=CODE&state=${encodeURIComponent(state)}`,
+        oauthEnv(db),
+        { headers: stateCookieHeaders("some-other-browser-state") }
+      );
+      assertLanding(response, "error");
+
+      // ... and the existing grant is untouched: not overwritten, not revoked,
+      // not deleted.
+      const row = db._sqlite
+        .prepare("SELECT * FROM oauth_grants WHERE uid = ?")
+        .get("uid-1");
+      assert.ok(row, "the existing grant must survive a refused callback");
+      assert.equal(row.refresh_token_enc, envelope, "the stored grant must not change");
+      assert.equal(row.connected_at_ms, 111);
+      assert.equal(row.updated_at_ms, 111);
+      assert.equal(row.revoked_at_ms, null);
+
+      // The user can still remove it.
+      const disconnect = await callWorker("/api/oauth/disconnect", oauthEnv(db), {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      assert.equal(disconnect.status, 200);
+      assert.deepEqual(await disconnect.json(), { connected: false, revoked: true });
+
+      const after = db._sqlite
+        .prepare("SELECT COUNT(*) AS n FROM oauth_grants WHERE uid = ?")
+        .get("uid-1").n;
+      assert.equal(after, 0, "disconnect must still delete the grant");
+    }
+  );
+});
+
+test("F13 status still reports the existing grant after a refused callback", async () => {
+  const db = createFakeD1();
+  const key = await makeSigningKey();
+  const token = await mintIdToken(key, { sub: "uid-1" });
+  const { state } = seedState(db, { uid: "uid-1" });
+
+  db._sqlite
+    .prepare(
+      "INSERT INTO oauth_grants " +
+        "(uid, refresh_token_enc, scope, token_type, connected_at_ms, updated_at_ms, revoked_at_ms) " +
+        "VALUES (?, ?, ?, ?, ?, ?, NULL)"
+    )
+    .run("uid-1", "v1.iv.ct", GOOGLE_YOUTUBE_SCOPE, "Bearer", 1, 1);
+
+  await withStubbedFetch(
+    parsed => {
+      if (parsed.href.includes("securetoken")) return { keys: [key.jwk] };
+      if (parsed.href.startsWith(GOOGLE_TOKEN_ENDPOINT)) {
+        return {
+          refresh_token: "1//refresh-abc",
+          scope: GOOGLE_YOUTUBE_SCOPE,
+          token_type: "Bearer"
+        };
+      }
+      return null;
+    },
+    async () => {
+      // Refused because this browser did not start the state (mismatched
+      // binding cookie), not because the flow is unavailable.
+      const refused = await callWorker(
+        `/api/oauth/callback?code=CODE&state=${encodeURIComponent(state)}`,
+        oauthEnv(db),
+        { headers: stateCookieHeaders("some-other-browser-state") }
+      );
+      assertLanding(refused, "error");
+
+      // The connection the user already made is still reported, so they can
+      // see it and revoke it.
+      const status = await callWorker("/api/oauth/status", oauthEnv(db), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      assert.equal(status.status, 200);
+      const body = await status.json();
+      assert.equal(body.connected, true);
+      assert.equal(body.scopeReady, true);
+      assert.equal(body.connectEnabled, true);
+      assert.ok(!JSON.stringify(body).includes("v1.iv.ct"), "no envelope leaks");
+    }
+  );
 });
 
 // =============================================================================
@@ -833,7 +1152,12 @@ test("G1 status reports disconnected with no grant", async () => {
         headers: { Authorization: `Bearer ${token}` }
       });
       assert.equal(response.status, 200);
-      assert.deepEqual(await response.json(), { connected: false, scope: "" });
+      assert.deepEqual(await response.json(), {
+        connected: false,
+        scope: "",
+        scopeReady: false,
+        connectEnabled: true
+      });
     }
   );
 });
@@ -861,6 +1185,10 @@ test("G2 status reports connected after a grant, never the token", async () => {
       const body = await response.json();
       assert.equal(body.connected, true);
       assert.equal(body.scope, "https://www.googleapis.com/auth/youtube.force-ssl");
+      assert.equal(body.scopeReady, true);
+      // The approved contract reports Connect as enabled even when a grant
+      // already exists. The grant itself stays visible and revocable.
+      assert.equal(body.connectEnabled, true);
       assert.ok(!JSON.stringify(body).includes("v1.iv.ct"), "no envelope leaks");
     }
   );
@@ -1108,6 +1436,218 @@ test("H7 disconnect rejects an unauthenticated caller", async () => {
   assert.equal(response.status, 401);
 });
 
+// -----------------------------------------------------------------------------
+// H) Disconnect drops the cached access token
+// -----------------------------------------------------------------------------
+//
+// The access-token cache is per-isolate. A disconnect that leaves a cached
+// token behind would let a token minted BEFORE the disconnect keep working in
+// that isolate. The handler invalidates the uid's cache entry as soon as the
+// caller is authenticated, before any grant read or revocation I/O.
+//
+// These tests import the SAME module instance the Worker imports (both resolve
+// to shared/oauth-tokens.js), so they observe the Worker's real cache.
+
+test("H8 disconnect clears the cached access token for the user", async () => {
+  _resetTokenState();
+  const db = createFakeD1();
+  const key = await makeSigningKey();
+  const token = await mintIdToken(key, { sub: "uid-1" });
+  const encKey = await deriveAesKey(ENC_KEY_SECRET);
+
+  db._sqlite
+    .prepare(
+      "INSERT INTO oauth_grants " +
+        "(uid, refresh_token_enc, scope, token_type, connected_at_ms, updated_at_ms, revoked_at_ms) " +
+        "VALUES (?, ?, ?, ?, ?, ?, NULL)"
+    )
+    .run("uid-1", await encryptToken("1//cached", encKey), "s", "Bearer", 1, 1);
+
+  const internals = _testInternals();
+  const original = globalThis.fetch;
+
+  globalThis.fetch = async url => {
+    const parsed = new URL(url);
+
+    if (parsed.href.startsWith(GOOGLE_TOKEN_ENDPOINT)) {
+      return new Response(JSON.stringify({ access_token: "ya29.cached", expires_in: 3600 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    if (parsed.href.startsWith(GOOGLE_REVOKE_ENDPOINT)) {
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    if (parsed.href.includes("securetoken")) {
+      return new Response(JSON.stringify({ keys: [key.jwk] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    return new Response(JSON.stringify({}), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const config = { clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, encryptionKey: encKey };
+
+    // Seed the cache for this uid through the real module code path.
+    const cached = await getAccessTokenForUser("uid-1", oauthEnv(db), {
+      db,
+      config,
+      fetch: globalThis.fetch,
+      encryptToken,
+      decryptToken
+    });
+
+    assert.equal(cached, "ya29.cached");
+    assert.equal(
+      internals.accessTokenCache.has("uid-1"),
+      true,
+      "the access token must be cached before the disconnect"
+    );
+
+    const response = await callWorker("/api/oauth/disconnect", oauthEnv(db), {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` }
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { connected: false, revoked: true });
+
+    assert.equal(
+      internals.accessTokenCache.has("uid-1"),
+      false,
+      "the disconnect must drop the cached access token"
+    );
+
+    const count = db._sqlite
+      .prepare("SELECT COUNT(*) AS n FROM oauth_grants WHERE uid = ?")
+      .get("uid-1").n;
+    assert.equal(count, 0, "the local grant must be deleted");
+  } finally {
+    globalThis.fetch = original;
+    _resetTokenState();
+  }
+});
+
+test("H9 disconnect invalidates an in-flight refresh", async () => {
+  _resetTokenState();
+  const db = createFakeD1();
+  const key = await makeSigningKey();
+  const token = await mintIdToken(key, { sub: "uid-1" });
+  const encKey = await deriveAesKey(ENC_KEY_SECRET);
+
+  db._sqlite
+    .prepare(
+      "INSERT INTO oauth_grants " +
+        "(uid, refresh_token_enc, scope, token_type, connected_at_ms, updated_at_ms, revoked_at_ms) " +
+        "VALUES (?, ?, ?, ?, ?, ?, NULL)"
+    )
+    .run("uid-1", await encryptToken("1//inflight", encKey), "s", "Bearer", 1, 1);
+
+  const internals = _testInternals();
+  const original = globalThis.fetch;
+
+  // Park the token exchange so the refresh is provably still in flight while
+  // the disconnect runs.
+  let releaseTokenExchange;
+  const tokenExchangeGate = new Promise(resolve => {
+    releaseTokenExchange = resolve;
+  });
+
+  globalThis.fetch = async url => {
+    const parsed = new URL(url);
+
+    if (parsed.href.startsWith(GOOGLE_TOKEN_ENDPOINT)) {
+      await tokenExchangeGate;
+      return new Response(JSON.stringify({ access_token: "ya29.late", expires_in: 3600 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    if (parsed.href.startsWith(GOOGLE_REVOKE_ENDPOINT)) {
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    if (parsed.href.includes("securetoken")) {
+      return new Response(JSON.stringify({ keys: [key.jwk] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    return new Response(JSON.stringify({}), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const config = { clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, encryptionKey: encKey };
+
+    // Settle into an object instead of a bare promise so a rejection can never
+    // be reported as unhandled.
+    const refresh = getAccessTokenForUser("uid-1", oauthEnv(db), {
+      db,
+      config,
+      fetch: globalThis.fetch,
+      encryptToken,
+      decryptToken
+    }).then(
+      value => ({ ok: true, value }),
+      error => ({ ok: false, error })
+    );
+
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(
+      internals.accessTokenInFlight.has("uid-1"),
+      true,
+      "the refresh must be in flight before the disconnect"
+    );
+
+    const response = await callWorker("/api/oauth/disconnect", oauthEnv(db), {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` }
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { connected: false, revoked: true });
+
+    // Let the parked exchange finish: its result must be discarded.
+    releaseTokenExchange();
+
+    const outcome = await refresh;
+    assert.equal(outcome.ok, false, "the in-flight refresh must not succeed after a disconnect");
+    assert.equal(
+      outcome.error && outcome.error.message,
+      "INVALIDATED",
+      "the in-flight refresh must be invalidated, not returned"
+    );
+    assert.equal(
+      internals.accessTokenCache.has("uid-1"),
+      false,
+      "no access token may be cached after the disconnect"
+    );
+  } finally {
+    releaseTokenExchange();
+    globalThis.fetch = original;
+    _resetTokenState();
+  }
+});
+
 // =============================================================================
 // I) Integration: pre-existing behaviour is untouched
 // =============================================================================
@@ -1152,4 +1692,281 @@ test("I4 the migration created both OAuth tables", () => {
 
   assert.ok(tables.includes("oauth_states"), "oauth_states must exist");
   assert.ok(tables.includes("oauth_grants"), "oauth_grants must exist");
+});
+
+// -----------------------------------------------------------------------------
+// OAuth status handler: scopeReady
+// -----------------------------------------------------------------------------
+//
+// The status endpoint reports whether the caller has a live grant and whether
+// that grant carries the scope MyTube needs to act on the user's behalf.
+// `scopeReady` is a pure boolean derived from the STORED scope string; it
+// never exposes a token, an envelope, or any credential.
+
+test("S1 status reports disconnected with no grant and scopeReady false", async () => {
+  const db = createFakeD1();
+  const key = await makeSigningKey();
+  const token = await mintIdToken(key, { sub: "uid-1" });
+
+  await withStubbedFetch(
+    parsed => (parsed.href.includes("securetoken") ? { keys: [key.jwk] } : null),
+    async () => {
+      const response = await callWorker("/api/oauth/status", oauthEnv(db), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), {
+        connected: false,
+        scope: "",
+        scopeReady: false,
+        connectEnabled: true
+      });
+    }
+  );
+});
+
+test("S2 status reports connected and scopeReady true with the required scope", async () => {
+  const db = createFakeD1();
+  const key = await makeSigningKey();
+  const token = await mintIdToken(key, { sub: "uid-1" });
+
+  await db
+    .prepare(
+      "INSERT INTO oauth_grants " +
+        "(uid, refresh_token_enc, scope, token_type, connected_at_ms, updated_at_ms, revoked_at_ms) " +
+        "VALUES (?, ?, ?, ?, ?, ?, NULL)"
+    )
+    .bind("uid-1", "v1.iv.ct", GOOGLE_YOUTUBE_SCOPE, "Bearer", 1, 1)
+    .run();
+
+  await withStubbedFetch(
+    parsed => (parsed.href.includes("securetoken") ? { keys: [key.jwk] } : null),
+    async () => {
+      const response = await callWorker("/api/oauth/status", oauthEnv(db), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      assert.equal(response.status, 200);
+      const body = await response.json();
+      assert.equal(body.connected, true);
+      assert.equal(body.scope, GOOGLE_YOUTUBE_SCOPE);
+      assert.equal(body.scopeReady, true);
+      assert.equal(body.connectedAtMs, 1);
+      assert.ok(
+        !JSON.stringify(body).includes("v1.iv.ct"),
+        "the stored envelope must never leak"
+      );
+    }
+  );
+});
+
+test("S3 status scopeReady is true when the required scope is one of several", async () => {
+  const db = createFakeD1();
+  const key = await makeSigningKey();
+  const token = await mintIdToken(key, { sub: "uid-1" });
+
+  const scope = [
+    "https://www.googleapis.com/auth/youtube.readonly",
+    GOOGLE_YOUTUBE_SCOPE,
+    "https://www.googleapis.com/auth/userinfo.email"
+  ].join(" ");
+
+  await db
+    .prepare(
+      "INSERT INTO oauth_grants " +
+        "(uid, refresh_token_enc, scope, token_type, connected_at_ms, updated_at_ms, revoked_at_ms) " +
+        "VALUES (?, ?, ?, ?, ?, ?, NULL)"
+    )
+    .bind("uid-1", "v1.iv.ct", scope, "Bearer", 1, 1)
+    .run();
+
+  await withStubbedFetch(
+    parsed => (parsed.href.includes("securetoken") ? { keys: [key.jwk] } : null),
+    async () => {
+      const response = await callWorker("/api/oauth/status", oauthEnv(db), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const body = await response.json();
+      assert.equal(body.connected, true);
+      assert.equal(body.scope, scope);
+      assert.equal(body.scopeReady, true);
+    }
+  );
+});
+
+test("S4 status reports connected but scopeReady false for an insufficient scope", async () => {
+  const db = createFakeD1();
+  const key = await makeSigningKey();
+  const token = await mintIdToken(key, { sub: "uid-1" });
+
+  await db
+    .prepare(
+      "INSERT INTO oauth_grants " +
+        "(uid, refresh_token_enc, scope, token_type, connected_at_ms, updated_at_ms, revoked_at_ms) " +
+        "VALUES (?, ?, ?, ?, ?, ?, NULL)"
+    )
+    .bind(
+      "uid-1",
+      "v1.iv.ct",
+      "https://www.googleapis.com/auth/youtube.readonly",
+      "Bearer",
+      1,
+      1
+    )
+    .run();
+
+  await withStubbedFetch(
+    parsed => (parsed.href.includes("securetoken") ? { keys: [key.jwk] } : null),
+    async () => {
+      const response = await callWorker("/api/oauth/status", oauthEnv(db), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const body = await response.json();
+      assert.equal(body.connected, true);
+      assert.equal(body.scope, "https://www.googleapis.com/auth/youtube.readonly");
+      assert.equal(body.scopeReady, false);
+    }
+  );
+});
+
+test("S5 status reports connected but scopeReady false for an empty scope", async () => {
+  const db = createFakeD1();
+  const key = await makeSigningKey();
+  const token = await mintIdToken(key, { sub: "uid-1" });
+
+  await db
+    .prepare(
+      "INSERT INTO oauth_grants " +
+        "(uid, refresh_token_enc, scope, token_type, connected_at_ms, updated_at_ms, revoked_at_ms) " +
+        "VALUES (?, ?, ?, ?, ?, ?, NULL)"
+    )
+    .bind("uid-1", "v1.iv.ct", "", "Bearer", 1, 1)
+    .run();
+
+  await withStubbedFetch(
+    parsed => (parsed.href.includes("securetoken") ? { keys: [key.jwk] } : null),
+    async () => {
+      const response = await callWorker("/api/oauth/status", oauthEnv(db), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const body = await response.json();
+      assert.equal(body.connected, true);
+      assert.equal(body.scope, "");
+      assert.equal(body.scopeReady, false);
+    }
+  );
+});
+
+test("S6 status treats a revoked grant as disconnected with scopeReady false", async () => {
+  const db = createFakeD1();
+  const key = await makeSigningKey();
+  const token = await mintIdToken(key, { sub: "uid-1" });
+
+  await db
+    .prepare(
+      "INSERT INTO oauth_grants " +
+        "(uid, refresh_token_enc, scope, token_type, connected_at_ms, updated_at_ms, revoked_at_ms) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind("uid-1", "v1.iv.ct", GOOGLE_YOUTUBE_SCOPE, "Bearer", 1, 1, 2)
+    .run();
+
+  await withStubbedFetch(
+    parsed => (parsed.href.includes("securetoken") ? { keys: [key.jwk] } : null),
+    async () => {
+      const response = await callWorker("/api/oauth/status", oauthEnv(db), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), {
+        connected: false,
+        scope: "",
+        scopeReady: false,
+        connectEnabled: true
+      });
+    }
+  );
+});
+
+// =============================================================================
+// K) Scheduled cleanup of expired OAuth state rows
+// -----------------------------------------------------------------------------
+// The start route prunes opportunistically when a flow begins, but the
+// scheduled handler is the authoritative cleanup and must work without any
+// request. The cutoff it uses is the one the callback already applies to reject
+// an expired state: expires_at_ms <= now.
+// =============================================================================
+
+// Insert one flow-state row directly, the way a started flow would.
+function insertStateRow(db, state, expiresAtMs, consumed, now) {
+  db._sqlite
+    .prepare(
+      "INSERT INTO oauth_states " +
+        "(state, uid, code_verifier, redirect_uri, created_at_ms, expires_at_ms, consumed) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+    .run(state, "uid-1", "verifier", REDIRECT_URI, now - 60_000, expiresAtMs, consumed);
+}
+
+test("K1 the scheduled handler prunes expired and redeemed state rows", async () => {
+  const db = createFakeD1();
+  const now = Date.now();
+  const live = now + 10 * 60 * 1000;
+
+  insertStateRow(db, "state-expired", now - 1000, 0, now);
+  insertStateRow(db, "state-redeemed", live, 1, now);
+  insertStateRow(db, "state-live", live, 0, now);
+
+  // A grant must survive the cleanup untouched: pruning flow state may never
+  // touch a stored grant.
+  db._sqlite
+    .prepare(
+      "INSERT INTO oauth_grants " +
+        "(uid, refresh_token_enc, scope, token_type, connected_at_ms, updated_at_ms, revoked_at_ms) " +
+        "VALUES (?, ?, ?, ?, ?, ?, NULL)"
+    )
+    .run("uid-1", "v1.iv.ct", GOOGLE_YOUTUBE_SCOPE, "Bearer", 1, 1);
+
+  await withStubbedFetch(
+    parsed => {
+      throw new Error("the scheduled prune must not call out: " + parsed.href);
+    },
+    async calls => {
+      await scheduled({}, oauthEnv(db), {});
+      assert.equal(calls.length, 0, "the scheduled run must not make any request");
+    }
+  );
+
+  const remaining = db._sqlite
+    .prepare("SELECT state FROM oauth_states ORDER BY state")
+    .all()
+    .map(row => row.state);
+
+  assert.deepEqual(remaining, ["state-live"], "only the live state may survive");
+
+  const grants = db._sqlite.prepare("SELECT uid FROM oauth_grants").all();
+  assert.equal(grants.length, 1, "a stored grant must never be pruned");
+});
+
+test("K2 the scheduled prune is repeatable and leaves a live state alone", async () => {
+  const db = createFakeD1();
+  const now = Date.now();
+
+  insertStateRow(db, "state-live", now + 10 * 60 * 1000, 0, now);
+
+  await withStubbedFetch(
+    parsed => {
+      throw new Error("the scheduled prune must not call out: " + parsed.href);
+    },
+    async () => {
+      await scheduled({}, oauthEnv(db), {});
+      await scheduled({}, oauthEnv(db), {});
+    }
+  );
+
+  const remaining = db._sqlite
+    .prepare("SELECT state FROM oauth_states ORDER BY state")
+    .all()
+    .map(row => row.state);
+
+  assert.deepEqual(remaining, ["state-live"], "a live state survives every run");
 });

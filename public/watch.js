@@ -126,6 +126,30 @@ let active = current;
 // YouTube videos this is derived from the yt: id once known.
 let activeKey = videoKey;
 
+const AUTOPLAY_STORAGE_KEY = "mytube_autoplay";
+
+function getAutoplayPreference(){
+    try{
+        const val = localStorage.getItem(AUTOPLAY_STORAGE_KEY);
+        if(val === null){
+            return true;
+        }
+        return val === "true";
+    }
+    catch(e){
+        return true;
+    }
+}
+
+function setAutoplayPreference(enabled){
+    try{
+        localStorage.setItem(AUTOPLAY_STORAGE_KEY, enabled ? "true" : "false");
+    }
+    catch(e){
+        // ignore
+    }
+}
+
 // Resolve the storage key that should be used right now. For YouTube videos
 // `activeKey` is set once the video metadata loads; before that we fall back to
 // the safe placeholder key so nothing ever dereferences undefined.
@@ -474,6 +498,9 @@ function handleYtPlayerState(event){
     if(!(event && typeof event.data === "number" && event.data === YT.PlayerState.ENDED)){
         return;
     }
+    if(!getAutoplayPreference()){
+        return;
+    }
     nextVideo();
 }
 
@@ -707,15 +734,21 @@ function renderYtSubViews(v){
         liveChatStop(true);
     }
 
-    // Ensure the single Like/Dislike controls show the real YouTube like count
-    // once metadata has loaded (for YouTube videos) — no duplicate stats row.
+    // Ensure Like/Dislike reflects public count and, for YouTube videos, load
+    // the actual rating from the connected YouTube account (never local/library).
     renderLikeDislike();
+    if(isYt){
+        void loadYoutubeRating({ force: true });
+    }
 
     renderSave();
     renderSubscribe();
     // Recompute saved/subscribed state for the now-current YouTube video.
     isSaved = localStorage.getItem(saveKey()) === "1";
     refreshSubscribeState();
+    // Read-only: fetch actual YouTube account subscription status for this channel.
+    // Never auto-subscribes/unsubscribes; mutations require explicit confirmation.
+    syncYtAccountSubscriptionForCurrentVideo(true);
     // Arm watch-history recording now that the active YouTube video is known.
     // (The DOMContentLoaded recordHistory() call runs before YouTube metadata
     // is available and would otherwise return early for yt: videos.)
@@ -873,7 +906,7 @@ function buildYtComment(c){
 
     const text = document.createElement("p");
     text.className = "yt-comment-text";
-    text.textContent = c.text || "";
+    appendSafeLineContent(text, c.text || "");
 
     const time = document.createElement("span");
     time.className = "yt-comment-time";
@@ -1029,43 +1062,126 @@ function renderDescription(){
 
 // Append the text of one description line as text nodes plus clickable <a>
 // elements for http(s) URLs, all created with safe DOM APIs (never innerHTML).
+function timestampToSeconds(ts){
+    if(typeof ts !== "string"){
+        return null;
+    }
+
+    const parts = ts.split(":");
+    if(parts.length !== 2 && parts.length !== 3){
+        return null;
+    }
+
+    if(!parts.every(part => /^\d+$/.test(part))){
+        return null;
+    }
+
+    const nums = parts.map(Number);
+    if(!nums.every(Number.isSafeInteger)){
+        return null;
+    }
+
+    let seconds;
+
+    if(parts.length === 2){
+        const [minutes, secs] = nums;
+        if(secs > 59){
+            return null;
+        }
+        seconds = minutes * 60 + secs;
+    } else {
+        const [hours, minutes, secs] = nums;
+        if(minutes > 59 || secs > 59){
+            return null;
+        }
+        seconds = hours * 3600 + minutes * 60 + secs;
+    }
+
+    return Number.isSafeInteger(seconds) ? seconds : null;
+}
+
+// Seek video to timestamp in seconds
+function seekToTime(seconds){
+    if(ytKeyControlAvailable()){
+        try{
+            ytPlayer.seekTo(seconds, true);
+            return;
+        }
+        catch(e){
+            // fall through
+        }
+    }
+    if(video){
+        try{
+            video.currentTime = seconds;
+        }
+        catch(e){
+            // ignore
+        }
+    }
+}
+
 function appendSafeLineContent(lineEl, line){
-    const urlRe = /(https?:\/\/[^\s]+)/g;
+    // Match URLs and timestamps. Timestamps like 1:23, 10:45, 1:23:45
+    // Use word boundaries to avoid matching inside larger numbers
+    const combinedRe = /(https?:\/\/[^\s]+)|\b[0-9]+:[0-5][0-9](?::[0-5][0-9])?\b/g;
     let lastIndex = 0;
     let match;
 
-    while((match = urlRe.exec(line)) !== null){
+    while((match = combinedRe.exec(line)) !== null){
         if(match.index > lastIndex){
             lineEl.appendChild(document.createTextNode(line.slice(lastIndex, match.index)));
         }
-        const url = match[0];
+        const matched = match[0];
 
-        // Strip a single trailing punctuation char if it was captured with the URL.
-        let cleanUrl = url;
-        const lastChar = url.charAt(url.length - 1);
-        if(/[.,;:!?)]/.test(lastChar)){
-            cleanUrl = url.slice(0, -1);
-            if(cleanUrl.length < 8){
-                cleanUrl = url;
+        // Check if it's a URL
+        if(/^https?:\/\//.test(matched)){
+            const url = matched;
+            // Strip a single trailing punctuation char if it was captured with the URL.
+            let cleanUrl = url;
+            const lastChar = url.charAt(url.length - 1);
+            if(/[.,;:!?)]/.test(lastChar)){
+                cleanUrl = url.slice(0, -1);
+                if(cleanUrl.length < 8){
+                    cleanUrl = url;
+                }
+            }
+
+            const a = document.createElement("a");
+            a.href = cleanUrl;
+            a.target = "_blank";
+            a.rel = "noopener noreferrer";
+            a.className = "desc-link";
+            a.textContent = cleanUrl.length > 60 ? cleanUrl.slice(0, 60) + "…" : cleanUrl;
+
+            if(cleanUrl !== url){
+                const tailIdx = match.index + cleanUrl.length;
+                lineEl.appendChild(a);
+                lineEl.appendChild(document.createTextNode(line.slice(tailIdx, match.index + url.length)));
+                lastIndex = match.index + url.length;
+            }
+            else{
+                lineEl.appendChild(a);
+                lastIndex = match.index + url.length;
             }
         }
-
-        const a = document.createElement("a");
-        a.href = cleanUrl;
-        a.target = "_blank";
-        a.rel = "noopener noreferrer";
-        a.className = "desc-link";
-        a.textContent = cleanUrl.length > 60 ? cleanUrl.slice(0, 60) + "…" : cleanUrl;
-
-        if(cleanUrl !== url){
-            const tailIdx = match.index + cleanUrl.length;
-            lineEl.appendChild(a);
-            lineEl.appendChild(document.createTextNode(line.slice(tailIdx, match.index + url.length)));
-            lastIndex = match.index + url.length;
-        }
         else{
+            // It's a timestamp
+            const ts = matched;
+            const a = document.createElement("a");
+            a.href = "#";
+            a.className = "desc-link desc-timestamp";
+            a.textContent = ts;
+            a.addEventListener("click", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const seconds = timestampToSeconds(ts);
+                if(typeof seconds === "number" && Number.isFinite(seconds) && seconds >= 0){
+                    seekToTime(seconds);
+                }
+            });
             lineEl.appendChild(a);
-            lastIndex = match.index + url.length;
+            lastIndex = match.index + ts.length;
         }
     }
 
@@ -1247,6 +1363,21 @@ function getUpNextVideoId(){
 }
 
 
+function setupAutoplayToggle(){
+    const toggleBtn = document.getElementById("autoplayToggle");
+    if(!toggleBtn){
+        return;
+    }
+    const enabled = getAutoplayPreference();
+    toggleBtn.setAttribute("aria-pressed", enabled ? "true" : "false");
+    toggleBtn.addEventListener("click", () => {
+        const current = getAutoplayPreference();
+        const next = !current;
+        setAutoplayPreference(next);
+        toggleBtn.setAttribute("aria-pressed", next ? "true" : "false");
+    });
+}
+
 function renderPrevNext(){
     const prevBtn = document.getElementById("prevBtn");
     const nextBtn = document.getElementById("nextBtn");
@@ -1386,12 +1517,15 @@ function unsubFirestoreComments(){
 }
 
 
-// ================= YOUTUBE LIVE CHAT (read-only) =================
+// ================= YOUTUBE LIVE CHAT (read + opt-in sending) =================
 // The REAL YouTube Live Chat for the video currently being watched.
 //
 // Scope, deliberately narrow:
-//   * Read-only. There is no composer, no send endpoint, and nothing is written
-//     to Firestore - this is YouTube's own chat, displayed.
+//   * Reading is always available. Sending is off unless the server reports it
+//     enabled for this request; the server re-checks on every POST.
+//   * A sent message goes to YouTube as the signed-in user's OWN connected
+//     YouTube account. Nothing is written to Firestore, and MyTube does not keep
+//     a copy of the message.
 //   * Separate from video comments. MyTube comments and YouTube's public
 //     commentThreads are untouched by this code and keep their own rendering.
 //   * Shown only while the backend reports the video is actually live.
@@ -1422,7 +1556,38 @@ const liveChatState = {
     paused: false,
     // Monotonic token: any async result from a previous video is ignored.
     run: 0,
-    stopped: false
+    stopped: false,
+    // --- sending (server-gated, hidden unless both flags are true) ---
+    form: null,
+    input: null,
+    sendBtn: null,
+    note: null,
+    // True only when the live-chat payload says the server has sending enabled.
+    sendEnabled: false,
+    // True only after /api/oauth/status reports a usable YouTube scope.
+    sendScopeReady: false,
+    // null = unknown/temporary failure, true = confirmed ready, false = confirmed not ready (200 response)
+    sendScopeConfirmedReady: null,
+    // Retry state for temporary initial verification failures
+    scopeVerifyRetryCount: 0,
+    scopeVerifyTimer: null,
+    scopeVerifyExhausted: false,
+    // One in-flight submit at a time per tab.
+    sendInFlight: false,
+    // One OAuth scope recheck at a time.
+    scopeRecheckInFlight: false,
+    scopeRecheckRun: 0,
+    // Subscriber-only / restricted chat (user-confirmed actions only)
+    restriction: null,
+    restrictionBox: null,
+    restrictionText: null,
+    restrictionActions: null,
+    restrictionState: "idle", // idle | checking | checked
+    subscriptionSubscribed: null, // null unknown/unavailable, true, false
+    chatRestrictionConfirmed: false, // confirmed send restriction (e.g. CHAT_FORBIDDEN); do not assume subscriber-only
+    subscriptionCheckState: "idle", // idle | checking | ok | error
+    subscriptionActionInFlight: false,
+    preserveRestrictionOnce: false
 };
 
 
@@ -1447,6 +1612,13 @@ function liveChatEls(){
         liveChatState.meta = document.getElementById("liveChatMeta");
         liveChatState.badge = document.getElementById("liveChatBadge");
         liveChatState.attrib = document.getElementById("liveChatAttrib");
+        liveChatState.form = document.getElementById("liveChatForm");
+        liveChatState.input = document.getElementById("liveChatInput");
+        liveChatState.sendBtn = document.getElementById("liveChatSend");
+        liveChatState.note = document.getElementById("liveChatNote");
+        liveChatState.restriction = document.getElementById("liveChatRestriction");
+        liveChatState.restrictionText = document.getElementById("liveChatRestrictionText");
+        liveChatState.restrictionActions = document.getElementById("liveChatRestrictionActions");
     }
 
     return liveChatState;
@@ -1716,6 +1888,23 @@ function liveChatRender(messages, poll){
 }
 
 
+function liveChatClearRestriction(options){
+    const opts = options && typeof options === "object" ? options : {};
+    if(liveChatState.preserveRestrictionOnce && !opts.force){
+        liveChatState.preserveRestrictionOnce = false;
+        return;
+    }
+    liveChatState.preserveRestrictionOnce = false;
+    const els = liveChatEls();
+    liveChatState.restrictionState = "idle";
+    liveChatState.subscriptionSubscribed = null;
+    liveChatState.chatRestrictionConfirmed = false;
+    liveChatState.subscriptionCheckState = "idle";
+    if(els.restrictionText){ els.restrictionText.textContent = ""; }
+    if(els.restrictionActions){ els.restrictionActions.textContent = ""; }
+    if(els.restriction){ els.restriction.hidden = true; }
+}
+
 function liveChatReset(){
     const els = liveChatEls();
 
@@ -1726,6 +1915,7 @@ function liveChatReset(){
     liveChatState.seen.clear();
     liveChatSetStatus("");
     liveChatSetMeta("");
+    liveChatClearRestriction();
 }
 
 
@@ -1752,6 +1942,23 @@ function liveChatStop(hidePanel){
     // Never leave a previous stream's chat link behind once we are no longer
     // following that stream.
     liveChatSetAttrib("");
+
+    // Sending is per-stream and per-account: start hidden next time.
+    if(liveChatState.scopeVerifyTimer){
+        clearTimeout(liveChatState.scopeVerifyTimer);
+        liveChatState.scopeVerifyTimer = null;
+    }
+    liveChatState.scopeVerifyRetryCount = 0;
+    liveChatState.scopeVerifyExhausted = false;
+    liveChatState.sendEnabled = false;
+    liveChatState.sendScopeReady = false;
+    liveChatState.sendScopeConfirmedReady = null;
+    liveChatState.sendInFlight = false;
+    liveChatState.scopeRecheckInFlight = false;
+    liveChatState.scopeRecheckRun = 0;
+    liveChatState.subscriptionActionInFlight = false;
+    liveChatState.preserveRestrictionOnce = false;
+    liveChatSetSendVisible(false);
 }
 
 
@@ -1792,6 +1999,797 @@ function liveChatFinish(status){
     // Terminal: never resume, even after a hidden/visible tab cycle.
     liveChatState.tick = null;
     liveChatState.paused = false;
+
+    // Cancel pending OAuth capability retries and invalidate in-flight verification
+    // results so no async verification mutates state after chat has ended.
+    // Preserve rendered history and panel/composer visibility behavior.
+    if(liveChatState.scopeVerifyTimer){
+        clearTimeout(liveChatState.scopeVerifyTimer);
+        liveChatState.scopeVerifyTimer = null;
+    }
+    liveChatState.scopeVerifyRetryCount = 0;
+    liveChatState.scopeVerifyExhausted = false;
+    liveChatState.scopeRecheckInFlight = false;
+
+    // A finished/ended chat cannot be posted to.
+    liveChatState.sendEnabled = false;
+    liveChatSetSendVisible(false);
+}
+
+
+// --- Sending (hidden unless the server says it is enabled) ------------------
+// The composer is a convenience, never the gate. Every rule below is enforced
+// again by POST /api/liveChat/send; a stale tab can only produce a clean error.
+
+function liveChatSendNote(text, tone){
+    const els = liveChatEls();
+
+    if(!els.note){
+        return;
+    }
+
+    els.note.textContent = text || "";
+    els.note.classList.toggle("is-error", tone === "error");
+    els.note.classList.toggle("is-ok", tone === "ok");
+    els.note.hidden = !text;
+}
+
+
+// Visibility requires a live stream id AND both server facts. Called after
+// every poll and after the account probe, so a capability change hides the
+// composer without a reload.
+function liveChatSetSendVisible(show){
+    const els = liveChatEls();
+
+    if(!els.form){
+        return;
+    }
+
+    const panel = els.panel || liveChatState.panel;
+    const panelActive = panel ? !panel.hidden : true;
+    const hasSource = Boolean(liveChatState.sourceId);
+    const stopped = liveChatState.stopped === true;
+
+    const user = typeof currentUser === "function" ? currentUser() : null;
+    const canSendEnabled =
+        Boolean(show) &&
+        panelActive &&
+        hasSource &&
+        !stopped &&
+        Boolean(user) &&
+        liveChatState.sendEnabled === true &&
+        liveChatState.sendScopeReady === true &&
+        liveChatState.chatRestrictionConfirmed !== true;
+
+    const composerVisible =
+        panelActive &&
+        hasSource &&
+        !stopped;
+
+    // On confirmed send restriction (e.g. CHAT_FORBIDDEN), hide actual composer
+    // controls; restriction explanation/actions are rendered outside the form.
+    const formVisible = composerVisible && liveChatState.chatRestrictionConfirmed !== true;
+    els.form.hidden = !formVisible;
+
+    if(els.attrib){
+        els.attrib.style.display = composerVisible ? "none" : "";
+    }
+
+    if(els.input){
+        els.input.disabled = !canSendEnabled || liveChatState.sendInFlight === true;
+    }
+
+    if(els.sendBtn){
+        els.sendBtn.disabled = !canSendEnabled || liveChatState.sendInFlight === true;
+    }
+}
+
+
+function liveChatApplySendVisibility(){
+    const user = typeof currentUser === "function" ? currentUser() : null;
+    const els = liveChatEls();
+
+    liveChatSetSendVisible(true);
+
+    if(!els.form || els.form.hidden){
+        return;
+    }
+
+    if(liveChatState.stopped || !liveChatState.sourceId){
+        liveChatSendNote("", "");
+        if(els.input){
+            els.input.disabled = true;
+        }
+        if(els.sendBtn){
+            els.sendBtn.disabled = true;
+        }
+        return;
+    }
+
+    if(!user){
+        liveChatSendNote("Sign in to send messages.", "error");
+        if(els.input){
+            els.input.disabled = true;
+        }
+        if(els.sendBtn){
+            els.sendBtn.disabled = true;
+        }
+        return;
+    }
+
+    if(liveChatState.sendEnabled !== true){
+        liveChatSendNote("Chat sending is currently unavailable.", "error");
+        if(els.input){
+            els.input.disabled = true;
+        }
+        if(els.sendBtn){
+            els.sendBtn.disabled = true;
+        }
+        return;
+    }
+
+    if(liveChatState.sendScopeReady !== true){
+        // Only show Connect when server explicitly confirmed scopeReady is false in a 200 response.
+        if(liveChatState.sendScopeConfirmedReady === false){
+            liveChatSendNote("Connect your YouTube account to send messages.", "error");
+        }
+        else if(liveChatState.scopeVerifyExhausted){
+            liveChatSendNote("Couldn't verify connection. Please try again.", "error");
+        }
+        else{
+            liveChatSendNote("Verifying YouTube connection...", "");
+        }
+        if(els.input){
+            els.input.disabled = true;
+        }
+        if(els.sendBtn){
+            els.sendBtn.disabled = true;
+        }
+        return;
+    }
+
+    if(liveChatState.sendInFlight === true){
+        liveChatSendNote("Sending...", "");
+        if(els.input){
+            els.input.disabled = true;
+        }
+        if(els.sendBtn){
+            els.sendBtn.disabled = true;
+        }
+        return;
+    }
+
+    liveChatSendNote("", "");
+}
+
+
+// Safe, closed copy for every server code. Unknown codes fall back to a generic
+// sentence; the server's own `error` string is never rendered here.
+function liveChatSendErrorMessage(code, status){
+    switch(String(code || "")){
+        case "RATE_LIMITED":
+            return "You're sending messages too quickly. Please wait a moment.";
+        case "CHAT_RATE_LIMITED":
+            return "YouTube is asking for a slower pace. Please wait a moment.";
+        case "SEND_IN_PROGRESS":
+            return "Your previous message is still being sent.";
+        case "YOUTUBE_NOT_CONNECTED":
+            return "Connect your YouTube account on your profile to send messages.";
+        case "YOUTUBE_SCOPE_REQUIRED":
+        case "YOUTUBE_REAUTH_REQUIRED":
+            return "Reconnect your YouTube account on your profile to send messages.";
+        case "NOT_LIVE":
+            return "This stream is not live.";
+        case "CHAT_DISABLED":
+            return "Live chat is turned off for this broadcast.";
+        case "LIVE_CHAT_ENDED":
+            return "This live chat has ended.";
+        case "LIVE_CHAT_NOT_FOUND":
+            return "This live chat is unavailable.";
+        case "CHAT_FORBIDDEN":
+            return "You can't send messages in this chat.";
+        case "INVALID_MESSAGE":
+            return "That message can't be sent. Check the text and try again.";
+        case "CHAT_SEND_DISABLED":
+            return "Sending chat messages is not available yet.";
+        case "QUOTA_EXCEEDED":
+            return "YouTube's daily limit has been reached. Please try again later.";
+        default:
+            return status === 401
+                ? "Sign in to send messages."
+                : "We couldn't send your message. Please try again.";
+    }
+}
+
+
+function liveChatBindSendForm(){
+    const els = liveChatEls();
+
+    if(!els.form || els.form.dataset.bound === "1"){
+        return;
+    }
+
+    els.form.dataset.bound = "1";
+    els.form.addEventListener("submit", liveChatSubmit);
+
+    // Typing dismisses "Sent."/"error" so the note never looks stale.
+    if(els.input){
+        els.input.addEventListener("input", () => {
+            if(!liveChatState.sendInFlight){
+                liveChatSendNote("", "");
+            }
+        });
+    }
+}
+
+
+async function liveChatAuthedFetch(path, init){
+    const user = currentUser();
+    if(!user || typeof user.getIdToken !== "function"){
+        return { ok: false, status: 401, code: "UNAUTHENTICATED", body: null };
+    }
+    if(auth && typeof auth.authStateReady === "function"){
+        await auth.authStateReady();
+    }
+    const freshUser = currentUser() || user;
+    const token = await freshUser.getIdToken();
+    const res = await fetch(path, {
+        ...(init || {}),
+        headers: {
+            ...((init && init.headers) || {}),
+            Authorization: "Bearer " + token
+        },
+        cache: "no-store"
+    });
+    let body = null;
+    try{ body = await res.json(); } catch(e){ body = null; }
+    return { ok: res.ok, status: res.status, body, code: body && body.code ? String(body.code) : "" };
+}
+
+function liveChatRestrictionText(base, subscribed){
+    if(subscribed === true){
+        return base + " Your account appears subscribed to this channel, but you still can't send messages in this chat. Other restrictions or subscription-duration requirements may apply.";
+    }
+    if(subscribed === false){
+        return base + " You can check whether your connected YouTube account is subscribed to this channel.";
+    }
+    return base + " This may happen if the chat is subscriber-only, members-only, or has other restrictions.";
+}
+
+async function liveChatCheckSubscription(){
+    const els = liveChatEls();
+    const run = liveChatState.run;
+    const sourceId = liveChatState.sourceId;
+    if(!sourceId || liveChatState.stopped || run !== liveChatState.run){ return; }
+    if(liveChatState.restrictionState === "checking" || liveChatState.subscriptionCheckState === "checking"){ return; }
+
+    liveChatState.restrictionState = "checking";
+    liveChatState.subscriptionCheckState = "checking";
+    if(els.restrictionActions){ els.restrictionActions.textContent = "Checking subscription..."; }
+
+    const result = await liveChatAuthedFetch("/api/liveChat/subscriptionStatus?videoId=" + encodeURIComponent(sourceId));
+    if(liveChatState.stopped || run !== liveChatState.run || sourceId !== liveChatState.sourceId){ return; }
+
+    if(!result.ok || !result.body || result.body.available !== true){
+        liveChatState.restrictionState = "checked";
+        liveChatState.subscriptionCheckState = "error";
+        liveChatState.subscriptionSubscribed = null;
+        liveChatState.chatRestrictionConfirmed = true;
+        if(els.restrictionText){
+            els.restrictionText.textContent = "Unable to verify your chat eligibility. Please try again.";
+        }
+        if(els.restrictionActions){ els.restrictionActions.textContent = ""; }
+        liveChatApplySendVisibility();
+        liveChatRenderRestrictionActions();
+        return;
+    }
+
+    liveChatState.restrictionState = "checked";
+    liveChatState.subscriptionCheckState = "ok";
+    liveChatState.subscriptionSubscribed = result.body.subscribed === true;
+    liveChatState.chatRestrictionConfirmed = true;
+    if(els.restrictionText){
+        if(liveChatState.subscriptionSubscribed === false){
+            els.restrictionText.textContent = "You may need to subscribe to this channel to join the chat.";
+        } else {
+            els.restrictionText.textContent = "You are subscribed, but this chat may have additional restrictions.";
+        }
+    }
+    liveChatApplySendVisibility();
+    liveChatRenderRestrictionActions();
+}
+
+async function liveChatSubscribeAction(){
+    const run = liveChatState.run;
+    const sourceId = liveChatState.sourceId;
+    if(!sourceId || liveChatState.stopped || run !== liveChatState.run){ return; }
+    if(liveChatState.subscriptionActionInFlight){ return; }
+
+    const confirmed = window.confirm("Subscribe to this channel with your connected YouTube account? This action happens only because you confirmed it.");
+    if(!confirmed){ return; }
+    if(liveChatState.stopped || run !== liveChatState.run || sourceId !== liveChatState.sourceId){ return; }
+
+    liveChatState.subscriptionActionInFlight = true;
+    const els = liveChatEls();
+    liveChatRenderRestrictionActions();
+
+    try{
+        const result = await liveChatAuthedFetch("/api/liveChat/subscribe", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ videoId: sourceId })
+        });
+
+        if(liveChatState.stopped || run !== liveChatState.run || sourceId !== liveChatState.sourceId){ return; }
+
+        if(result.ok && result.body && result.body.subscribed === true){
+            liveChatState.subscriptionSubscribed = true;
+            liveChatState.restrictionState = "checked";
+            liveChatState.chatRestrictionConfirmed = true;
+            if(els.restrictionText){
+                els.restrictionText.textContent = "Subscription completed. Refreshing chat eligibility...";
+            }
+            if(els.restrictionActions){ els.restrictionActions.textContent = ""; }
+            // Refresh subscription status and chat state. Do not automatically resend.
+            await liveChatCheckSubscription();
+            if(!liveChatState.stopped && run === liveChatState.run && sourceId === liveChatState.sourceId){
+                // Preserve valid restriction feedback across the restart when possible.
+                const preserved = {
+                    state: liveChatState.restrictionState,
+                    subscribed: liveChatState.subscriptionSubscribed,
+                    checkState: liveChatState.subscriptionCheckState,
+                    confirmed: liveChatState.chatRestrictionConfirmed === true,
+                    text: els.restrictionText ? els.restrictionText.textContent : ""
+                };
+                liveChatState.subscriptionActionInFlight = false;
+                liveChatState.preserveRestrictionOnce = Boolean(preserved && preserved.text);
+                liveChatStart(sourceId, true);
+                if(preserved && preserved.text){
+                    const elsAfter = liveChatEls();
+                    liveChatState.restrictionState = preserved.state || "checked";
+                    liveChatState.subscriptionSubscribed = preserved.subscribed;
+                    liveChatState.subscriptionCheckState = preserved.checkState || "idle";
+                    liveChatState.chatRestrictionConfirmed = preserved.confirmed === true;
+                    if(elsAfter.restrictionText){ elsAfter.restrictionText.textContent = preserved.text; }
+                    if(elsAfter.restriction){ elsAfter.restriction.hidden = false; }
+                    liveChatApplySendVisibility();
+                    liveChatRenderRestrictionActions();
+                }
+            }
+            return;
+        }
+
+        if(liveChatState.stopped || run !== liveChatState.run || sourceId !== liveChatState.sourceId){ return; }
+        liveChatState.restrictionState = "checked";
+        liveChatState.subscriptionCheckState = "error";
+        liveChatState.chatRestrictionConfirmed = true;
+        if(els.restrictionText){
+            const msg = (result.body && result.body.error) ? String(result.body.error) : "Couldn't subscribe right now.";
+            els.restrictionText.textContent = "Unable to verify your chat eligibility. Please try again. " + msg;
+        }
+        liveChatApplySendVisibility();
+        liveChatRenderRestrictionActions();
+    }
+    finally{
+        if(run === liveChatState.run && sourceId === liveChatState.sourceId){
+            liveChatState.subscriptionActionInFlight = false;
+        }
+        else if(liveChatState.stopped){
+            liveChatState.subscriptionActionInFlight = false;
+        }
+        liveChatRenderRestrictionActions();
+    }
+}
+
+function liveChatRenderRestrictionActions(){
+    const els = liveChatEls();
+    if(!els.restrictionActions) return;
+    if(liveChatState.restrictionState === "checking") return;
+    if(liveChatState.stopped) return;
+    els.restrictionActions.textContent = "";
+
+    if(liveChatState.subscriptionActionInFlight){
+        const note = document.createElement("span");
+        note.textContent = "Subscribing...";
+        els.restrictionActions.appendChild(note);
+        return;
+    }
+
+    const user = currentUser();
+    if(!user){
+        const note = document.createElement("span");
+        note.textContent = "Sign in and connect your YouTube account to check subscription status.";
+        els.restrictionActions.appendChild(note);
+        return;
+    }
+
+    const checkBtn = document.createElement("button");
+    checkBtn.type = "button";
+    checkBtn.className = "live-chat-restriction-btn";
+    checkBtn.textContent = "Check subscription";
+    checkBtn.disabled = liveChatState.subscriptionActionInFlight === true;
+    checkBtn.addEventListener("click", liveChatCheckSubscription);
+    els.restrictionActions.appendChild(checkBtn);
+
+    if(liveChatState.subscriptionSubscribed === false){
+        const subBtn = document.createElement("button");
+        subBtn.type = "button";
+        subBtn.className = "live-chat-restriction-btn live-chat-restriction-btn--primary";
+        subBtn.textContent = "Subscribe";
+        subBtn.disabled = liveChatState.subscriptionActionInFlight === true;
+        subBtn.addEventListener("click", liveChatSubscribeAction);
+        els.restrictionActions.appendChild(subBtn);
+    }
+}
+
+function liveChatShowRestriction(code){
+    const els = liveChatEls();
+    if(!els.restriction || !els.restrictionText) return;
+    liveChatState.restrictionState = "idle";
+    liveChatState.subscriptionSubscribed = null;
+    liveChatState.chatRestrictionConfirmed = true;
+    liveChatState.subscriptionCheckState = "idle";
+    const isForbidden = String(code || "") === "CHAT_FORBIDDEN";
+    if(els.restrictionText){
+        els.restrictionText.textContent = isForbidden
+            ? "You can't send messages in this chat. This may be due to subscriber-only mode, members-only mode, or other restrictions. Chat eligibility is not verified yet."
+            : "You can't send messages in this chat right now. Chat eligibility is not verified yet.";
+    }
+    els.restriction.hidden = false;
+    liveChatApplySendVisibility();
+    liveChatRenderRestrictionActions();
+}
+
+// Does this account hold a usable YouTube scope? The send capability itself
+// comes from the live-chat payload, so this probe only decides whether showing
+// the composer is even meaningful. Failure leaves it hidden.
+const SCOPE_VERIFY_MAX_RETRIES = 3;
+
+function scheduleScopeVerifyRetry(run, isRecheck){
+    if(liveChatState.stopped || run !== liveChatState.run){
+        return;
+    }
+    if(liveChatState.scopeVerifyTimer){
+        return;
+    }
+    if(liveChatState.scopeVerifyRetryCount >= SCOPE_VERIFY_MAX_RETRIES){
+        // Retries exhausted - show temporary error, do not claim confirmed disconnect.
+        liveChatState.sendScopeConfirmedReady = null;
+        liveChatState.sendScopeReady = false;
+        liveChatState.scopeVerifyExhausted = true;
+        liveChatSendNote("Couldn't verify connection. Please try again.", "error");
+        const els = liveChatEls();
+        if(els && els.input){ els.input.disabled = true; }
+        if(els && els.sendBtn){ els.sendBtn.disabled = true; }
+        return;
+    }
+    const delay = Math.min(1500 * Math.pow(2, liveChatState.scopeVerifyRetryCount), 6000);
+    liveChatState.scopeVerifyRetryCount += 1;
+    liveChatState.scopeVerifyTimer = setTimeout(() => {
+        liveChatState.scopeVerifyTimer = null;
+        if(liveChatState.stopped || run !== liveChatState.run){
+            return;
+        }
+        liveChatLoadSendCapability(run, { recheck: isRecheck, fromRetry: true });
+    }, delay);
+}
+
+async function liveChatLoadSendCapability(run, options){
+    const opts = options && typeof options === "object" ? options : {};
+    const recheck = opts.recheck === true;
+    const fromRetry = opts.fromRetry === true;
+
+    if(recheck){
+        if(liveChatState.scopeRecheckInFlight){
+            return;
+        }
+        liveChatState.scopeRecheckInFlight = true;
+        liveChatState.scopeRecheckRun = run;
+    }
+
+    try{
+        if(!recheck){
+            // Initial load: don't mark as confirmed not-ready. Keep unknown until confirmed.
+            liveChatState.sendScopeReady = false;
+            liveChatState.sendScopeConfirmedReady = null;
+            if(!fromRetry){
+                if(liveChatState.scopeVerifyTimer){
+                    clearTimeout(liveChatState.scopeVerifyTimer);
+                    liveChatState.scopeVerifyTimer = null;
+                }
+                liveChatState.scopeVerifyRetryCount = 0;
+                liveChatState.scopeVerifyExhausted = false;
+            }
+            liveChatApplySendVisibility();
+        }
+        else{
+            // During recheck, show temporary state without treating as confirmed disconnect.
+            liveChatSendNote("Checking YouTube connection...", "");
+            const els = liveChatEls();
+            if(els && els.input){ els.input.disabled = true; }
+            if(els && els.sendBtn){ els.sendBtn.disabled = true; }
+        }
+
+        const user = currentUser();
+
+        if(!user || typeof user.getIdToken !== "function"){
+            // No Firebase user/token: could be signed out or auth still initializing.
+            // Do not confirm disconnect. Initial checks get bounded retries.
+            liveChatState.sendScopeReady = false;
+            liveChatState.sendScopeConfirmedReady = null;
+            if(recheck){
+                liveChatSendNote("Couldn't verify connection. Please try again.", "error");
+                const els = liveChatEls();
+                if(els && els.input){ els.input.disabled = true; }
+                if(els && els.sendBtn){ els.sendBtn.disabled = true; }
+            }
+            else{
+                liveChatSendNote("Verifying YouTube connection...", "");
+                const els = liveChatEls();
+                if(els && els.input){ els.input.disabled = true; }
+                if(els && els.sendBtn){ els.sendBtn.disabled = true; }
+                scheduleScopeVerifyRetry(run, false);
+            }
+            return;
+        }
+
+        if(liveChatState.stopped || run !== liveChatState.run){
+            return;
+        }
+
+        if(auth && typeof auth.authStateReady === "function"){
+            await auth.authStateReady();
+        }
+
+        if(liveChatState.stopped || run !== liveChatState.run){
+            return;
+        }
+
+        const freshUser = currentUser() || user;
+        if(!freshUser || typeof freshUser.getIdToken !== "function"){
+            throw new Error("No user token available");
+        }
+        const token = await freshUser.getIdToken();
+
+        if(liveChatState.stopped || run !== liveChatState.run){
+            return;
+        }
+
+        const res = await fetch("/api/oauth/status", {
+            headers: { Authorization: "Bearer " + token },
+            cache: "no-store"
+        });
+
+        if(liveChatState.stopped || run !== liveChatState.run){
+            return;
+        }
+
+        let body = null;
+        if(res.ok){
+            try{
+                body = await res.json();
+            }
+            catch(e){
+                body = null;
+            }
+        }
+
+        if(liveChatState.stopped || run !== liveChatState.run){
+            return;
+        }
+
+        if(res.ok && body && typeof body === "object"){
+            // Only a valid 200 response can confirm scope state.
+            const scopeReady = body.scopeReady === true;
+            liveChatState.sendScopeReady = scopeReady;
+            liveChatState.sendScopeConfirmedReady = scopeReady;
+            liveChatState.scopeVerifyRetryCount = 0;
+            liveChatState.scopeVerifyExhausted = false;
+            if(liveChatState.scopeVerifyTimer){
+                clearTimeout(liveChatState.scopeVerifyTimer);
+                liveChatState.scopeVerifyTimer = null;
+            }
+            liveChatApplySendVisibility();
+            return;
+        }
+
+        // Temporary failure (non-200, auth error, parse error, etc.) - do NOT claim confirmed disconnect.
+        liveChatState.sendScopeConfirmedReady = null;
+        if(!recheck){
+            // Keep sendScopeReady false (not confirmed ready) but show temporary message and retry.
+            liveChatState.sendScopeReady = false;
+            liveChatSendNote("Checking YouTube connection...", "");
+            const els = liveChatEls();
+            if(els && els.input){ els.input.disabled = true; }
+            if(els && els.sendBtn){ els.sendBtn.disabled = true; }
+            scheduleScopeVerifyRetry(run, false);
+        }
+        else{
+            liveChatSendNote("Couldn't verify connection. Please try again.", "error");
+            const els = liveChatEls();
+            if(els && els.input){ els.input.disabled = true; }
+            if(els && els.sendBtn){ els.sendBtn.disabled = true; }
+        }
+    }
+    catch(e){
+        if(liveChatState.stopped || run !== liveChatState.run){
+            return;
+        }
+        // Temporary failure (token/network/etc.) - do NOT claim confirmed disconnect.
+        liveChatState.sendScopeConfirmedReady = null;
+        if(!recheck){
+            liveChatState.sendScopeReady = false;
+            liveChatSendNote("Checking YouTube connection...", "");
+            const els = liveChatEls();
+            if(els && els.input){ els.input.disabled = true; }
+            if(els && els.sendBtn){ els.sendBtn.disabled = true; }
+            scheduleScopeVerifyRetry(run, false);
+        }
+        else{
+            liveChatSendNote("Couldn't verify connection. Please try again.", "error");
+            const els = liveChatEls();
+            if(els && els.input){ els.input.disabled = true; }
+            if(els && els.sendBtn){ els.sendBtn.disabled = true; }
+        }
+    }
+    finally{
+        if(recheck && liveChatState.scopeRecheckRun === run){
+            liveChatState.scopeRecheckInFlight = false;
+        }
+    }
+}
+
+
+async function liveChatSubmit(event){
+    if(event){
+        event.preventDefault();
+    }
+
+    const els = liveChatEls();
+
+    if(!els.input || !els.sendBtn || liveChatState.sendInFlight){
+        return;
+    }
+
+    // A stale form (capability revoked server-side) must not fire a request.
+    if(liveChatState.sendEnabled !== true || liveChatState.sendScopeReady !== true){
+        liveChatApplySendVisibility();
+        return;
+    }
+
+    const text = String(els.input.value || "");
+    const sourceId = liveChatState.sourceId;
+    const run = liveChatState.run;
+    const user = currentUser();
+
+    if(!sourceId || !user){
+        liveChatSendNote("This live chat is no longer available.", "error");
+        return;
+    }
+
+    if(text.trim() === ""){
+        liveChatSendNote("Type a message first.", "error");
+        els.input.focus();
+        return;
+    }
+
+    // Count code points, matching the server's 200-character rule (an emoji is
+    // one character, not two).
+    if(Array.from(text).length > 200){
+        liveChatSendNote("Messages can be up to 200 characters.", "error");
+        els.input.focus();
+        return;
+    }
+
+    liveChatState.sendInFlight = true;
+    els.input.disabled = true;
+    els.sendBtn.disabled = true;
+    liveChatSendNote("Sending...", "");
+
+    const ownsCurrentStream = () => (
+        !liveChatState.stopped &&
+        run === liveChatState.run &&
+        sourceId === liveChatState.sourceId
+    );
+
+    try{
+        const token = await user.getIdToken();
+        if(!ownsCurrentStream()){
+            return;
+        }
+
+        const requestId =
+            (window.crypto && typeof window.crypto.randomUUID === "function")
+                ? window.crypto.randomUUID()
+                : ("r" + Date.now() + Math.floor(Math.random() * 1000000));
+
+        const res = await fetch("/api/liveChat/send", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + token
+            },
+            body: JSON.stringify({
+                videoId: sourceId,
+                text: text,
+                requestId: requestId
+            })
+        });
+
+        if(!ownsCurrentStream()){
+            return;
+        }
+
+        let body = null;
+
+        try{
+            body = await res.json();
+        }
+        catch(e){
+            body = null;
+        }
+
+        if(!ownsCurrentStream()){
+            return;
+        }
+
+        if(res.ok && body && body.ok === true){
+            // Show the confirmed message immediately; the next poll will also
+            // return it, and the dedupe set keeps it from appearing twice.
+            if(body.message && body.message.id){
+                liveChatRender([body.message], null);
+            }
+
+            els.input.value = "";
+            liveChatSendNote("Sent.", "ok");
+            return;
+        }
+
+        const code = String((body && body.code) || "");
+
+        liveChatSendNote(liveChatSendErrorMessage(code, res.status), "error");
+
+        if(code === "LIVE_CHAT_ENDED" || code === "CHAT_DISABLED" || code === "LIVE_CHAT_NOT_FOUND"){
+            liveChatClearRestriction();
+            liveChatSetSendVisible(false);
+        }
+        else if(code === "CHAT_FORBIDDEN"){
+            liveChatShowRestriction(code);
+        }
+        else if(code === "YOUTUBE_NOT_CONNECTED" || code === "YOUTUBE_SCOPE_REQUIRED" || code === "YOUTUBE_REAUTH_REQUIRED"){
+            liveChatClearRestriction();
+            // Don't mark as confirmed disconnect. Recheck OAuth status.
+            liveChatSendNote("Verifying YouTube connection...", "");
+            liveChatLoadSendCapability(liveChatState.run, { recheck: true });
+            return;
+        }
+        else if(code === "CHAT_SEND_DISABLED"){
+            liveChatClearRestriction();
+            liveChatState.sendEnabled = false;
+            liveChatSetSendVisible(false);
+        }
+        else {
+            liveChatClearRestriction();
+        }
+    }
+    catch(e){
+        if(!ownsCurrentStream()){
+            return;
+        }
+        liveChatSendNote("We couldn't reach MyTube. Check your connection and try again.", "error");
+    }
+    finally{
+        if(ownsCurrentStream()){
+            liveChatState.sendInFlight = false;
+            if(!liveChatState.scopeRecheckInFlight){
+                liveChatApplySendVisibility();
+            }
+
+            if(els.form && !els.form.hidden && els.input && !liveChatState.scopeRecheckInFlight){
+                els.input.focus();
+            }
+        }
+    }
 }
 
 
@@ -1826,6 +2824,13 @@ function liveChatStart(sourceId, isLive){
     liveChatSetBadge("LIVE", false);
     liveChatSetMeta("");
     liveChatSetStatus("Connecting to live chat...");
+
+    // Wire the composer once, keep it hidden, and check the account's YouTube
+    // scope in parallel with the first poll. The poll result supplies the
+    // server-side send capability.
+    liveChatBindSendForm();
+    liveChatSetSendVisible(false);
+    liveChatLoadSendCapability(run);
 
     // Poll one batch. The server decides whether this is the first fetch (it then
     // returns recent history) or a follow-up (it returns only new messages), so
@@ -1863,6 +2868,7 @@ function liveChatStart(sourceId, isLive){
         if(!result.ok){
             // Transient failure: back off and retry rather than showing an error.
             liveChatSetStatus("Live chat is reconnecting...");
+            liveChatSetSendVisible(false);
             liveChatState.timer = setTimeout(poll, 10000);
             return;
         }
@@ -1894,6 +2900,7 @@ function liveChatStart(sourceId, isLive){
                     "Live chat is turned off for this broadcast, or has not started yet."
                 );
             }
+            liveChatSetSendVisible(false);
             liveChatState.timer = setTimeout(poll, 15000);
             return;
         }
@@ -1906,9 +2913,15 @@ function liveChatStart(sourceId, isLive){
 
         if(result.chatStatus === "error"){
             liveChatSetStatus("Live chat is temporarily unavailable. Retrying...");
+            liveChatSetSendVisible(false);
             liveChatState.timer = setTimeout(poll, 10000);
             return;
         }
+
+        // The payload is the only source of truth for the server kill switch.
+        // `undefined` (older payload) is treated as off, never as on.
+        liveChatState.sendEnabled = result.chatSendEnabled === true;
+        liveChatApplySendVisibility();
 
         // Status is "live" here. Say something only when there is genuinely
         // nothing to show, so a busy chat is not cluttered with text.
@@ -1965,6 +2978,11 @@ document.addEventListener("visibilitychange", () => {
     if(liveChatState.paused && liveChatState.tick && !liveChatState.stopped){
         liveChatState.paused = false;
         liveChatState.timer = setTimeout(liveChatState.tick, 0);
+    }
+
+    // Refresh actual YouTube rating when returning to the tab (throttled per video).
+    if(isYoutubeRatingVideo()){
+        void loadYoutubeRating({ force: false });
     }
 });
 
@@ -2098,7 +3116,7 @@ function buildLocalCommentNode(comment){
 
     const text = document.createElement("p");
     text.className = "comment-text";
-    text.textContent = comment.text;
+    appendSafeLineContent(text, comment.text || "");
 
     const time = document.createElement("span");
     time.className = "comment-time";
@@ -2568,8 +3586,342 @@ let voteState = "neutral";
 let storedLikeCount = baseLikeCount;
 let storedDislikeCount = baseDislikeCount;
 
+// ================= YOUTUBE RATING SYNC (Phase 2) =================
+// For YouTube videos, the connected YouTube account's actual rating is the
+// source of truth (GET/POST /api/youtube/rating). MyTube Liked Library is
+// independent and must never be presented as actual YouTube rating. Local vote
+// storage is preserved for non-YouTube/local behavior only.
+const YT_RATING_REFRESH_MIN_MS = 45 * 1000;
+let ytRatingState = "none"; // last confirmed: like | dislike | none
+let ytRatingStatus = "idle"; // idle | loading | ready | stale | unavailable | auth_required | connect_required | error
+let ytRatingConfirmed = false; // true only after a successful GET/POST confirmation for current context
+let ytRatingSeq = 0;
+let ytRatingActiveVideoId = "";
+let ytRatingWriteInFlight = false;
+let ytRatingReadController = null;
+const ytRatingLastFetchAt = new Map(); // videoId -> ms
+
+function currentYoutubeSourceId(){
+    if(!isYt){
+        return "";
+    }
+    const sid = typeof ytSourceId === "function" ? ytSourceId(rawId) : "";
+    if(/^[A-Za-z0-9_-]{11}$/.test(String(sid || ""))){
+        return String(sid);
+    }
+    const activeSid = active && (active.sourceId || (typeof active.id === "string" && active.id.startsWith("yt:") ? active.id.slice(3) : ""));
+    return /^[A-Za-z0-9_-]{11}$/.test(String(activeSid || "")) ? String(activeSid) : "";
+}
+
+function normalizeYoutubeRatingValue(value){
+    const rating = String(value || "").trim().toLowerCase();
+    if(rating === "like" || rating === "dislike" || rating === "none") return rating;
+    return "none";
+}
+
+function isYoutubeRatingVideo(){
+    return Boolean(isYt && currentYoutubeSourceId());
+}
+
+function resetYoutubeRatingState(status = "idle"){
+    ytRatingSeq += 1;
+    if(ytRatingReadController){
+        try{ ytRatingReadController.abort(); } catch(e){}
+        ytRatingReadController = null;
+    }
+    ytRatingWriteInFlight = false;
+    ytRatingStatus = status;
+    ytRatingState = "none";
+    ytRatingConfirmed = false;
+    ytRatingActiveVideoId = currentYoutubeSourceId();
+}
+
+// ================= CONNECTED YOUTUBE ACCOUNT IDENTITY =================
+// Read-only identity of the account that will perform YouTube actions. It is
+// resolved from the same OAuth grant used by the rating/subscription endpoints,
+// never from the video's channel or a locally stored name.
+const ytIdentity = createYoutubeAccountIdentity({
+    getUid: () => {
+        const user = typeof currentUser === "function" ? currentUser() : null;
+        return user && user.uid ? String(user.uid) : "";
+    },
+    getToken: () => getFirebaseIdTokenForYoutube(),
+    onChange: () => {
+        renderYtActingAccount();
+        renderLikeDislike();
+        renderYtAccountSub();
+    }
+});
+
+function ensureYtActingAccountEl(){
+    if(!isYt){
+        return null;
+    }
+    let el = document.getElementById("ytActingAccount");
+    if(el){
+        return el;
+    }
+    const anchor = dislikeBtn || likeBtn;
+    if(!anchor || !anchor.parentElement || !anchor.parentElement.parentElement){
+        return null;
+    }
+    const actionsRow = anchor.parentElement;
+    el = document.createElement("div");
+    el.id = "ytActingAccount";
+    el.className = "yt-acting-account";
+    el.style.fontSize = "12px";
+    el.style.color = "#aaa";
+    el.style.marginTop = "6px";
+    el.style.lineHeight = "1.4";
+    el.setAttribute("aria-live", "polite");
+    // Place the label below the whole action row, not inside the flex row.
+    actionsRow.parentElement.insertBefore(el, actionsRow.nextSibling);
+    return el;
+}
+
+function renderYtActingAccount(){
+    const el = ensureYtActingAccountEl();
+    if(!el){
+        return;
+    }
+    el.style.display = "";
+    const s = ytIdentity.state;
+    if(s.status === "ready" && s.channel && s.channel.title){
+        el.textContent = "Acting as " + s.channel.title + " on YouTube";
+    }
+    else if(s.status === "multiple"){
+        el.textContent = ytIdentity.blockedMessage();
+    }
+    else if(s.status === "none"){
+        el.textContent = ytIdentity.blockedMessage();
+    }
+    else if(s.status === "signed_out"){
+        el.textContent = "Sign in to use YouTube actions.";
+    }
+    else if(s.status === "disconnected"){
+        el.textContent = "Connect your YouTube account in Profile to use YouTube actions.";
+    }
+    else if(s.status === "error"){
+        el.textContent = s.lastError || "Could not identify your connected YouTube account.";
+    }
+    else if(s.status === "loading"){
+        el.textContent = "Checking connected YouTube account...";
+    }
+    else{
+        el.textContent = "";
+        el.style.display = "none";
+    }
+}
+
+function loadYoutubeAccountIdentity(options = {}){
+    return ytIdentity.load(options);
+}
+
+async function getFirebaseIdTokenForYoutube(){
+    const user = currentUser ? currentUser() : (auth && auth.currentUser);
+    if(!user || typeof user.getIdToken !== "function"){
+        return null;
+    }
+    if(auth && typeof auth.authStateReady === "function"){
+        try{ await auth.authStateReady(); } catch(e){}
+    }
+    const freshUser = (currentUser ? currentUser() : null) || (auth && auth.currentUser) || user;
+    if(!freshUser || typeof freshUser.getIdToken !== "function"){
+        return null;
+    }
+    try{
+        return await freshUser.getIdToken();
+    }
+    catch(e){
+        return null;
+    }
+}
+
+async function fetchYoutubeRatingApi(videoId, signal){
+    const token = await getFirebaseIdTokenForYoutube();
+    if(!token){
+        return { ok: false, status: 401, code: "UNAUTHENTICATED", body: null };
+    }
+    const res = await fetch("/api/youtube/rating?videoId=" + encodeURIComponent(videoId), {
+        method: "GET",
+        headers: { Authorization: "Bearer " + token },
+        cache: "no-store",
+        signal
+    });
+    let body = null;
+    try{ body = await res.json(); } catch(e){ body = null; }
+    return { ok: res.ok, status: res.status, code: body && body.code ? String(body.code) : "", body };
+}
+
+async function postYoutubeRatingApi(videoId, rating, expectedChannelId, expectedUid){
+    const token = await getFirebaseIdTokenForYoutube();
+    if(!token){
+        return { ok: false, status: 401, code: "UNAUTHENTICATED", body: null };
+    }
+    const res = await fetch("/api/youtube/rating", {
+        method: "POST",
+        headers: {
+            Authorization: "Bearer " + token,
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ videoId, rating, expectedChannelId, expectedUid }),
+        cache: "no-store"
+    });
+    let body = null;
+    try{ body = await res.json(); } catch(e){ body = null; }
+    return { ok: res.ok, status: res.status, code: body && body.code ? String(body.code) : "", body };
+}
+
+function youtubeRatingCodeToStatus(code){
+    if(code === "UNAUTHENTICATED") return "auth_required";
+    if(code === "YOUTUBE_NOT_CONNECTED" || code === "YOUTUBE_SCOPE_REQUIRED" || code === "YOUTUBE_REAUTH_REQUIRED") return "connect_required";
+    return "unavailable";
+}
+
+function showYoutubeRatingGuidance(){
+    if(!isYoutubeRatingVideo()) return;
+    if(ytRatingStatus === "auth_required"){
+        setActionMsg("Sign in to rate this video on YouTube.");
+        return;
+    }
+    if(ytRatingStatus === "connect_required"){
+        setActionMsg("Connect your YouTube account in Profile to rate videos.");
+        return;
+    }
+    if(ytRatingStatus === "unavailable"){
+        setActionMsg("YouTube rating is unavailable right now.");
+    }
+}
+
+function canRefreshYoutubeRating(videoId, force){
+    if(force) return true;
+    const last = ytRatingLastFetchAt.get(videoId) || 0;
+    return (Date.now() - last) >= YT_RATING_REFRESH_MIN_MS;
+}
+
+async function loadYoutubeRating(options = {}){
+    if(!isYoutubeRatingVideo()){
+        return;
+    }
+    const videoId = currentYoutubeSourceId();
+    if(!videoId){
+        return;
+    }
+    if(!options.force && !canRefreshYoutubeRating(videoId, false)){
+        return;
+    }
+
+    // Non-blocking: never delays the rating read or Live Chat initialization.
+    void loadYoutubeAccountIdentity({ force: false });
+
+    const user = currentUser ? currentUser() : (auth && auth.currentUser);
+    if(!user){
+        ytRatingSeq += 1;
+        ytRatingActiveVideoId = videoId;
+        // Preserve last confirmed rating; show sign-in guidance truthfully.
+        ytRatingStatus = "auth_required";
+        renderLikeDislike();
+        setActionMsg("Sign in to rate this video on YouTube.");
+        return;
+    }
+
+    const seq = ++ytRatingSeq;
+    ytRatingActiveVideoId = videoId;
+    ytRatingStatus = "loading";
+    if(ytRatingReadController){
+        try{ ytRatingReadController.abort(); } catch(e){}
+    }
+    const controller = new AbortController();
+    ytRatingReadController = controller;
+    renderLikeDislike();
+
+    let result;
+    try{
+        result = await fetchYoutubeRatingApi(videoId, controller.signal);
+    }
+    catch(e){
+        if(e && e.name === "AbortError") return;
+        result = { ok: false, code: "UPSTREAM_ERROR", body: null };
+    }
+    finally{
+        if(ytRatingReadController === controller){
+            ytRatingReadController = null;
+        }
+    }
+
+    if(seq !== ytRatingSeq || currentYoutubeSourceId() !== videoId){
+        return;
+    }
+
+    ytRatingLastFetchAt.set(videoId, Date.now());
+
+    if(result && result.ok && result.body && result.body.ok === true){
+        ytRatingState = normalizeYoutubeRatingValue(result.body.rating);
+        ytRatingConfirmed = true;
+        ytRatingStatus = "ready";
+        renderLikeDislike();
+        return;
+    }
+
+    const code = result && (result.code || (result.body && result.body.code)) ? String(result.code || result.body.code) : "UPSTREAM_ERROR";
+    const mappedStatus = youtubeRatingCodeToStatus(code);
+
+    if(mappedStatus === "auth_required" || mappedStatus === "connect_required"){
+        // Preserve last confirmed rating; show guidance without silently changing it.
+        ytRatingStatus = mappedStatus;
+        if(mappedStatus === "auth_required"){
+            ytIdentity.clear("signed_out");
+        }
+        else{
+            ytIdentity.clear("disconnected");
+        }
+        renderLikeDislike();
+        if(mappedStatus === "auth_required"){
+            setActionMsg("Sign in to rate this video on YouTube.");
+        }
+        else{
+            setActionMsg("Connect or reconnect your YouTube account in Profile to rate videos.");
+        }
+        return;
+    }
+
+    if(ytRatingConfirmed){
+        // Preserve last confirmed rating on temporary refresh failures (network,
+        // timeout, quota, rate limits, upstream). Keep UI truthful.
+        ytRatingStatus = "stale";
+        renderLikeDislike();
+        if(code === "QUOTA_EXCEEDED"){
+            setActionMsg("Couldn't refresh your YouTube rating (quota reached). Showing your last confirmed rating.");
+        }
+        else if(code === "RATE_LIMITED" || code === "CHAT_RATE_LIMITED"){
+            setActionMsg("Couldn't refresh your YouTube rating right now. Showing your last confirmed rating.");
+        }
+        else{
+            setActionMsg("Couldn't refresh your YouTube rating. Showing your last confirmed rating.");
+        }
+        return;
+    }
+
+    // No previously confirmed rating: show unavailable truthfully.
+    ytRatingState = "none";
+    ytRatingConfirmed = false;
+    ytRatingStatus = "unavailable";
+    renderLikeDislike();
+}
+
 
 function restoreVoteState(){
+    // For YouTube videos, actual rating comes from the connected YouTube account
+    // via the backend API. Never use local/library state as YouTube rating truth.
+    if(isYt){
+        voteState = "neutral";
+        isLiked = false;
+        isDisliked = false;
+        resetYoutubeRatingState("loading");
+        renderLikeDislike();
+        return;
+    }
+
     try{
         const likeState = localStorage.getItem(likeStateKey());
         const dislikeState = localStorage.getItem(dislikeStateKey());
@@ -2624,19 +3976,76 @@ function formatCount(n){
 
 
 function renderLikeDislike(){
-    // The Like button shows the real public like count (statistics.likeCount)
-    // from the API — no invented count and no duplicate stats row. YouTube's
-    // public Data API does not expose dislike counts, so the Dislike control is
-    // shown truthfully with no fake number.
+    if(isYoutubeRatingVideo()){
+        // Reflect last confirmed rating (truthful). "ready" means freshly confirmed;
+        // "stale"/guidance/error states may still show a previously confirmed rating.
+        const hasConfirmed = ytRatingConfirmed === true;
+        const liked = hasConfirmed && ytRatingState === "like";
+        const disliked = hasConfirmed && ytRatingState === "dislike";
+        const busy = ytRatingStatus === "loading" || ytRatingWriteInFlight;
+        const identityStatus = ytIdentity.state.status;
+        const identityBlocked = ytIdentity.isBlocked()
+            || identityStatus === "loading"
+            || identityStatus === "error"
+            || identityStatus === "idle";
+        const disableActions = busy || identityBlocked; // allow clicks for auth/connect guidance when not busy
+
+        function ytRatingTitle(defaultTitle){
+            if(identityBlocked){
+                return ytIdentity.identityMessage();
+            }
+            if(ytRatingStatus === "auth_required"){
+                return "Sign in to rate this video on YouTube";
+            }
+            if(ytRatingStatus === "connect_required"){
+                return "Connect your YouTube account to rate videos";
+            }
+            if(busy){
+                return "Updating rating...";
+            }
+            if(ytRatingStatus === "stale" && hasConfirmed){
+                return "Showing your last confirmed YouTube rating (refresh failed)";
+            }
+            if((ytRatingStatus === "unavailable" || ytRatingStatus === "error") && !hasConfirmed){
+                return "YouTube rating unavailable";
+            }
+            if((ytRatingStatus === "unavailable" || ytRatingStatus === "error") && hasConfirmed){
+                return "Couldn't refresh YouTube rating; showing last confirmed rating";
+            }
+            return defaultTitle || "";
+        }
+
+        if(likeBtn){
+            likeBtn.classList.toggle("active", liked);
+            likeBtn.textContent = "👍 " + (liked ? "Liked" : "Like") + ytLikeCountSuffix();
+            likeBtn.setAttribute("aria-pressed", liked ? "true" : "false");
+            likeBtn.disabled = Boolean(disableActions);
+            likeBtn.title = ytRatingTitle("");
+        }
+        if(dislikeBtn){
+            dislikeBtn.classList.toggle("active", disliked);
+            dislikeBtn.textContent = "👎 " + (disliked ? "Disliked" : "Dislike");
+            dislikeBtn.setAttribute("aria-pressed", disliked ? "true" : "false");
+            dislikeBtn.disabled = Boolean(disableActions);
+            dislikeBtn.title = ytRatingTitle("");
+        }
+        return;
+    }
+
+    // Local/non-YouTube behavior (preserved).
     if(likeBtn){
         likeBtn.classList.toggle("active", isLiked);
         likeBtn.textContent = "👍 " + (isLiked ? "Liked" : "Like") + ytLikeCountSuffix();
         likeBtn.setAttribute("aria-pressed", isLiked ? "true" : "false");
+        likeBtn.disabled = false;
+        likeBtn.title = "";
     }
     if(dislikeBtn){
         dislikeBtn.classList.toggle("active", isDisliked);
         dislikeBtn.textContent = "👎 " + (isDisliked ? "Disliked" : "Dislike");
         dislikeBtn.setAttribute("aria-pressed", isDisliked ? "true" : "false");
+        dislikeBtn.disabled = false;
+        dislikeBtn.title = "";
     }
 }
 
@@ -2651,7 +4060,8 @@ function ytLikeCountSuffix(){
 }
 
 
-function setVote(next){
+function setLocalVote(next){
+    // Existing local/non-YouTube behavior (preserved).
     // next: "like" | "dislike"
     const wasLiked = voteState === "liked";
     const wasDisliked = voteState === "disliked";
@@ -2684,10 +4094,7 @@ function setVote(next){
     persistVoteState();
     renderLikeDislike();
 
-    // Persist liked state to Firestore when logged in. Any state other than
-    // "liked" (neutral OR disliked) must clear the Firestore record, otherwise
-    // switching a previously-liked video to Dislike leaves a stale entry in
-    // the Liked Videos library. deleteDoc on a missing doc is a no-op.
+    // Persist liked state to Firestore when logged in (existing behavior).
     const uid = uidOrNull();
     if(uid && active){
         if(voteState === "liked"){
@@ -2706,6 +4113,178 @@ function setVote(next){
             removeFromLiked(uid, active.id || storageKey());
         }
     }
+}
+
+async function setYoutubeVote(next){
+    // next: "like" | "dislike" (user intent). Actual rating sent to YouTube is
+    // like/dislike/none based on confirmed current state.
+    if(!isYoutubeRatingVideo()){
+        return;
+    }
+
+    if(ytRatingStatus === "auth_required"){
+        setActionMsg("Sign in to rate this video on YouTube.");
+        renderLikeDislike();
+        return;
+    }
+    if(ytRatingStatus === "connect_required"){
+        setActionMsg("Connect your YouTube account in Profile to rate videos.");
+        renderLikeDislike();
+        return;
+    }
+    if(ytRatingWriteInFlight || ytRatingStatus === "loading"){
+        return;
+    }
+
+    const videoId = currentYoutubeSourceId();
+    if(!videoId){
+        return;
+    }
+
+    // Capture the identity the user is currently shown, then force-refresh it
+    // immediately before the write. A changed user/channel blocks the action;
+    // the backend also re-verifies the expected channel independently.
+    const expected = ytIdentity.mutationGuard();
+    if(!expected.uid || !expected.channelId){
+        setActionMsg(ytIdentity.identityMessage());
+        renderLikeDislike();
+        return;
+    }
+
+    const seq = ++ytRatingSeq;
+    ytRatingWriteInFlight = true;
+    renderLikeDislike();
+
+    const guard = await ytIdentity.verifyForMutation(expected);
+    if(seq !== ytRatingSeq){
+        ytRatingWriteInFlight = false;
+        renderLikeDislike();
+        return;
+    }
+    if(!guard.ok){
+        ytRatingWriteInFlight = false;
+        setActionMsg(ytIdentity.mutationFailureMessage(guard.reason));
+        renderLikeDislike();
+        return;
+    }
+
+    // Determine target rating from last confirmed state only.
+    const confirmed = ytRatingConfirmed === true ? ytRatingState : "none";
+    let target = "none";
+    if(next === "like"){
+        target = confirmed === "like" ? "none" : "like";
+    }
+    else if(next === "dislike"){
+        target = confirmed === "dislike" ? "none" : "dislike";
+    }
+    else{
+        ytRatingWriteInFlight = false;
+        renderLikeDislike();
+        return;
+    }
+
+    let result;
+    try{
+        result = await postYoutubeRatingApi(videoId, target, expected.channelId, expected.uid);
+    }
+    catch(e){
+        result = { ok: false, code: "UPSTREAM_ERROR", body: null };
+    }
+
+    if(seq !== ytRatingSeq || currentYoutubeSourceId() !== videoId){
+        // Stale response/video changed; do not apply.
+        ytRatingWriteInFlight = false;
+        renderLikeDislike();
+        return;
+    }
+
+    ytRatingWriteInFlight = false;
+
+    if(result && result.ok && result.body && result.body.ok === true){
+        ytRatingState = normalizeYoutubeRatingValue(result.body.rating || target);
+        ytRatingConfirmed = true;
+        ytRatingStatus = "ready";
+        ytRatingLastFetchAt.set(videoId, Date.now());
+
+        // MyTube Liked Library is independent from actual YouTube rating.
+        // Successful YouTube like may add; dislike/none must NOT delete.
+        const uid = uidOrNull();
+        if(uid && active && ytRatingState === "like"){
+            try{
+                await addToLiked(uid, {
+                    videoId: active.id || ("yt:" + videoId),
+                    type: "youtube",
+                    title: active.title || "",
+                    thumb: active.thumb || "",
+                    channel: active.channel || "",
+                    views: active.views || "",
+                    duration: active.time || "",
+                    likeCount: (typeof active.likeCount === "number") ? active.likeCount : 0
+                });
+            }
+            catch(e){
+                console.warn("Failed to add YouTube-liked video to MyTube library:", e);
+            }
+        }
+
+        renderLikeDislike();
+        return;
+    }
+
+    // Preserve previous confirmed state on failure. Never silently fall back.
+    const code = result && (result.code || (result.body && result.body.code)) ? String(result.code || result.body.code) : "UPSTREAM_ERROR";
+    const mappedStatus = youtubeRatingCodeToStatus(code);
+    if(mappedStatus === "auth_required" || mappedStatus === "connect_required"){
+        // Preserve stored last-confirmed rating; show guidance and drop the
+        // stale identity so the next action cannot use an invalid grant.
+        ytRatingStatus = mappedStatus;
+        if(mappedStatus === "auth_required"){
+            ytIdentity.clear("signed_out");
+        }
+        else{
+            ytIdentity.clear("disconnected");
+        }
+    }
+    else if(code === "YOUTUBE_IDENTITY_CHANGED" || code === "MULTIPLE_CHANNELS" || code === "YOUTUBE_IDENTITY_UNVERIFIED"){
+        // The grant no longer matches what the user saw. Drop the stale view and
+        // re-read the current grant so the next action starts from the truth.
+        ytIdentity.clear("idle");
+        void ytIdentity.load({ force: true });
+    }
+    // Otherwise keep ytRatingConfirmed/ytRatingState unchanged.
+    renderLikeDislike();
+    if(code === "UNAUTHENTICATED"){
+        setActionMsg("Sign in to rate this video on YouTube.");
+    }
+    else if(code === "YOUTUBE_NOT_CONNECTED" || code === "YOUTUBE_SCOPE_REQUIRED" || code === "YOUTUBE_REAUTH_REQUIRED"){
+        setActionMsg("Connect or reconnect your YouTube account in Profile to rate videos.");
+    }
+    else if(code === "YOUTUBE_IDENTITY_CHANGED"){
+        setActionMsg("Your connected YouTube channel changed. Reconnect your YouTube account using the intended channel and try again.");
+    }
+    else if(code === "MULTIPLE_CHANNELS"){
+        setActionMsg("Multiple YouTube channels are available for this Google account. Reconnect using the intended channel before rating videos.");
+    }
+    else if(code === "YOUTUBE_IDENTITY_UNVERIFIED"){
+        setActionMsg("Could not verify your connected YouTube channel. Reload the page and try again.");
+    }
+    else if(code === "QUOTA_EXCEEDED"){
+        setActionMsg("YouTube's daily limit has been reached. Please try again later.");
+    }
+    else if(code === "RATE_LIMITED" || code === "CHAT_RATE_LIMITED"){
+        setActionMsg("You're making requests too quickly. Please wait a moment.");
+    }
+    else{
+        setActionMsg("Could not update your YouTube rating. Please try again.");
+    }
+}
+
+function setVote(next){
+    if(isYoutubeRatingVideo()){
+        void setYoutubeVote(next);
+        return;
+    }
+    setLocalVote(next);
 }
 
 
@@ -2802,7 +4381,536 @@ if(saveBtn){
 }
 
 
-// ================= SUBSCRIBE =================
+// ================= YOUTUBE ACCOUNT SUBSCRIPTION (explicit, confirmed, separate) =================
+// Actual connected YouTube account subscription status/actions for the current
+// channel. Completely separate from MyTube-local subscription (localStorage/Firestore)
+// handled below. Never auto-subscribes/unsubscribes. Mutations require explicit
+// user action + clear confirmation and update UI only after confirmed backend success.
+// On uncertain mutation timeout/error, refreshes status via GET; never blindly retries.
+const ytAccountSubState = {
+    seq: 0,
+    mutationSeq: 0,
+    channelId: "",
+    uid: "",
+    status: "idle", // idle | signed_out | disconnected | loading | ready | unavailable | mutating
+    subscribed: null, // true | false | null (unknown/unavailable)
+    statusInFlight: false,
+    mutationInFlight: false,
+    lastError: ""
+};
+
+let ytAccountSubUi = null;
+
+function isValidYoutubeChannelIdClient(value){
+    const channelId = String(value || "").trim();
+    return channelId.length > 0 && channelId.length <= 128 && /^[A-Za-z0-9_-]+$/.test(channelId);
+}
+
+function currentYtAccountChannelId(){
+    if(!isYt) return "";
+    const v = active || current || null;
+    const cid = v && typeof v.channelId === "string" ? v.channelId.trim() : "";
+    return isValidYoutubeChannelIdClient(cid) ? cid : "";
+}
+
+function ensureYtAccountSubUi(){
+    if(ytAccountSubUi && ytAccountSubUi.root && ytAccountSubUi.root.isConnected){
+        return ytAccountSubUi;
+    }
+    if(!subscribeBtn || !subscribeBtn.parentElement){
+        return null;
+    }
+    let root = document.getElementById("ytAccountSubRoot");
+    if(!root){
+        root = document.createElement("div");
+        root.id = "ytAccountSubRoot";
+        root.className = "yt-account-sub-watch";
+        root.style.marginTop = "8px";
+        root.style.display = "none";
+        root.style.maxWidth = "360px";
+
+        const label = document.createElement("div");
+        label.className = "yt-account-sub-watch-label";
+        label.style.fontSize = "12px";
+        label.style.color = "#aaa";
+        label.style.marginBottom = "4px";
+        label.textContent = "YouTube account";
+
+        const row = document.createElement("div");
+        row.style.display = "flex";
+        row.style.alignItems = "center";
+        row.style.gap = "8px";
+        row.style.flexWrap = "wrap";
+
+        const status = document.createElement("span");
+        status.id = "ytAccountSubStatus";
+        status.style.fontSize = "13px";
+        status.style.color = "#ddd";
+        status.setAttribute("aria-live", "polite");
+
+        const btn = document.createElement("button");
+        btn.id = "ytAccountSubBtn";
+        btn.type = "button";
+        btn.className = "secondary-btn";
+        btn.style.fontSize = "13px";
+        btn.style.padding = "6px 10px";
+
+        row.appendChild(status);
+        row.appendChild(btn);
+        root.appendChild(label);
+        root.appendChild(row);
+        subscribeBtn.parentElement.insertBefore(root, subscribeBtn.nextSibling);
+    }
+    ytAccountSubUi = {
+        root,
+        label: root.querySelector(".yt-account-sub-watch-label"),
+        status: root.querySelector("#ytAccountSubStatus"),
+        btn: root.querySelector("#ytAccountSubBtn")
+    };
+    return ytAccountSubUi;
+}
+
+function ytAccountSubAuthUid(){
+    const user = (typeof currentUser === "function" ? currentUser() : null) || (auth && auth.currentUser) || null;
+    return user && user.uid ? String(user.uid) : "";
+}
+
+function renderYtAccountSub(){
+    const ui = ensureYtAccountSubUi();
+    if(!ui) return;
+    const channelId = currentYtAccountChannelId();
+    const show = Boolean(isYt && channelId);
+    ui.root.style.display = show ? "" : "none";
+    if(!show) return;
+
+    if(ui.label){
+        const acting = ytIdentity.label();
+        ui.label.textContent = acting
+            ? ("YouTube account: acting as " + acting)
+            : "YouTube account";
+    }
+
+    const s = ytAccountSubState;
+    const busy = s.statusInFlight || s.mutationInFlight || s.status === "loading" || s.status === "mutating";
+    const identityStatus = ytIdentity.state.status;
+    const identityBlocked = ytIdentity.isBlocked()
+        || identityStatus === "loading"
+        || identityStatus === "error"
+        || identityStatus === "idle";
+    let statusText = "Status unavailable.";
+    let btnText = "Check status";
+    let btnDisabled = busy || identityBlocked;
+
+    if(identityBlocked){
+        statusText = ytIdentity.identityMessage();
+        btnText = "Check status";
+        btnDisabled = busy;
+    } else if(!ytAccountSubAuthUid()){
+        statusText = "Sign in to check your YouTube account subscription.";
+        btnText = "Sign in";
+        btnDisabled = false;
+    } else if(s.status === "loading"){
+        statusText = "Checking YouTube account status...";
+        btnText = "Checking...";
+    } else if(s.status === "mutating"){
+        statusText = "Updating YouTube account subscription...";
+        btnText = "Updating...";
+    } else if(s.status === "disconnected"){
+        statusText = "Connect your YouTube account in Profile to manage subscriptions.";
+        btnText = "Open Profile";
+        btnDisabled = false;
+    } else if(s.status === "ready"){
+        if(s.subscribed === true){
+            statusText = "Subscribed on your YouTube account.";
+            btnText = "Unsubscribe on YouTube";
+            btnDisabled = busy;
+        } else if(s.subscribed === false){
+            statusText = "Not subscribed on your YouTube account.";
+            btnText = "Subscribe on YouTube";
+            btnDisabled = busy;
+        } else {
+            statusText = "YouTube account status unavailable.";
+            btnText = "Check status";
+            btnDisabled = busy;
+        }
+    } else if(s.status === "unavailable"){
+        statusText = s.lastError || "YouTube account status unavailable.";
+        btnText = "Refresh status";
+        btnDisabled = busy;
+    } else {
+        statusText = "Check your YouTube account subscription status.";
+        btnText = "Check status";
+        btnDisabled = busy;
+    }
+
+    if(ui.status) ui.status.textContent = statusText;
+    if(ui.btn){
+        ui.btn.textContent = btnText;
+        ui.btn.disabled = Boolean(btnDisabled);
+    }
+}
+
+function ytAccountSubSetUnavailable(msg, status){
+    ytAccountSubState.status = status || "unavailable";
+    ytAccountSubState.lastError = msg || "";
+    renderYtAccountSub();
+}
+
+async function fetchYtAccountSubscriptionStatus(options = {}){
+    const opts = options || {};
+    const channelId = currentYtAccountChannelId();
+    if(!isYt || !channelId) return;
+
+    const uid = ytAccountSubAuthUid();
+
+    if(!uid){
+        // Intentional status/state transition: invalidate any stale in-flight status
+        // response and clear status in-flight only. Never clear mutationInFlight here:
+        // an already-sent subscribe/unsubscribe POST may still be unresolved server-side,
+        // and releasing that lock would allow a second mutation.
+        ytAccountSubState.seq += 1;
+        ytAccountSubState.channelId = channelId;
+        ytAccountSubState.uid = "";
+        ytAccountSubState.statusInFlight = false;
+        if(ytAccountSubState.mutationInFlight){
+            ytAccountSubState.status = "mutating";
+            ytAccountSubState.lastError = "";
+            renderYtAccountSub();
+            return;
+        }
+        ytAccountSubState.status = "signed_out";
+        ytAccountSubState.subscribed = null;
+        ytAccountSubState.lastError = "";
+        renderYtAccountSub();
+        return;
+    }
+
+    // Preserve running request ownership: do NOT increment seq before guards.
+    // A duplicate/overlapping call must not invalidate an active request.
+    if(ytAccountSubState.statusInFlight || ytAccountSubState.mutationInFlight){
+        return;
+    }
+    if(
+        !opts.force
+        && ytAccountSubState.status === "ready"
+        && ytAccountSubState.channelId === channelId
+        && ytAccountSubState.uid === uid
+    ){
+        return;
+    }
+
+    const seq = ++ytAccountSubState.seq;
+    ytAccountSubState.channelId = channelId;
+    ytAccountSubState.uid = uid;
+    ytAccountSubState.statusInFlight = true;
+    ytAccountSubState.status = "loading";
+    ytAccountSubState.lastError = "";
+    renderYtAccountSub();
+
+    let result;
+    try{
+        const token = await getFirebaseIdTokenForYoutube();
+        if(!token){
+            result = { ok: false, status: 401, body: { code: "UNAUTHENTICATED" } };
+        } else {
+            const res = await fetch("/api/youtube/subscription-status?channelId=" + encodeURIComponent(channelId), {
+                method: "GET",
+                headers: { Authorization: "Bearer " + token },
+                cache: "no-store"
+            });
+            let body = null;
+            try{ body = await res.json(); } catch(e){ body = null; }
+            result = { ok: res.ok, status: res.status, body };
+        }
+    } catch(e){
+        result = { ok: false, status: 0, body: { code: "UPSTREAM_ERROR" } };
+    }
+
+    // Only the owning request may clear statusInFlight/apply state.
+    // Superseded requests (channel/auth/explicit takeover) must not touch shared state.
+    if(
+        seq !== ytAccountSubState.seq
+        || ytAccountSubState.statusInFlight !== true
+        || currentYtAccountChannelId() !== channelId
+        || ytAccountSubAuthUid() !== uid
+    ){
+        return;
+    }
+
+    ytAccountSubState.statusInFlight = false;
+    const body = result && result.body ? result.body : {};
+    const code = String(body.code || "");
+
+    if(result.ok && body.ok === true && body.available === true && (body.subscribed === true || body.subscribed === false)){
+        ytAccountSubState.status = "ready";
+        ytAccountSubState.subscribed = body.subscribed === true;
+        ytAccountSubState.lastError = "";
+        renderYtAccountSub();
+        return;
+    }
+
+    if(result.status === 401 || code === "UNAUTHENTICATED"){
+        ytAccountSubState.status = "signed_out";
+        ytAccountSubState.subscribed = null;
+        ytAccountSubState.lastError = "Sign in required.";
+        ytIdentity.clear("signed_out");
+    } else if(code === "YOUTUBE_NOT_CONNECTED" || code === "YOUTUBE_SCOPE_REQUIRED" || code === "YOUTUBE_REAUTH_REQUIRED"){
+        ytAccountSubState.status = "disconnected";
+        ytAccountSubState.subscribed = null;
+        ytAccountSubState.lastError = "";
+        ytIdentity.clear("disconnected");
+    } else if(code === "RATE_LIMITED" || code === "CHAT_RATE_LIMITED"){
+        ytAccountSubSetUnavailable("You're making requests too quickly. Please wait a moment and refresh status.");
+        return;
+    } else if(code === "QUOTA_EXCEEDED"){
+        ytAccountSubSetUnavailable("YouTube's daily limit has been reached. Please try again later.");
+        return;
+    } else {
+        ytAccountSubSetUnavailable((body && body.error) ? String(body.error) : "Could not check YouTube account subscription status.");
+        return;
+    }
+    renderYtAccountSub();
+}
+
+async function mutateYtAccountSubscription(action){
+    const channelId = currentYtAccountChannelId();
+    if(!isYt || !channelId) return;
+    if(action !== "subscribe" && action !== "unsubscribe") return;
+    if(ytAccountSubState.mutationInFlight || ytAccountSubState.statusInFlight) return;
+
+    const uid = ytAccountSubAuthUid();
+    if(!uid){
+        ytAccountSubState.status = "signed_out";
+        renderYtAccountSub();
+        setActionMsg("Sign in to manage your YouTube account subscription.");
+        return;
+    }
+    if(ytAccountSubState.status === "disconnected"){
+        setActionMsg("Connect your YouTube account in Profile to manage subscriptions.");
+        renderYtAccountSub();
+        return;
+    }
+
+    // Capture the identity the user is currently shown. It must survive the
+    // immediate pre-write refresh, and the backend verifies it again.
+    const expected = ytIdentity.mutationGuard();
+    if(!expected.uid || !expected.channelId){
+        setActionMsg(ytIdentity.identityMessage());
+        renderYtAccountSub();
+        return;
+    }
+
+    const channelName = (active && active.channel) || (current && current.channel) || "this channel";
+    const confirmText = action === "subscribe"
+        ? ("Subscribe to \"" + channelName + "\" using your connected YouTube account?")
+        : ("Unsubscribe from \"" + channelName + "\" using your connected YouTube account?");
+    if(!window.confirm(confirmText)){
+        return;
+    }
+
+    // Separate mutation ownership: status/auth/channel seq changes must not release
+    // a pending mutation lock or allow a second mutation while unresolved.
+    const mutationSeqToken = ++ytAccountSubState.mutationSeq;
+    ytAccountSubState.channelId = channelId;
+    ytAccountSubState.uid = uid;
+    ytAccountSubState.mutationInFlight = true;
+    ytAccountSubState.status = "mutating";
+    ytAccountSubState.lastError = "";
+    renderYtAccountSub();
+
+    // Refresh and verify immediately before the write. If the grant, user or
+    // channel changed, block instead of silently acting on another account.
+    const guard = await ytIdentity.verifyForMutation(expected);
+    if(mutationSeqToken !== ytAccountSubState.mutationSeq){
+        return;
+    }
+    if(!guard.ok){
+        ytAccountSubState.mutationInFlight = false;
+        ytAccountSubState.status = "unavailable";
+        ytAccountSubState.lastError = ytIdentity.mutationFailureMessage(guard.reason);
+        renderYtAccountSub();
+        setActionMsg(ytAccountSubState.lastError);
+        return;
+    }
+
+    let result;
+    try{
+        const token = await getFirebaseIdTokenForYoutube();
+        if(!token){
+            result = { ok: false, status: 401, body: { code: "UNAUTHENTICATED" }, uncertain: false };
+        } else {
+            const endpoint = action === "subscribe" ? "/api/youtube/subscribe" : "/api/youtube/unsubscribe";
+            // Do not abort or blindly retry an already-sent mutation request.
+            const res = await fetch(endpoint, {
+                method: "POST",
+                headers: {
+                    Authorization: "Bearer " + token,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({ channelId, expectedChannelId: expected.channelId, expectedUid: expected.uid }),
+                cache: "no-store"
+            });
+            let body = null;
+            try{ body = await res.json(); } catch(e){ body = null; }
+            const code = body && body.code ? String(body.code) : "";
+            const uncertain = (code === "UPSTREAM_TIMEOUT" || code === "UPSTREAM_ERROR" || res.status >= 500 || res.status === 504);
+            result = { ok: res.ok, status: res.status, body, uncertain };
+        }
+    } catch(e){
+        result = { ok: false, status: 0, body: { code: "UPSTREAM_ERROR" }, uncertain: true };
+    }
+
+    // Original owner must always release its own lock when settled.
+    if(mutationSeqToken !== ytAccountSubState.mutationSeq){
+        return;
+    }
+
+    const uiStale = (currentYtAccountChannelId() !== channelId || ytAccountSubAuthUid() !== uid);
+    // Original owner releases its lock exactly once when settled.
+    ytAccountSubState.mutationInFlight = false;
+    if(uiStale){
+        // Stale auth/channel context: never apply subscribed/error/success from the old
+        // mutation. Derive safe UI from the CURRENT context only.
+        const currentChannelId = currentYtAccountChannelId();
+        const currentUid = ytAccountSubAuthUid();
+        ytAccountSubState.channelId = currentChannelId;
+        ytAccountSubState.uid = currentUid;
+        ytAccountSubState.subscribed = null;
+        ytAccountSubState.lastError = "";
+        if(!currentUid){
+            ytAccountSubState.status = "signed_out";
+            renderYtAccountSub();
+            return;
+        }
+        if(!isYt || !currentChannelId){
+            ytAccountSubState.status = "idle";
+            renderYtAccountSub();
+            return;
+        }
+        // Signed in with valid YouTube channel: unknown state, then fresh read-only GET.
+        // mutationInFlight is already released, so status fetch may start.
+        ytAccountSubState.status = "idle";
+        renderYtAccountSub();
+        void fetchYtAccountSubscriptionStatus({ force: true });
+        return;
+    }
+
+    const body = result && result.body ? result.body : {};
+    const code = String(body.code || "");
+
+    if(result.ok && body.ok === true && body.available === true && (body.subscribed === true || body.subscribed === false)){
+        ytAccountSubState.status = "ready";
+        ytAccountSubState.subscribed = body.subscribed === true;
+        ytAccountSubState.lastError = "";
+        renderYtAccountSub();
+        setActionMsg(body.alreadySubscribed ? "Already subscribed on your YouTube account." : (body.alreadyUnsubscribed ? "Already unsubscribed on your YouTube account." : (body.subscribed ? "Subscribed on your YouTube account." : "Unsubscribed on your YouTube account.")));
+        return;
+    }
+
+    // Uncertain timeout/error: refresh status via GET for current context.
+    // Never blindly repeat mutation.
+    if(result.uncertain || code === "UPSTREAM_TIMEOUT" || code === "UPSTREAM_ERROR"){
+        setActionMsg("Could not confirm the YouTube account change. Refreshing status...");
+        void fetchYtAccountSubscriptionStatus({ force: true });
+        return;
+    }
+
+    if(result.status === 401 || code === "UNAUTHENTICATED"){
+        ytAccountSubState.status = "signed_out";
+        ytAccountSubState.subscribed = null;
+        ytIdentity.clear("signed_out");
+    } else if(code === "YOUTUBE_NOT_CONNECTED" || code === "YOUTUBE_SCOPE_REQUIRED" || code === "YOUTUBE_REAUTH_REQUIRED"){
+        ytAccountSubState.status = "disconnected";
+        ytAccountSubState.subscribed = null;
+        ytIdentity.clear("disconnected");
+    } else if(code === "YOUTUBE_IDENTITY_CHANGED" || code === "MULTIPLE_CHANNELS" || code === "YOUTUBE_IDENTITY_UNVERIFIED"){
+        ytAccountSubState.status = "unavailable";
+        ytAccountSubState.lastError = (body && body.error) ? String(body.error) : "Could not verify your connected YouTube channel.";
+        ytIdentity.clear("idle");
+        void ytIdentity.load({ force: true });
+    } else if(code === "RATE_LIMITED" || code === "CHAT_RATE_LIMITED"){
+        ytAccountSubState.status = "unavailable";
+        ytAccountSubState.lastError = "You're making requests too quickly. Please wait a moment.";
+    } else if(code === "QUOTA_EXCEEDED"){
+        ytAccountSubState.status = "unavailable";
+        ytAccountSubState.lastError = "YouTube's daily limit has been reached. Please try again later.";
+    } else {
+        ytAccountSubState.status = "unavailable";
+        ytAccountSubState.lastError = (body && body.error) ? String(body.error) : "Could not update YouTube account subscription.";
+    }
+    renderYtAccountSub();
+    if(ytAccountSubState.lastError) setActionMsg(ytAccountSubState.lastError);
+}
+
+function setupYtAccountSubUi(){
+    const ui = ensureYtAccountSubUi();
+    if(!ui || !ui.btn || ui.btn.dataset.ytAccountSubWired === "1") return;
+    ui.btn.dataset.ytAccountSubWired = "1";
+    ui.btn.addEventListener("click", () => {
+        const uid = ytAccountSubAuthUid();
+        if(!uid){
+            // Use existing sign-in navigation flow (matches auth header behavior).
+            window.location.href = "login.html";
+            return;
+        }
+        if(ytAccountSubState.status === "disconnected"){
+            window.location.href = "profile.html";
+            return;
+        }
+        if(ytAccountSubState.statusInFlight || ytAccountSubState.mutationInFlight) return;
+
+        // Read-only status checks stay available even when identity is ambiguous
+        // or temporarily unavailable; only the mutation path is gated.
+        const guard = ytIdentity.mutationGuard();
+        if(!guard.uid || !guard.channelId){
+            setActionMsg(ytIdentity.identityMessage());
+            void fetchYtAccountSubscriptionStatus({ force: true });
+            return;
+        }
+        if(ytAccountSubState.status === "ready" && ytAccountSubState.subscribed === true){
+            void mutateYtAccountSubscription("unsubscribe");
+            return;
+        }
+        if(ytAccountSubState.status === "ready" && ytAccountSubState.subscribed === false){
+            void mutateYtAccountSubscription("subscribe");
+            return;
+        }
+        void fetchYtAccountSubscriptionStatus({ force: true });
+    });
+}
+
+function syncYtAccountSubscriptionForCurrentVideo(force = false){
+    setupYtAccountSubUi();
+    renderYtAccountSub();
+    if(!isYt || !currentYtAccountChannelId()){
+        return;
+    }
+    void fetchYtAccountSubscriptionStatus({ force: Boolean(force) });
+}
+
+function resetYtAccountSubscriptionState(){
+    // Invalidate stale status responses only. Never release a pending mutation lock:
+    // auth/channel changes cannot allow a second mutation while the first unresolved
+    // request may still complete server-side.
+    ytAccountSubState.seq += 1;
+    ytAccountSubState.channelId = currentYtAccountChannelId();
+    ytAccountSubState.uid = ytAccountSubAuthUid();
+    ytAccountSubState.statusInFlight = false;
+    if(ytAccountSubState.mutationInFlight){
+        ytAccountSubState.status = "mutating";
+        ytAccountSubState.lastError = "";
+        renderYtAccountSub();
+        return;
+    }
+    ytAccountSubState.subscribed = null;
+    ytAccountSubState.lastError = "";
+    if(!ytAccountSubAuthUid()) ytAccountSubState.status = "signed_out";
+    else if(!isYt || !currentYtAccountChannelId()) ytAccountSubState.status = "idle";
+    else ytAccountSubState.status = "idle";
+    renderYtAccountSub();
+}
+
+// ================= SUBSCRIBE (MyTube-local; existing behavior preserved) =================
 
 // Per-channel subscription state: each channel has its own key so that
 // subscribing to one channel does not affect another.
@@ -3152,10 +5260,13 @@ window.addEventListener("DOMContentLoaded", () => {
     setupVoteButtons();
     renderSave();
     renderSubscribe();
+    setupYtAccountSubUi();
+    renderYtAccountSub();
     setupPlaylistUI();
     setupCommentForm();
     renderMute();
     renderPrevNext();
+    setupAutoplayToggle();
     setupKeyboardShortcuts();
     renderTimeDisplay();
     loadVideo();
@@ -3164,10 +5275,22 @@ window.addEventListener("DOMContentLoaded", () => {
 
 
 window.addEventListener("mytube-auth-change", () => {
+    // Re-read the connected account identity on every auth/account transition.
+    // Sign-out clears synchronously so no stale account label can remain; a
+    // signed-in transition re-reads the current grant.
+    const authUser = typeof currentUser === "function" ? currentUser() : null;
+    if(!authUser){
+        ytIdentity.clear("signed_out");
+    }
+    else{
+        void loadYoutubeAccountIdentity({ force: true });
+    }
     // A YouTube video has `active` populated but `current` is null, so we must
     // NOT key off `current` here — otherwise the comment form would never
     // refresh its logged-in state while watching a YouTube video.
     if(!active && !current){
+        resetYtAccountSubscriptionState();
+        renderYtAccountSub();
         return;
     }
     setupCommentForm();
@@ -3176,6 +5299,32 @@ window.addEventListener("mytube-auth-change", () => {
     recordHistory();
     // Sync save/like/subscribe state from Firestore.
     syncStateFromFirestore();
+
+    // Refresh actual YouTube rating on auth/connect state changes.
+    if(isYoutubeRatingVideo()){
+        void loadYoutubeRating({ force: true });
+    }
+    // Refresh read-only YouTube account subscription status (no auto mutations).
+    if(isYt && currentYtAccountChannelId()){
+        void fetchYtAccountSubscriptionStatus({ force: true });
+    } else {
+        resetYtAccountSubscriptionState();
+    }
+});
+
+
+// Grant changes (connect/disconnect/reconnect) invalidate the identity
+// immediately. The signal is also delivered across tabs by the shared helper;
+// no tokens or channel identity are stored in the notification.
+onYoutubeGrantChange(() => {
+    ytIdentity.clear("idle");
+    void loadYoutubeAccountIdentity({ force: true });
+    if(isYoutubeRatingVideo()){
+        void loadYoutubeRating({ force: true });
+    }
+    if(isYt && currentYtAccountChannelId()){
+        void fetchYtAccountSubscriptionStatus({ force: true });
+    }
 });
 
 
@@ -3282,3 +5431,8 @@ async function syncStateFromFirestore(){
 
 
 console.log("MyTube Watch JS Loaded ✅");
+
+
+// Imported last so the protected Live Chat block above keeps its exact bytes
+// and line positions. ES module imports are hoisted before the module body.
+import { createYoutubeAccountIdentity, onYoutubeGrantChange } from "./youtube-account.js";

@@ -453,11 +453,13 @@ maxlength="2000"
 
 
 
-<!-- YouTube Live Chat (read-only).
+<!-- YouTube Live Chat (read + opt-in sending).
      Lives inside the right-hand column above Up Next. Hidden by default: watch.js
      reveals it only when the backend reports the video is currently live. The
-     messages shown are YouTube's own live chat for that broadcast - MyTube does
-     not store or send any of it. -->
+     messages shown are YouTube's own live chat for that broadcast; MyTube does
+     not store them. The composer below is hidden unless BOTH the signed-in
+     account has a usable YouTube connection AND the server reports sending
+     enabled, and every send is checked again server-side. -->
 <section id="liveChatPanel" class="live-chat" aria-label="YouTube Live Chat" hidden>
 
 <header class="live-chat-head">
@@ -478,6 +480,23 @@ YouTube Live Chat
 
 <p id="liveChatStatus" class="live-chat-status"></p>
 
+<!-- Sending to YouTube's chat as your own connected YouTube account. Hidden by
+     default; watch.js unhides it only when the live-chat payload reports sending
+     enabled and /api/oauth/status reports a usable YouTube scope. On confirmed
+     chat restriction (e.g. CHAT_FORBIDDEN), the composer form is hidden while
+     the restriction explanation/actions remain visible. -->
+<form id="liveChatForm" class="live-chat-compose" hidden>
+<div class="live-chat-compose-row">
+<input id="liveChatInput" class="live-chat-input" type="text" autocomplete="off" placeholder="Send a message to this live chat" aria-label="Message" disabled>
+<button id="liveChatSend" class="live-chat-send" type="submit" disabled>Send</button>
+</div>
+<p id="liveChatNote" class="live-chat-note" role="status" hidden></p>
+</form>
+<div id="liveChatRestriction" class="live-chat-restriction" hidden>
+  <p id="liveChatRestrictionText" class="live-chat-restriction-text"></p>
+  <div id="liveChatRestrictionActions" class="live-chat-restriction-actions"></div>
+</div>
+
 <footer class="live-chat-foot">
 <a id="liveChatAttrib" href="https://www.youtube.com/live_chat" target="_blank" rel="noopener noreferrer" class="live-chat-attrib">
 Chat provided by YouTube
@@ -490,9 +509,18 @@ Chat provided by YouTube
 <aside class="suggested" aria-label="Up Next">
 
 
+<div class="upnext-header">
 <h3>
 Up Next
 </h3>
+<div class="autoplay-control">
+  <span class="autoplay-label">Autoplay</span>
+  <button id="autoplayToggle" type="button" class="autoplay-toggle" role="switch" aria-pressed="true" aria-label="Autoplay">
+    <span class="autoplay-track"></span>
+    <span class="autoplay-knob"></span>
+  </button>
+</div>
+</div>
 
 
 <div id="relatedList">

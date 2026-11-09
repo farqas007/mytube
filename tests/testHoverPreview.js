@@ -710,10 +710,23 @@ test("F1 the homepage card wires the preview onto its thumbnail", () => {
     /attachHoverPreviewHere\(thumb,\s*v\.id\)/,
     "index.html buildCard must attach the preview"
   );
+  // The homepage loads the shared helper lazily alongside the YouTube client so
+  // first paint is not blocked. The card records the id and is completed when
+  // the module announces readiness; no static import is required.
   assert.match(
     INDEX_HTML,
-    /import \{ attachHoverPreview \} from "\.\/shared\/hoverPreview\.js"/,
-    "index.html must import the shared helper"
+    /await import\("\.\/shared\/hoverPreview\.js"\)/,
+    "index.html must load the shared helper"
+  );
+  assert.match(
+    INDEX_HTML,
+    /window\.MyTubeHoverPreview\s*=\s*\{\s*attachHoverPreview:\s*hp\.attachHoverPreview\s*\}/,
+    "the helper must be exposed for cards rendered before it arrived"
+  );
+  assert.match(
+    INDEX_HTML,
+    /window\.dispatchEvent\(new Event\("mytube-hover-ready"\)\)/,
+    "readiness must be announced so early cards are wired"
   );
 });
 

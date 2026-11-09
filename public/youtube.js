@@ -162,6 +162,7 @@ async function apiRequest(route, params, signal, options = {}){
       result.chatStatus = (payload && payload.status) ? String(payload.status) : "error";
       result.isLive = Boolean(payload && payload.isLive);
       result.liveChatId = (payload && payload.liveChatId) ? String(payload.liveChatId) : "";
+      result.chatSendEnabled = Boolean(payload && payload.chatSendEnabled === true);
       result.concurrentViewers = Number(payload && payload.concurrentViewers) || 0;
       result.pollingIntervalMillis = Number(payload && payload.pollingIntervalMillis) || 5000;
       result.offlineAt = (payload && payload.offlineAt) ? String(payload.offlineAt) : "";
@@ -344,6 +345,7 @@ async function liveChat(id, pageToken, initial){
     chatStatus: res.chatStatus || (res.ok ? "error" : "error"),
     messages: Array.isArray(res.messages) ? res.messages : [],
     isLive: Boolean(res.isLive),
+    chatSendEnabled: res.chatSendEnabled === true,
     liveChatId: res.liveChatId || "",
     concurrentViewers: Number(res.concurrentViewers) || 0,
     pollingIntervalMillis: Number(res.pollingIntervalMillis) || 5000,
@@ -364,6 +366,38 @@ async function channelVideos(channelId, max, pageToken){
   return { videos: videos || [], nextPageToken: nextPageToken || "", error: error || "", ok: ok };
 }
 
+// Fetch the connected YouTube account's own channel identity (read-only).
+// Requires a Firebase ID token; the browser never sees or sends a Google access
+// token. The backend resolves the channel from that user's existing OAuth grant.
+async function youtubeAccount(token){
+  if(!token){
+    return { ok: false, status: 401, code: "UNAUTHENTICATED", body: null };
+  }
+  const base = await resolveBackendBase();
+  if(!base){
+    return { ok: false, status: 0, code: "UPSTREAM_ERROR", body: null };
+  }
+  try{
+    const res = await fetch(base + "/youtube/account", {
+      method: "GET",
+      headers: { Authorization: "Bearer " + token },
+      cache: "no-store",
+      signal: AbortSignal.timeout(15000)
+    });
+    let body = null;
+    try{ body = await res.json(); } catch(e){ body = null; }
+    return {
+      ok: res.ok,
+      status: res.status,
+      code: body && body.code ? String(body.code) : "",
+      body
+    };
+  }
+  catch(e){
+    return { ok: false, status: 0, code: "UPSTREAM_ERROR", body: null };
+  }
+}
+
 // Whether the dynamic source is considered available (backend reachable).
 async function isAvailable(){
   const base = await resolveBackendBase();
@@ -379,6 +413,7 @@ export {
   trending,
   channelVideos,
   liveChat,
+  youtubeAccount,
   isAvailable,
   newFeedSeed,
   FEED_TOPICS,

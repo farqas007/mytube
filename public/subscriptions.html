@@ -92,15 +92,64 @@ Logout
 <!-- CONTENT -->
 <div id="subsContent" class="profile-content" style="display:none;">
 
+<!-- YouTube Account Subscriptions (actual connected YouTube account; read-only) -->
+<section id="youtubeAccountSubsSection" class="yt-account-subs" aria-labelledby="ytAccountSubsHeading">
+<div class="yt-account-subs-header">
+<h2 id="ytAccountSubsHeading">YouTube Account Subscriptions</h2>
+<p class="yt-account-subs-subtitle">Subscriptions from your connected YouTube account. This list is separate from MyTube local subscriptions.</p>
+</div>
+
+<div id="ytAccountSubsControls" class="yt-account-subs-controls" style="display:none;">
+<p id="ytAccountSubsCount" class="yt-account-subs-count" aria-live="polite"></p>
+</div>
+
+<p id="ytAccountSubsStatus" class="yt-account-subs-status" role="status" aria-live="polite"></p>
+
+<div id="ytAccountSubsLoading" class="yt-account-subs-inline-state" style="display:none;">
+<div class="spinner" aria-hidden="true"></div>
+<p>Loading YouTube account subscriptions...</p>
+</div>
+
+<div id="ytAccountSubsState" class="yt-account-subs-inline-state" style="display:none;">
+<p id="ytAccountSubsStateText"></p>
+<button id="ytAccountSubsActionBtn" type="button" class="back-home" style="display:none;"></button>
+</div>
+
+<div id="ytAccountSubsList" class="yt-account-subs-list" aria-label="YouTube account subscriptions"></div>
+
+<button id="ytAccountSubsLoadMore" type="button" class="load-more" style="display:none;">Load more</button>
+</section>
+
+<!-- Local MyTube Subscriptions (existing behavior preserved) -->
+<section id="localSubsSection" class="local-subs-section" aria-labelledby="localSubsHeading">
 <div class="subs-toolbar">
-<h2>Your Subscriptions</h2>
+<h2 id="localSubsHeading">Your Subscriptions</h2>
 <button id="subsRefreshBtn" type="button" class="subs-refresh">
 Refresh
 </button>
 </div>
 
+<!-- Local loading/empty/error states (scoped to local subscriptions) -->
+<div id="localSubsLoading" class="state-panel local-subs-state" style="display:none;">
+<div class="spinner"></div>
+<p>Loading subscriptions...</p>
+</div>
+
+<div id="localSubsEmpty" class="state-panel local-subs-state" style="display:none;">
+<h2>No Local Subscriptions Yet</h2>
+<p>Subscribe to channels on the watch page to see their latest videos here. This is separate from your YouTube account subscriptions.</p>
+<button type="button" class="back-home" onclick="goHome()">Browse Videos</button>
+</div>
+
+<div id="localSubsError" class="state-panel local-subs-state" style="display:none;">
+<h2>Something went wrong</h2>
+<p id="localSubsErrorText">Could not load subscriptions.</p>
+<button type="button" class="back-home" onclick="goHome()">Back to Home</button>
+</div>
+
 <!-- View toggle: Feed is the unified newest-first list; Channels preserves the
      per-channel shelves. Both read the same cached channel data. -->
+<div id="localSubsViews">
 <div class="lib-tabs" role="tablist" aria-label="Subscriptions view">
 <button id="subsViewFeed" type="button" class="lib-tab active" role="tab" aria-selected="true">Feed</button>
 <button id="subsViewChannels" type="button" class="lib-tab" role="tab" aria-selected="false">Channels</button>
@@ -117,6 +166,9 @@ Refresh
 <div id="shelvesView" hidden>
 <div id="channelSections" class="channel-sections"></div>
 </div>
+</div>
+
+</section>
 
 </div>
 

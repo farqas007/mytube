@@ -21,6 +21,8 @@ const historyListEl = document.getElementById("historyList");
 const savedListEl = document.getElementById("savedList");
 const likedListEl = document.getElementById("likedList");
 const clearHistoryBtn = document.getElementById("clearHistoryBtn");
+const historySearchInput = document.getElementById("historySearch");
+const historySearchClearBtn = document.getElementById("historySearchClear");
 const tabs = document.querySelectorAll(".lib-tab");
 const sections = {
     history: document.getElementById("libHistory"),
@@ -42,6 +44,8 @@ let currentTab = "history";
 let currentUid = null;
 let playlistDetailId = null;
 let playlistDetailName = "";
+let fullHistoryItems = [];
+let historySearchQuery = "";
 
 
 // ================= HELPERS =================
@@ -125,6 +129,30 @@ function renderEmptyMessage(container, msg){
 
 // ================= TABS =================
 
+if(historySearchInput){
+    historySearchInput.addEventListener("input", () => {
+        historySearchQuery = historySearchInput.value || "";
+        if(historySearchClearBtn){
+            historySearchClearBtn.style.display = historySearchQuery ? "" : "none";
+        }
+        applyHistorySearch();
+    });
+}
+
+if(historySearchClearBtn){
+    historySearchClearBtn.addEventListener("click", () => {
+        if(historySearchInput){
+            historySearchInput.value = "";
+        }
+        historySearchQuery = "";
+        historySearchClearBtn.style.display = "none";
+        applyHistorySearch();
+        if(historySearchInput){
+            historySearchInput.focus();
+        }
+    });
+}
+
 function switchTab(tab){
     currentTab = tab;
     tabs.forEach(t => {
@@ -142,7 +170,7 @@ function switchTab(tab){
 
 // ================= RENDER: HISTORY =================
 
-async function renderHistory(){
+function applyHistorySearch(){
     if(!historyListEl){
         return;
     }
@@ -153,31 +181,46 @@ async function renderHistory(){
         if(clearHistoryBtn){
             clearHistoryBtn.style.display = "none";
         }
+        if(historySearchClearBtn){
+            historySearchClearBtn.style.display = "none";
+        }
         return;
     }
 
-    let items = [];
-    try{
-        items = await getHistory(currentUid, 50);
-    }
-    catch(e){
-        console.warn("Failed to load history:", e);
-    }
-
-    const before = items.length;
+    let items = fullHistoryItems.slice();
     items = items.filter(isYouTubeVideo);
 
+    if(historySearchQuery){
+        const q = historySearchQuery.toLowerCase();
+        items = items.filter(item => {
+            const title = String(item.title || "").toLowerCase();
+            const channel = String(item.channel || "").toLowerCase();
+            return title.includes(q) || channel.includes(q);
+        });
+    }
+
     if(clearHistoryBtn){
-        clearHistoryBtn.style.display = items.length > 0 ? "" : "none";
+        clearHistoryBtn.style.display = fullHistoryItems.filter(isYouTubeVideo).length > 0 ? "" : "none";
+    }
+
+    if(historySearchClearBtn){
+        historySearchClearBtn.style.display = historySearchQuery ? "" : "none";
     }
 
     if(items.length === 0){
-        renderEmptyMessage(
-            historyListEl,
-            before === 0
-                ? "No watch history yet. Start watching videos!"
-                : "Older local videos are no longer available. Only YouTube videos are kept here."
-        );
+        if(historySearchQuery){
+            renderEmptyMessage(historyListEl, "No matching videos in your history.");
+        }
+        else{
+            const before = fullHistoryItems.length;
+            const ytBefore = fullHistoryItems.filter(isYouTubeVideo).length;
+            renderEmptyMessage(
+                historyListEl,
+                before === 0 || ytBefore === 0
+                    ? (before === 0 ? "No watch history yet. Start watching videos!" : "Older local videos are no longer available. Only YouTube videos are kept here.")
+                    : "No watch history yet. Start watching videos!"
+            );
+        }
         return;
     }
 
@@ -194,9 +237,40 @@ async function renderHistory(){
             emptyMsg: "No watch history yet.",
             onRemove: async (video) => {
                 await removeFromHistory(currentUid, video.id);
+                fullHistoryItems = fullHistoryItems.filter(h => (h.videoId || h.id) !== video.id);
+                applyHistorySearch();
             }
         }));
     });
+}
+
+async function renderHistory(){
+    if(!historyListEl){
+        return;
+    }
+    historyListEl.replaceChildren();
+
+    if(!currentUid){
+        fullHistoryItems = [];
+        if(clearHistoryBtn){
+            clearHistoryBtn.style.display = "none";
+        }
+        if(historySearchClearBtn){
+            historySearchClearBtn.style.display = "none";
+        }
+        renderEmptyMessage(historyListEl, "Log in to see your watch history.");
+        return;
+    }
+
+    try{
+        fullHistoryItems = await getHistory(currentUid, 50);
+    }
+    catch(e){
+        console.warn("Failed to load history:", e);
+        fullHistoryItems = [];
+    }
+
+    applyHistorySearch();
 }
 
 

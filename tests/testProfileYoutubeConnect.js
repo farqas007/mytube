@@ -16,6 +16,9 @@
 //   * the three fixed callback statuses are handled and unknown values ignored;
 //   * the status query is stripped from the address bar via replaceState;
 //   * the disconnect message stays honest about `revoked === false`;
+//   * the UI offers Connect only when the server explicitly reports the flow
+//     as enabled (fail-closed), while an existing connection stays visible and
+//     stays revocable;
 //   * the module adds no YouTube write endpoint and no new dependency.
 // =============================================================================
 
@@ -112,6 +115,73 @@ function makeWindow(href) {
       }
     }
   };
+}
+
+// A DOM element double good enough for the module's status/button rendering.
+function makeElement() {
+  return {
+    style: {},
+    textContent: "",
+    className: "",
+    disabled: false,
+    addEventListener() {}
+  };
+}
+
+// Evaluate the REAL refreshStatus() against fake elements and a stubbed
+// fetchStatus(), so the shipped logic decides which buttons are shown for a
+// given server answer.
+function sandboxRefreshStatus(status, body) {
+  const statusEl = makeElement();
+  const connectBtn = makeElement();
+  const disconnectBtn = makeElement();
+  const helpEl = makeElement();
+
+  // refreshStatus() only clears or reloads the shared identity helper; the
+  // helper itself has its own tests. Record the calls so the sandbox still
+  // proves the connection path drives identity resolution.
+  const identityCalls = [];
+  const ytIdentity = {
+    clear(reason) {
+      identityCalls.push(["clear", reason]);
+    },
+    load(options) {
+      identityCalls.push(["load", options]);
+    }
+  };
+
+  const factory = new Function(
+    "statusEl",
+    "connectBtn",
+    "disconnectBtn",
+    "helpEl",
+    "setStatus",
+    "setBusy",
+    "fetchStatus",
+    "ytIdentity",
+    `let connectAvailable = true;
+     ${extractFunction(CONNECT_JS, "refreshStatus")}
+     return { refreshStatus, available: () => connectAvailable };`
+  );
+
+  const instance = factory(
+    statusEl,
+    connectBtn,
+    disconnectBtn,
+    helpEl,
+    (text, kind) => {
+      statusEl.textContent = text || "";
+      statusEl.className = "yt-connect-status" + (kind ? " " + kind : "");
+    },
+    () => {},
+    async () => ({
+      response: { status, ok: status >= 200 && status < 300 },
+      body
+    }),
+    ytIdentity
+  );
+
+  return { instance, statusEl, connectBtn, disconnectBtn, helpEl, identityCalls };
 }
 
 // =============================================================================
@@ -216,12 +286,15 @@ test("C1 browser code never references the server-only secrets", () => {
   }
 });
 
-test("C2 the module adds no new dependency", () => {
+test("C2 the module adds no new external dependency", () => {
   const imports = CONNECT_JS.match(/^import[\s\S]*?from\s+"[^"]+";/gm) || [];
+  // The identity helper is part of this release (Phase 1) and shares the same
+  // grant; it is a local module, not a new third-party dependency.
+  const localAllowlist = new Set(["./firebase.js", "./youtube-account.js"]);
   for (const imp of imports) {
     const from = /from\s+"([^"]+)"/.exec(imp)[1];
     assert.ok(
-      from === "./firebase.js" || from.includes("gstatic.com/firebasejs"),
+      localAllowlist.has(from) || from.includes("gstatic.com/firebasejs"),
       `unexpected dependency: ${from}`
     );
   }
@@ -304,7 +377,9 @@ test("E1 the disconnect message distinguishes revoked === false", () => {
 test("E2 not-configured (503) hides Connect instead of erroring", () => {
   assert.match(CONNECT_JS, /status === 503/);
   const block = CONNECT_JS.slice(CONNECT_JS.indexOf("status === 503"));
-  assert.match(block.slice(0, 300), /not available yet/);
+  // The 503 branch also clears the shared identity before rendering its safe
+  // message, so the window must span the whole branch.
+  assert.match(block.slice(0, 600), /not available yet/);
 });
 
 test("E3 unauthenticated (401) asks the user to sign in again", () => {
@@ -329,4 +404,87 @@ test("F1 the status/button classes are styled", () => {
   for (const cls of [".yt-connect-status", ".yt-connect-actions", ".yt-disconnect-btn"]) {
     assert.ok(STYLE_CSS.includes(cls), `style.css must style ${cls}`);
   }
+});
+
+// =============================================================================
+// G) The UI honors the server's connectEnabled flag (fail-closed)
+// -----------------------------------------------------------------------------
+// The approved server contract reports connectEnabled: true, so Connect is
+// offered. The UI still fails closed: only an explicit `true` shows the button,
+// and a server that reports false (or omits the flag) hides it. An existing
+// connection always stays visible and revocable: the user must be able to
+// remove a grant regardless of whether new connections are allowed.
+// =============================================================================
+
+test("G1 the Connect button starts hidden, like the Disconnect button", () => {
+  const tag = /<button[^>]*id="ytConnectBtn"[^>]*>/.exec(PROFILE_HTML);
+  assert.ok(tag, "the connect button must exist");
+  assert.match(
+    tag[0],
+    /display:\s*none/,
+    "it must not show before the server has answered"
+  );
+});
+
+test("G2 the module hides Connect when the server reports the flow as disabled", async () => {
+  const { instance, statusEl, connectBtn, helpEl } = sandboxRefreshStatus(200, {
+    connected: false,
+    scope: "",
+    connectEnabled: false
+  });
+
+  await instance.refreshStatus({});
+
+  assert.equal(connectBtn.style.display, "none", "Connect must be removed");
+  assert.equal(helpEl.style.display, "none", "the help text must go with it");
+  assert.equal(instance.available(), false);
+  assert.match(statusEl.textContent, /not available yet/);
+});
+
+test("G3 an existing connection stays visible and revocable while disabled", async () => {
+  const { instance, statusEl, connectBtn, disconnectBtn, identityCalls } =
+    sandboxRefreshStatus(200, {
+      connected: true,
+      scope: "",
+      connectEnabled: false
+    });
+
+  await instance.refreshStatus({});
+
+  assert.equal(statusEl.textContent, "YouTube account connected.");
+  assert.equal(connectBtn.style.display, "none");
+  assert.equal(disconnectBtn.style.display, "", "Disconnect must stay available");
+  assert.deepEqual(
+    identityCalls[0],
+    ["load", { force: true }],
+    "a connected grant must trigger identity resolution"
+  );
+});
+
+test("G4 the module shows Connect when the server reports the flow as enabled", async () => {
+  const { instance, connectBtn, helpEl } = sandboxRefreshStatus(200, {
+    connected: false,
+    scope: "",
+    connectEnabled: true
+  });
+
+  await instance.refreshStatus({});
+
+  assert.equal(connectBtn.style.display, "");
+  assert.equal(helpEl.style.display, "");
+  assert.equal(instance.available(), true);
+});
+
+test("G5 a status response without the flag hides the Connect button", async () => {
+  // Fail closed: an older or malformed status response must not offer a new
+  // connection. The server remains the sole authority on whether Connect is
+  // enabled.
+  const { instance, connectBtn } = sandboxRefreshStatus(200, {
+    connected: false,
+    scope: ""
+  });
+
+  await instance.refreshStatus({});
+
+  assert.equal(connectBtn.style.display, "none");
 });

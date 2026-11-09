@@ -603,12 +603,95 @@ function whenYTReady(fn){
     window.addEventListener("mytube-yt-ready", fn, { once: true });
 }
 
+// Bounded wait for the YouTube client module (prevents infinite Loading when
+// the deferred module fails to load or never becomes ready). On failure/timeout,
+// callers decide how to surface the error while preserving seq/stale guards.
+let ytReadyWaitTimer = null;
+let ytReadyWaitHandler = null;
+function clearYtReadyWait(){
+    if(ytReadyWaitTimer){
+        clearTimeout(ytReadyWaitTimer);
+        ytReadyWaitTimer = null;
+    }
+    if(ytReadyWaitHandler){
+        window.removeEventListener("mytube-yt-ready", ytReadyWaitHandler);
+        window.removeEventListener("mytube-yt-failed", ytReadyWaitHandler);
+        ytReadyWaitHandler = null;
+    }
+}
+function waitForYTReady(onReady, onFail, timeoutMs){
+    if(ytClient()){
+        onReady();
+        return;
+    }
+    if(window.__mytubeYtReadyFailed){
+        if(typeof onFail === "function"){
+            onFail("failed");
+        }
+        return;
+    }
+    clearYtReadyWait();
+    ytReadyWaitHandler = function(e){
+        clearYtReadyWait();
+        if((e && e.type === "mytube-yt-failed") || window.__mytubeYtReadyFailed){
+            if(typeof onFail === "function"){
+                onFail("failed");
+            }
+        }
+        else if(ytClient()){
+            onReady();
+        }
+        else if(typeof onFail === "function"){
+            onFail("unknown");
+        }
+    };
+    window.addEventListener("mytube-yt-ready", ytReadyWaitHandler);
+    window.addEventListener("mytube-yt-failed", ytReadyWaitHandler);
+    ytReadyWaitTimer = setTimeout(function(){
+        clearYtReadyWait();
+        if(ytClient()){
+            onReady();
+        }
+        else if(typeof onFail === "function"){
+            onFail(window.__mytubeYtReadyFailed ? "failed" : "timeout");
+        }
+    }, typeof timeoutMs === "number" ? timeoutMs : 12000);
+}
+
 function showStatus(text){
     if(dynamicStatus){
         dynamicStatus.style.display = text ? "block" : "none";
         dynamicStatus.textContent = text || "";
         dynamicStatus.setAttribute("aria-busy", text ? "true" : "false");
     }
+}
+
+function showRetryableStatus(text, retryFn){
+    if(!dynamicStatus){
+        return;
+    }
+    dynamicStatus.style.display = text ? "block" : "none";
+    dynamicStatus.setAttribute("aria-busy", "false");
+    dynamicStatus.replaceChildren();
+    if(!text){
+        return;
+    }
+    const msg = document.createElement("span");
+    msg.textContent = String(text);
+    dynamicStatus.appendChild(msg);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "retry-btn";
+    btn.textContent = "Retry";
+    btn.style.marginLeft = "8px";
+    btn.style.padding = "4px 10px";
+    btn.style.cursor = "pointer";
+    btn.addEventListener("click", function(){
+        if(typeof retryFn === "function"){
+            retryFn();
+        }
+    });
+    dynamicStatus.appendChild(btn);
 }
 
 // Render a list of videos into the grid.
@@ -871,13 +954,24 @@ async function loadHomeFeed(){
 
     if(!client){
         // The YouTube module is deferred (type="module"), so it may not be ready
-        // yet — retry once it reports readiness.
-        whenYTReady(() => {
-            if(seq === homeSeq){
-                loadHomeFeed();
-            }
-        });
+        // yet — wait with a bounded timeout and fail clearly instead of loading forever.
         showStatus("Loading YouTube videos...");
+        waitForYTReady(
+            function(){
+                if(seq === homeSeq){
+                    loadHomeFeed();
+                }
+            },
+            function(){
+                if(seq !== homeSeq || !homeFeedActive()){
+                    return;
+                }
+                showRetryableStatus("Could not load YouTube videos. Please try again.", function(){
+                    loadHomeFeed();
+                });
+            },
+            12000
+        );
         return;
     }
 
@@ -1065,14 +1159,25 @@ async function doDynamicSearch(){
     }
 
     if(!client){
-        // Deferred module not loaded yet. Retry once it reports readiness —
-        // do NOT render local videos meanwhile.
-        whenYTReady(() => {
-            if(seq === searchSeq && searchTerm() === term){
-                doDynamicSearch();
-            }
-        });
+        // Deferred module not loaded yet. Wait with a bounded timeout and fail
+        // clearly instead of loading forever. Do NOT render local videos.
         showStatus("Searching YouTube...");
+        waitForYTReady(
+            function(){
+                if(seq === searchSeq && searchTerm() === term){
+                    doDynamicSearch();
+                }
+            },
+            function(){
+                if(seq !== searchSeq || searchTerm() !== term){
+                    return;
+                }
+                showRetryableStatus("Could not load YouTube search. Please try again.", function(){
+                    doDynamicSearch();
+                });
+            },
+            12000
+        );
         return;
     }
 
@@ -1307,39 +1412,45 @@ function applySearchFilterCatalogues(){
 
 <!-- Phase 7: YouTube dynamic discovery (backend proxy client) -->
 <script type="module">
-import {
-  search,
-  trending,
-  newFeedSeed,
-  FEED_TOPICS,
-  VIDEO_CATEGORIES,
-  SEARCH_ORDER_OPTIONS,
-  SEARCH_DURATION_OPTIONS,
-  SEARCH_UPLOAD_DATE_OPTIONS
-} from "./youtube.js";
-// Expose the client on window so the inline homepage script can call it.
-window.MyTubeYouTube = {
-  search: search,
-  trending: trending,
-  newFeedSeed: newFeedSeed,
-  FEED_TOPICS: FEED_TOPICS,
-  VIDEO_CATEGORIES: VIDEO_CATEGORIES,
-  SEARCH_ORDER_OPTIONS: SEARCH_ORDER_OPTIONS,
-  SEARCH_DURATION_OPTIONS: SEARCH_DURATION_OPTIONS,
-  SEARCH_UPLOAD_DATE_OPTIONS: SEARCH_UPLOAD_DATE_OPTIONS
-};
-// Desktop thumbnail hover preview (muted embed), shared with the subscriptions
-// and channel pages. Exposed on window because the homepage's own card renderer
-// is an inline (non-module) script.
-import { attachHoverPreview } from "./shared/hoverPreview.js";
-window.MyTubeHoverPreview = { attachHoverPreview: attachHoverPreview };
-// Cards may already have been rendered by the inline script before this module
-// executed, so announce the helper's arrival and let the page finish wiring.
-window.dispatchEvent(new Event("mytube-hover-ready"));
-// Signal readiness. This module is deferred, so the inline homepage script may
-// have already run its initial render before this executes; it listens for this
-// event to retry dynamic loading (search + home discovery) with the client set.
-window.dispatchEvent(new Event("mytube-yt-ready"));
+(async () => {
+  try {
+    const yt = await import("./youtube.js");
+    // Expose the client on window so the inline homepage script can call it.
+    window.MyTubeYouTube = {
+      search: yt.search,
+      trending: yt.trending,
+      newFeedSeed: yt.newFeedSeed,
+      FEED_TOPICS: yt.FEED_TOPICS,
+      VIDEO_CATEGORIES: yt.VIDEO_CATEGORIES,
+      SEARCH_ORDER_OPTIONS: yt.SEARCH_ORDER_OPTIONS,
+      SEARCH_DURATION_OPTIONS: yt.SEARCH_DURATION_OPTIONS,
+      SEARCH_UPLOAD_DATE_OPTIONS: yt.SEARCH_UPLOAD_DATE_OPTIONS
+    };
+
+    // Desktop thumbnail hover preview (muted embed), shared with the
+    // subscriptions and channel pages. Non-fatal if unavailable.
+    try {
+      const hp = await import("./shared/hoverPreview.js");
+      window.MyTubeHoverPreview = { attachHoverPreview: hp.attachHoverPreview };
+      window.dispatchEvent(new Event("mytube-hover-ready"));
+    } catch (hpErr) {
+      if (window.console && window.console.warn) {
+        window.console.warn("MyTube hover preview module failed:", hpErr);
+      }
+    }
+
+    window.__mytubeYtReadyFailed = false;
+    // Cards may already have been rendered by the inline script before this
+    // module executed; listeners retry dynamic loading with the client set.
+    window.dispatchEvent(new Event("mytube-yt-ready"));
+  } catch (e) {
+    window.__mytubeYtReadyFailed = true;
+    if (window.console && window.console.warn) {
+      window.console.warn("MyTube YouTube module failed:", e);
+    }
+    window.dispatchEvent(new Event("mytube-yt-failed"));
+  }
+})();
 </script>
 
 

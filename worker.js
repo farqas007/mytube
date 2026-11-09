@@ -5,6 +5,7 @@ import {
   normalizeVideosResponse,
   normalizeChannelResponse,
   normalizeCommentsResponse,
+  normalizeLiveChatMessage,
   normalizeLiveChatResponse,
   formatCount,
   formatPublishedDate,
@@ -38,6 +39,7 @@ import {
   GOOGLE_TOKEN_ENDPOINT,
   GOOGLE_YOUTUBE_SCOPE,
   buildAuthorizationUrl,
+  constantTimeEqual,
   createCodeChallenge,
   createCodeVerifier,
   createState,
@@ -47,6 +49,10 @@ import {
   redirectUriMatches,
   verifyFirebaseIdToken
 } from "./shared/oauth.js";
+import {
+  getAccessTokenForUser,
+  invalidateAccessToken
+} from "./shared/oauth-tokens.js";
 
 const YT_API_BASE = "https://www.googleapis.com/youtube/v3";
 
@@ -513,9 +519,10 @@ const MAX_CACHE_ENTRIES = 200;
 
 const memoryCache = new Map();
 
-// `extraHeaders` carries the Phase 1 index observability headers only. It is
-// applied AFTER the CORS/Cache-Control block so it can never overwrite
-// Content-Type, Cache-Control, Access-Control-Allow-Origin or Vary.
+// `extraHeaders` carries response-only headers such as Set-Cookie plus the
+// Phase 1 index observability headers. It is applied AFTER the CORS/Cache-Control
+// block so it can never overwrite Content-Type, Cache-Control,
+// Access-Control-Allow-Origin or Vary.
 function json(data, status = 200, request, extraHeaders = null) {
   const headers = {
     "Content-Type": "application/json; charset=utf-8",
@@ -1921,6 +1928,7 @@ async function getLiveChat(videoId, apiKey, options = {}) {
   // Shared (non-chat) response shape so the frontend can rely on one contract.
   const base = {
     isLive: live.isLive,
+    channelId: typeof live.channelId === "string" ? live.channelId : "",
     liveChatId: live.liveChatId,
     concurrentViewers: live.concurrentViewers,
     messages: [],
@@ -1929,6 +1937,9 @@ async function getLiveChat(videoId, apiKey, options = {}) {
     offlineAt: live.actualEndTime || "",
     activePoll: null,
     status: "not_live",
+    // Lets the watch page decide whether to offer the (hidden-by-default)
+    // composer. Computed per request from CHAT_SEND_ENABLED; never cached.
+    chatSendEnabled: options.chatSendEnabled === true,
     code: "",
     error: ""
   };
@@ -2051,10 +2062,14 @@ async function getLiveChat(videoId, apiKey, options = {}) {
 //   * The client secret, refresh token and access token NEVER leave the Worker.
 //     No token is ever put in a URL, a log line, or a response body.
 //   * /start (a fetch) requires a valid Firebase token; /callback (a navigation)
-//     requires a valid single-use state instead. Each step has exactly one
-//     authentication mechanism, and neither can be skipped.
+//     requires a valid single-use state bound to the initiating browser by an
+//     HttpOnly cookie. Each step has exactly one authentication mechanism, and
+//     neither can be skipped.
 //   * A state is single-use: consumed before the code exchange, so a replayed
 //     callback cannot mint a second grant.
+//   * While OAUTH_CONNECT_ENABLED is false no grant can be created at all:
+//     /start refuses before authentication, and /callback refuses after the
+//     state has been consumed but before the code is exchanged.
 //   * The redirect_uri is compared byte-for-byte to the configured value.
 //   * If the Google client env or the encryption secret is absent, every route
 //     fails closed with a clear error — never an unauthenticated success.
@@ -2064,9 +2079,44 @@ async function getLiveChat(videoId, apiKey, options = {}) {
 // near-useless, long enough for a user to get through the consent screen.
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 
+// The OAuth state is also bound to the browser that started the flow. The
+// cookie is the browser-bound half; the D1 row remains the server-side,
+// single-use half. It is HttpOnly, Secure and Lax so Google's top-level
+// redirect back to the callback can send it, but page JS can never read it.
+const OAUTH_STATE_COOKIE_NAME = "mytube_oauth_state";
+const OAUTH_STATE_COOKIE_PATH = "/api/oauth/callback";
+const OAUTH_STATE_COOKIE_MAX_AGE_SECONDS = Math.floor(OAUTH_STATE_TTL_MS / 1000);
+
 // Bound on how many abandoned states are pruned per start, so pruning can never
 // become an unbounded write.
 const OAUTH_STATE_PRUNE_LIMIT = 50;
+
+// Whether a NEW YouTube connection may be started, and whether a grant may be
+// created at all.
+//
+// HARD-CODED OFF, on purpose, and deliberately NOT an environment variable:
+// MyTube is a read-only product, the OAuth scope it asks for is a write scope
+// that no shipped feature uses, and the Connect flow is not approved for use.
+// A constant cannot be flipped by a dashboard change or a stray secret, so
+// re-enabling it takes a code change plus a separate, explicit approval.
+//
+// It gates BOTH halves of the flow:
+//   * /api/oauth/start    — refused BEFORE authentication (503
+//     OAUTH_CONNECT_DISABLED): no state row and no authorization URL.
+//   * /api/oauth/callback — the state is consumed and the request is then
+//     refused BEFORE the code is exchanged: no token is minted and no grant is
+//     ever inserted or updated.
+//
+// What this switch does NOT touch:
+//   * /api/oauth/status  — an existing grant stays visible.
+//   * /api/oauth/disconnect — an existing grant stays revocable. (Blocking that
+//     too would strand a grant the user could no longer remove from MyTube.)
+//
+// The net effect: while it is off, the only grant that can ever exist is one
+// that was created before the switch was flipped, and even a state that was
+// pending from before the flip can no longer be redeemed — it is consumed and
+// refused.
+const OAUTH_CONNECT_ENABLED = true;
 
 // Where the callback returns the browser after consent.
 //
@@ -2157,6 +2207,48 @@ function oauthError(message, code, status, request) {
   return json({ error: message, code }, status, request);
 }
 
+// Read a single cookie value without reflecting or logging the Cookie header.
+// The state value is base64url, but decode defensively in case a browser or
+// intermediary encoded it.
+function readOAuthStateCookie(request) {
+  const header = request.headers.get("Cookie") || "";
+
+  for (const part of header.split(";")) {
+    const separator = part.indexOf("=");
+
+    if (separator === -1) continue;
+
+    if (part.slice(0, separator).trim() !== OAUTH_STATE_COOKIE_NAME) continue;
+
+    const raw = part.slice(separator + 1).trim();
+
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
+  }
+
+  return "";
+}
+
+function oauthStateCookieHeader(state) {
+  return (
+    `${OAUTH_STATE_COOKIE_NAME}=${state}; ` +
+    `Path=${OAUTH_STATE_COOKIE_PATH}; ` +
+    `Max-Age=${OAUTH_STATE_COOKIE_MAX_AGE_SECONDS}; ` +
+    "HttpOnly; Secure; SameSite=Lax"
+  );
+}
+
+function clearOAuthStateCookieHeader() {
+  return (
+    `${OAUTH_STATE_COOKIE_NAME}=; ` +
+    `Path=${OAUTH_STATE_COOKIE_PATH}; ` +
+    "Max-Age=0; HttpOnly; Secure; SameSite=Lax"
+  );
+}
+
 // Build the fixed landing redirect used by the callback.
 //
 // `status` MUST come from OAUTH_LANDING_STATUS; anything else is coerced to
@@ -2176,7 +2268,8 @@ function oauthLandingRedirect(status) {
     status: 302,
     headers: {
       Location: location,
-      "Cache-Control": "no-store"
+      "Cache-Control": "no-store",
+      "Set-Cookie": clearOAuthStateCookieHeader()
     }
   });
 }
@@ -2328,10 +2421,19 @@ async function consumeOauthState(db, state, nowMs) {
 }
 
 // Best-effort prune of expired/consumed states. Never throws; a pruning failure
-// must not fail the start request.
+// must not fail the start request. Returns the number of rows removed (0 when
+// the prune failed) so the scheduled handler can report what it cleaned up.
+//
+// The cutoff is the same one the callback uses to reject an expired state:
+// expires_at_ms <= now (see consumeOauthState). Rows that were already
+// redeemed are removed as well, so a completed flow leaves nothing behind.
 async function pruneOauthStates(db, nowMs) {
+  if (!db) {
+    return 0;
+  }
+
   try {
-    await db
+    const result = await db
       .prepare(
         "DELETE FROM oauth_states WHERE state IN (" +
           "SELECT state FROM oauth_states " +
@@ -2340,8 +2442,13 @@ async function pruneOauthStates(db, nowMs) {
       )
       .bind(nowMs, OAUTH_STATE_PRUNE_LIMIT)
       .run();
-  } catch {
-    // Ignored on purpose: pruning is hygiene, not correctness.
+
+    return Number(result?.meta?.changes) || 0;
+  } catch (error) {
+    // Ignored on purpose: pruning is hygiene, not correctness. It is logged so
+    // a background run that stops cleaning up is visible instead of silent.
+    console.error("[mytube] OAuth state prune failed", error?.message || error);
+    return 0;
   }
 }
 
@@ -2368,6 +2475,21 @@ async function handleOAuthStart(request, env) {
     return oauthError(
       "YouTube connection is temporarily unavailable.",
       "OAUTH_UNAVAILABLE",
+      503,
+      request
+    );
+  }
+
+  // The Connect flow is hard-disabled. This check sits BEFORE the Firebase
+  // token is looked at, so an unauthenticated caller gets the same refusal as
+  // an authenticated one and no authorization request is ever handed out.
+  // Everything below this line (state creation, PKCE, the Google consent URL)
+  // is dead code while the switch is off; it is kept intact so re-enabling the
+  // flow is a one-line change, with the separate approval it requires.
+  if (!OAUTH_CONNECT_ENABLED) {
+    return oauthError(
+      "YouTube connection is not available yet.",
+      "OAUTH_CONNECT_DISABLED",
       503,
       request
     );
@@ -2424,7 +2546,14 @@ async function handleOAuthStart(request, env) {
   // The browser then navigates to `authorizationUrl` itself, which is the step
   // that needs no header. `authorizationUrl` contains the public client id, the
   // redirect_uri, the PKCE challenge and the state — never a secret or a token.
-  return json({ authorizationUrl }, 200, request);
+  //
+  // The state cookie is the browser-bound half of the CSRF defence: it is set
+  // on this same response, before the browser leaves for Google, and the
+  // callback refuses a state that this browser did not start. The cookie is
+  // scoped to the callback path and expires with the state row.
+  return json({ authorizationUrl }, 200, request, {
+    "Set-Cookie": oauthStateCookieHeader(state)
+  });
 }
 
 // GET /api/oauth/callback — Google redirects here with ?code and ?state.
@@ -2461,9 +2590,18 @@ async function handleOAuthCallback(request, env, url) {
 
   // NO Firebase Authorization header is required (or possible) here: Google
   // redirected the browser and cannot attach one. The stored, single-use state
-  // IS the authentication for this step — it was created on a request that DID
-  // carry a verified Firebase token, and it binds the grant to that verified
-  // uid. See consumeOauthState().
+  // is the server-side authority for the grant's uid, but it is not sufficient
+  // on its own: a state put in a victim's browser by an attacker would still be
+  // a login-linking/CSRF vector. The browser-bound cookie must match BEFORE the
+  // state is consumed, so a missing/wrong cookie cannot burn a legitimate state
+  // or reach the token exchange. A matching cookie and state are then consumed
+  // atomically by consumeOauthState().
+  const cookieState = readOAuthStateCookie(request);
+
+  if (!cookieState || !constantTimeEqual(cookieState, state)) {
+    return oauthLandingRedirect(OAUTH_LANDING_STATUS.error);
+  }
+
   const now = Date.now();
   let row;
 
@@ -2481,6 +2619,26 @@ async function handleOAuthCallback(request, env, url) {
   // The redirect URI must be exactly the one the flow started with AND exactly
   // the configured one. Two checks because two things could have drifted.
   if (!redirectUriMatches(row.redirect_uri, config.redirectUri)) {
+    return oauthLandingRedirect(OAUTH_LANDING_STATUS.error);
+  }
+
+  // The Connect flow is switched off (OAUTH_CONNECT_ENABLED = false), so NO
+  // grant may ever be created — not even by a state that was issued before the
+  // switch was flipped.
+  //
+  // Placement matters:
+  //   * It sits AFTER consumeOauthState, so the pending state was ALREADY
+  //     consumed. A state that is rejected here is burned: it can never be
+  //     redeemed by a replay, and it can never be redeemed later either, not
+  //     even if this switch is ever turned back on.
+  //   * It sits BEFORE the code exchange, so no authorization code is ever
+  //     presented to Google and no token is ever minted. The only way to
+  //     create a grant (the INSERT/UPDATE below) is unreachable while the
+  //     switch is off.
+  //
+  // Status and disconnect are deliberately NOT gated: an existing grant stays
+  // visible and stays revocable, which is the only way a user can remove it.
+  if (!OAUTH_CONNECT_ENABLED) {
     return oauthLandingRedirect(OAUTH_LANDING_STATUS.error);
   }
 
@@ -2509,6 +2667,15 @@ async function handleOAuthCallback(request, env, url) {
     tokenPayload = await tokenResponse.json().catch(() => null);
 
     if (!tokenResponse.ok || !tokenPayload?.refresh_token) {
+      return oauthLandingRedirect(OAUTH_LANDING_STATUS.error);
+    }
+
+    // Require the requested YouTube scope before persisting the grant.
+    // Missing scope must not be encrypted or written to D1. Use the same
+    // whitespace normalization as scopeReady() for consistency.
+    const returnedScope = String(tokenPayload.scope || "");
+    const scopeSet = returnedScope.split(/\s+/).filter(Boolean);
+    if (!scopeSet.includes(GOOGLE_YOUTUBE_SCOPE)) {
       return oauthLandingRedirect(OAUTH_LANDING_STATUS.error);
     }
   } catch {
@@ -2550,6 +2717,11 @@ async function handleOAuthCallback(request, env, url) {
   } catch {
     return oauthLandingRedirect(OAUTH_LANDING_STATUS.error);
   }
+
+  // A reconnect replaces the grant. Drop any access token cached in this
+  // isolate for the uid; other isolates detect the changed grant fingerprint on
+  // the write path before they may reuse a cached token.
+  invalidateAccessToken(row.uid);
 
   // Success: the browser lands on a fixed MyTube page with a non-sensitive
   // status. The grant owner is the uid the state was minted for.
@@ -2607,14 +2779,26 @@ async function handleOAuthStatus(request, env) {
   }
 
   if (!row || row.revoked_at_ms !== null && row.revoked_at_ms !== undefined) {
-    return json({ connected: false, scope: "" }, 200, request);
+    return json(
+      { connected: false, scope: "", scopeReady: false, connectEnabled: OAUTH_CONNECT_ENABLED },
+      200,
+      request
+    );
   }
+
+  const scopeStr = String(row.scope || "");
+  const scopeReady = scopeStr
+    .split(/\s+/)
+    .filter(Boolean)
+    .includes(GOOGLE_YOUTUBE_SCOPE);
 
   return json(
     {
       connected: true,
-      scope: String(row.scope || ""),
-      connectedAtMs: Number(row.connected_at_ms) || 0
+      scope: scopeStr,
+      connectedAtMs: Number(row.connected_at_ms) || 0,
+      scopeReady,
+      connectEnabled: OAUTH_CONNECT_ENABLED
     },
     200,
     request
@@ -2654,6 +2838,17 @@ async function handleOAuthDisconnect(request, env) {
   if (!auth.ok) {
     return auth.response;
   }
+
+  // Drop any cached access token for this user the moment they disconnect, so a
+  // token minted before the disconnect cannot be reused from this isolate.
+  //
+  // This is the earliest point where the uid is known, and it is placed before
+  // any I/O on purpose: one call then covers every exit below — the grant read
+  // failing, the Google revoke failing, the local delete failing, and success.
+  //
+  // Scope note: the token cache is per-isolate, so this invalidates THIS
+  // isolate only. Other isolates keep their cached token until it expires.
+  invalidateAccessToken(auth.uid);
 
   let row;
 
@@ -2738,6 +2933,2945 @@ async function handleOAuthDisconnect(request, env) {
   return json({ connected: false, revoked }, 200, request);
 }
 
+// -----------------------------------------------------------------------------
+// Live chat send (YouTube liveChatMessages.insert)
+// -----------------------------------------------------------------------------
+// This is the first WRITE path in MyTube. It is deliberately inert: nothing
+// below runs unless CHAT_SEND_ENABLED is exactly "true". The kill switch is the
+// first check in handleLiveChatSend, before auth, D1, or any network call, so a
+// missing/typo'd value cannot spend a token, read a grant, or post a message.
+//
+// Rules this block keeps:
+//   * The client sends a VIDEO id only. The active liveChatId is resolved here
+//     from YouTube's own liveStreamingDetails; a client-supplied chat id is
+//     ignored by construction.
+//   * The message is posted as the signed-in user's OWN YouTube account, using
+//     the refresh token stored by the OAuth flow. No channel-ownership check is
+//     performed: YouTube itself decides whether this account may post here.
+//   * The insert is never retried. It is not idempotent, so an automatic retry
+//     could double-post. One fetch, one attempt, a 10s abort.
+//   * Limits are per-ISOlate best-effort, in the same style as the OAuth
+//     limiter. They are abuse brakes, not a billing/quota guarantee.
+//   * No token, refresh token, message text or upstream error detail is ever
+//     returned to the client or logged.
+// -----------------------------------------------------------------------------
+
+function chatSendEnabled(env) {
+  // Exact string match only. "TRUE", "1", " true", a boolean true and every
+  // other variation stay off, so a typo can never enable the write path.
+  return env?.CHAT_SEND_ENABLED === "true";
+}
+
+const LIVE_CHAT_SEND_MAX_CODE_POINTS = 200;
+const LIVE_CHAT_SEND_MAX_BODY_BYTES = 4 * 1024;
+const LIVE_CHAT_SEND_TIMEOUT_MS = 10 * 1000;
+const LIVE_CHAT_SEND_IP_WINDOW_MS = 60 * 1000;
+const LIVE_CHAT_SEND_IP_MAX = 20;
+const LIVE_CHAT_SEND_USER_SHORT_WINDOW_MS = 10 * 1000;
+const LIVE_CHAT_SEND_USER_SHORT_MAX = 3;
+const LIVE_CHAT_SEND_USER_LONG_WINDOW_MS = 60 * 1000;
+const LIVE_CHAT_SEND_USER_LONG_MAX = 20;
+const LIVE_CHAT_SEND_INFLIGHT_TTL_MS = 15 * 1000;
+const LIVE_CHAT_SEND_IDEMPOTENCY_TTL_MS = 60 * 1000;
+const LIVE_CHAT_SEND_MAX_BUCKETS = 5000;
+const LIVE_CHAT_SEND_MAX_IDEMPOTENCY = 500;
+
+const LIVE_CHAT_SEND_INSERT_URL =
+  "https://www.googleapis.com/youtube/v3/liveChat/messages?part=snippet";
+
+const liveChatSendIpBuckets = new Map();
+const liveChatSendShortBuckets = new Map();
+const liveChatSendLongBuckets = new Map();
+const liveChatSendInFlight = new Map();
+const liveChatSendIdempotency = new Map();
+
+// Closed set of safe, already-user-facing messages. The handler always picks a
+// value from here; it never passes a Google-supplied message through.
+const LIVE_CHAT_SEND_MESSAGES = Object.freeze({
+  CHAT_SEND_DISABLED: "Sending chat messages is not enabled.",
+  METHOD_NOT_ALLOWED: "Method not allowed.",
+  UNSUPPORTED_MEDIA_TYPE: "Expected a JSON request.",
+  BODY_TOO_LARGE: "That message is too long.",
+  INVALID_REQUEST: "That request was not valid.",
+  INVALID_VIDEO_ID: "That video is not valid.",
+  INVALID_MESSAGE: "That message can't be sent. Check the text and try again.",
+  UNAUTHENTICATED: "Sign in required.",
+  RATE_LIMITED: "You are sending messages too quickly. Please wait a moment.",
+  CHAT_RATE_LIMITED: "YouTube is asking for a slower pace. Please wait a moment.",
+  SEND_IN_PROGRESS: "Your previous message is still being sent.",
+  YOUTUBE_NOT_CONNECTED: "Connect your YouTube account before sending messages.",
+  YOUTUBE_SCOPE_REQUIRED: "Reconnect your YouTube account to allow sending chat messages.",
+  YOUTUBE_REAUTH_REQUIRED: "Reconnect your YouTube account to continue.",
+  OAUTH_NOT_CONFIGURED: "YouTube connection is not available yet.",
+  OAUTH_UNAVAILABLE: "Sending is unavailable right now.",
+  YOUTUBE_NOT_CONFIGURED: "YouTube is not configured on this server.",
+  NOT_LIVE: "This stream is not live.",
+  CHAT_DISABLED: "Live chat is turned off for this broadcast.",
+  LIVE_CHAT_ENDED: "This live chat has ended.",
+  LIVE_CHAT_NOT_FOUND: "This live chat is unavailable.",
+  CHAT_FORBIDDEN: "You can't send messages in this chat.",
+  QUOTA_EXCEEDED: "YouTube's daily limit has been reached. Please try again later.",
+  TOKEN_EXCHANGE_FAILED: "Could not reach YouTube right now. Please try again.",
+  UPSTREAM_ERROR: "Could not reach YouTube right now. Please try again.",
+  UPSTREAM_TIMEOUT: "Could not reach YouTube right now. Please try again.",
+  OAUTH_CONFIG_ERROR: "YouTube connection needs attention. Please try again later.",
+  INTERNAL: "Something went wrong. Please try again."
+});
+
+function liveChatSendFailure(code, status, request) {
+  return json(
+    {
+      error: LIVE_CHAT_SEND_MESSAGES[code] || LIVE_CHAT_SEND_MESSAGES.INTERNAL,
+      code
+    },
+    status,
+    request
+  );
+}
+
+// -----------------------------------------------------------------------------
+// Live chat subscription helpers (subscriber-only / restricted chat support)
+// -----------------------------------------------------------------------------
+// Authenticated, user-initiated checks and explicit subscription actions only.
+// Channel IDs are ALWAYS resolved server-side from a trusted videoId via
+// probeVideoLive(). The client never supplies a trusted channelId. No
+// subscriptions.list/insert calls are made without a connected OAuth grant and
+// the existing youtube.force-ssl scope. Never auto-subscribe; never blindly
+// retry inserts.
+const SUBSCRIPTION_API_TIMEOUT_MS = 10 * 1000;
+const SUBSCRIPTION_STATUS_IP_WINDOW_MS = 60 * 1000;
+const SUBSCRIPTION_STATUS_IP_MAX = 30;
+const SUBSCRIPTION_STATUS_USER_WINDOW_MS = 60 * 1000;
+const SUBSCRIPTION_STATUS_USER_MAX = 20;
+const SUBSCRIPTION_SUBSCRIBE_IP_WINDOW_MS = 60 * 1000;
+const SUBSCRIPTION_SUBSCRIBE_IP_MAX = 10;
+const SUBSCRIPTION_SUBSCRIBE_USER_WINDOW_MS = 60 * 1000;
+const SUBSCRIPTION_SUBSCRIBE_USER_MAX = 6;
+
+const subscriptionStatusIpBuckets = new Map();
+const subscriptionStatusUserBuckets = new Map();
+const subscriptionSubscribeIpBuckets = new Map();
+const subscriptionSubscribeUserBuckets = new Map();
+
+function pruneSubscriptionBuckets(now) {
+  const maps = [
+    [subscriptionStatusIpBuckets, SUBSCRIPTION_STATUS_IP_WINDOW_MS * 3],
+    [subscriptionStatusUserBuckets, SUBSCRIPTION_STATUS_USER_WINDOW_MS * 3],
+    [subscriptionSubscribeIpBuckets, SUBSCRIPTION_SUBSCRIBE_IP_WINDOW_MS * 3],
+    [subscriptionSubscribeUserBuckets, SUBSCRIPTION_SUBSCRIBE_USER_WINDOW_MS * 3]
+  ];
+  for (const [map, maxAge] of maps) {
+    for (const [key, bucket] of map) {
+      if (!bucket || now - bucket.windowStart > maxAge) map.delete(key);
+    }
+    if (map.size > LIVE_CHAT_SEND_MAX_BUCKETS) {
+      for (const key of map.keys()) {
+        if (map.size <= LIVE_CHAT_SEND_MAX_BUCKETS) break;
+        map.delete(key);
+      }
+    }
+  }
+}
+
+function subscriptionFailure(code, status, request, extra = {}) {
+  const safeCode = LIVE_CHAT_SEND_MESSAGES[code] ? code : "UPSTREAM_ERROR";
+  return json(
+    {
+      ok: false,
+      subscribed: false,
+      available: false,
+      code: safeCode,
+      error: LIVE_CHAT_SEND_MESSAGES[safeCode],
+      ...extra
+    },
+    status,
+    request
+  );
+}
+
+async function readJsonBody(request, maxBytes) {
+  const result = await readLiveChatBody(request, maxBytes);
+  if (!result.ok) return { ok: false, code: result.code };
+  let payload;
+  try {
+    payload = JSON.parse(result.text || "{}");
+  } catch {
+    return { ok: false, code: "INVALID_REQUEST" };
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, code: "INVALID_REQUEST" };
+  }
+  return { ok: true, payload };
+}
+
+async function resolveLiveStreamChannel(videoId, apiKey) {
+  if (!isValidYouTubeSourceId(videoId)) {
+    return { ok: false, code: "INVALID_VIDEO_ID", status: 400 };
+  }
+  let live;
+  try {
+    live = await probeVideoLive(videoId, apiKey);
+  } catch {
+    return { ok: false, code: "UPSTREAM_ERROR", status: 502 };
+  }
+  if (!live || live.isLive !== true) {
+    return { ok: false, code: "NOT_LIVE", status: 409 };
+  }
+  const channelId = typeof live?.channelId === "string" ? live.channelId.trim() : "";
+  if (!channelId) {
+    return { ok: false, code: "UPSTREAM_ERROR", status: 502 };
+  }
+  return { ok: true, channelId, live };
+}
+
+async function getSubscriptionAccessToken(request, env) {
+  const auth = await requireFirebaseUser(request, env);
+  if (!auth.ok) return { ok: false, response: auth.response };
+  const config = await readOAuthConfig(env);
+  if (!config) return { ok: false, response: subscriptionFailure("OAUTH_NOT_CONFIGURED", 503, request) };
+  const db = oauthDb(env);
+  if (!db) return { ok: false, response: subscriptionFailure("OAUTH_UNAVAILABLE", 503, request) };
+  try {
+    const accessToken = await getAccessTokenForUser(auth.uid, env, {
+      config,
+      db,
+      requiredScope: GOOGLE_YOUTUBE_SCOPE,
+      revalidateGrant: true
+    });
+    return { ok: true, uid: auth.uid, accessToken };
+  } catch (e) {
+    const code = mapTokenLifecycleErrorToClientCode(e);
+    if (code === "YOUTUBE_NOT_CONNECTED" || code === "YOUTUBE_SCOPE_REQUIRED" || code === "YOUTUBE_REAUTH_REQUIRED" || code === "OAUTH_CONFIG_ERROR") {
+      return { ok: false, response: subscriptionFailure(code, 409, request) };
+    }
+    return { ok: false, response: subscriptionFailure("OAUTH_UNAVAILABLE", 503, request) };
+  }
+}
+
+async function youtubeSubscriptionRequest(url, accessToken, init = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SUBSCRIPTION_API_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json",
+        ...(init.headers || {})
+      },
+      signal: controller.signal
+    });
+    let data = null;
+    try { data = await response.json(); } catch { data = null; }
+    return { response, data };
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new Error("UPSTREAM_TIMEOUT");
+    throw new Error("UPSTREAM_ERROR");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function mapSubscriptionUpstreamError(status, data) {
+  const reason = data?.error?.errors?.[0]?.reason || data?.error?.status || "";
+  if (status === 401) return { code: "YOUTUBE_REAUTH_REQUIRED", status: 409 };
+  if (status === 403) {
+    if (reason === "quotaExceeded" || reason === "dailyLimitExceeded") return { code: "QUOTA_EXCEEDED", status: 503 };
+    if (reason === "rateLimitExceeded" || reason === "userRateLimitExceeded") return { code: "CHAT_RATE_LIMITED", status: 429 };
+    return { code: "CHAT_FORBIDDEN", status: 403 };
+  }
+  if (status === 404) return { code: "LIVE_CHAT_NOT_FOUND", status: 404 };
+  if (status === 429) return { code: "CHAT_RATE_LIMITED", status: 429 };
+  if (status >= 500) return { code: "UPSTREAM_ERROR", status: 502 };
+  return { code: "UPSTREAM_ERROR", status: 502 };
+}
+
+// -----------------------------------------------------------------------------
+// YouTube rating sync (authenticated, explicit user actions via API only).
+// Part 1: GET /api/youtube/rating?videoId=<id> (read actual rating).
+// -----------------------------------------------------------------------------
+const YOUTUBE_RATING_API_TIMEOUT_MS = 10_000;
+const YOUTUBE_RATING_READ_IP_WINDOW_MS = 60 * 1000;
+const YOUTUBE_RATING_READ_IP_MAX = 60;
+const YOUTUBE_RATING_READ_USER_WINDOW_MS = 60 * 1000;
+const YOUTUBE_RATING_READ_USER_MAX = 45;
+const YOUTUBE_RATING_WRITE_BODY_MAX_BYTES = 1024;
+const YOUTUBE_RATING_WRITE_IP_WINDOW_MS = 60 * 1000;
+const YOUTUBE_RATING_WRITE_IP_MAX = 30;
+const YOUTUBE_RATING_WRITE_USER_WINDOW_MS = 60 * 1000;
+const YOUTUBE_RATING_WRITE_USER_MAX = 20;
+const youtubeRatingReadIpBuckets = new Map();
+const youtubeRatingReadUserBuckets = new Map();
+const youtubeRatingWriteIpBuckets = new Map();
+const youtubeRatingWriteUserBuckets = new Map();
+
+function pruneYoutubeRatingBuckets(now) {
+  for (const [map, maxAge] of [
+    [youtubeRatingReadIpBuckets, YOUTUBE_RATING_READ_IP_WINDOW_MS * 3],
+    [youtubeRatingReadUserBuckets, YOUTUBE_RATING_READ_USER_WINDOW_MS * 3],
+    [youtubeRatingWriteIpBuckets, YOUTUBE_RATING_WRITE_IP_WINDOW_MS * 3],
+    [youtubeRatingWriteUserBuckets, YOUTUBE_RATING_WRITE_USER_WINDOW_MS * 3]
+  ]) {
+    for (const [key, bucket] of map.entries()) {
+      if (!bucket || now - bucket.windowStart > maxAge) map.delete(key);
+    }
+  }
+}
+
+function isValidYoutubeRatingValue(value) {
+  const rating = String(value || "").trim().toLowerCase();
+  return rating === "like" || rating === "dislike" || rating === "none";
+}
+
+function isValidYoutubeRatingVideoId(value) {
+  return /^[A-Za-z0-9_-]{11}$/.test(String(value || "").trim());
+}
+
+const YOUTUBE_RATING_MESSAGES = Object.freeze({
+  METHOD_NOT_ALLOWED: "Method not allowed.",
+  UNSUPPORTED_MEDIA_TYPE: "Expected a JSON request.",
+  BODY_TOO_LARGE: "That request was too large.",
+  INVALID_REQUEST: "That request was not valid.",
+  INVALID_VIDEO_ID: "That video is not valid.",
+  INVALID_RATING: "That rating is not valid.",
+  UNAUTHENTICATED: "Sign in required.",
+  RATE_LIMITED: "You are making requests too quickly. Please wait a moment.",
+  CHAT_RATE_LIMITED: "YouTube is asking for a slower pace. Please wait a moment.",
+  YOUTUBE_NOT_CONNECTED: "Connect your YouTube account to rate videos.",
+  YOUTUBE_SCOPE_REQUIRED: "Reconnect your YouTube account to allow rating videos.",
+  YOUTUBE_REAUTH_REQUIRED: "Reconnect your YouTube account to continue.",
+  MULTIPLE_CHANNELS: "Multiple YouTube channels are available for this Google account. Reconnect using the intended channel before rating videos.",
+  YOUTUBE_IDENTITY_CHANGED: "Your connected YouTube channel changed. Reconnect your YouTube account and try again.",
+  YOUTUBE_IDENTITY_UNVERIFIED: "Could not verify your connected YouTube channel. Reload the page and try again.",
+  OAUTH_NOT_CONFIGURED: "YouTube connection is not available yet.",
+  OAUTH_UNAVAILABLE: "Rating is unavailable right now.",
+  QUOTA_EXCEEDED: "YouTube's daily limit has been reached. Please try again later.",
+  TOKEN_EXCHANGE_FAILED: "Could not reach YouTube right now. Please try again.",
+  UPSTREAM_TIMEOUT: "Could not reach YouTube right now. Please try again.",
+  UPSTREAM_ERROR: "Could not reach YouTube right now. Please try again."
+});
+
+function youtubeRatingFailure(videoId, code, status, request, extra = {}) {
+  const safeVideoId = isValidYoutubeRatingVideoId(videoId) ? String(videoId).trim() : "";
+  const requestedCode = String(code || "");
+  const safeCode = Object.prototype.hasOwnProperty.call(YOUTUBE_RATING_MESSAGES, requestedCode)
+    ? requestedCode
+    : "UPSTREAM_ERROR";
+  return json(
+    {
+      ok: false,
+      available: false,
+      videoId: safeVideoId,
+      rating: "none",
+      source: "youtube",
+      code: safeCode,
+      error: YOUTUBE_RATING_MESSAGES[safeCode],
+      ...extra
+    },
+    status,
+    request
+  );
+}
+
+function mapYoutubeRatingReadUpstreamError(status, data) {
+  const reason = data?.error?.errors?.[0]?.reason || data?.error?.status || "";
+  if (status === 401) return { code: "YOUTUBE_REAUTH_REQUIRED", status: 409 };
+  if (status === 403) {
+    if (reason === "quotaExceeded" || reason === "dailyLimitExceeded") {
+      return { code: "QUOTA_EXCEEDED", status: 503 };
+    }
+    if (reason === "rateLimitExceeded" || reason === "userRateLimitExceeded") {
+      return { code: "CHAT_RATE_LIMITED", status: 429 };
+    }
+    // Ratings can be disabled/forbidden for specific videos/accounts.
+    return { code: "UPSTREAM_ERROR", status: 503 };
+  }
+  if (status === 404) return { code: "UPSTREAM_ERROR", status: 404 };
+  if (status === 429) return { code: "CHAT_RATE_LIMITED", status: 429 };
+  if (status >= 500) return { code: "UPSTREAM_ERROR", status: 502 };
+  return { code: "UPSTREAM_ERROR", status: 502 };
+}
+
+function normalizeYoutubeRatingValue(value) {
+  const rating = String(value || "").trim().toLowerCase();
+  if (rating === "like" || rating === "dislike" || rating === "none") return rating;
+  return "none";
+}
+
+async function youtubeGetRatingRequest(videoId, accessToken) {
+  const endpoint = new URL("https://www.googleapis.com/youtube/v3/videos/getRating");
+  endpoint.searchParams.set("id", videoId);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), YOUTUBE_RATING_API_TIMEOUT_MS);
+  try {
+    const response = await fetch(endpoint.toString(), {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json"
+      },
+      signal: controller.signal
+    });
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+    return { response, data };
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new Error("UPSTREAM_TIMEOUT");
+    throw new Error("UPSTREAM_ERROR");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// GET /api/youtube/rating?videoId=...
+async function handleGetYoutubeRating(request, env) {
+  if (request.method !== "GET") {
+    return youtubeRatingFailure("", "METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  const url = new URL(request.url);
+  const videoId = String(url.searchParams.get("videoId") || "").trim();
+  const ip = clientIp(request);
+  const now = Date.now();
+  pruneYoutubeRatingBuckets(now);
+
+  if (!isValidYoutubeRatingVideoId(videoId)) {
+    return youtubeRatingFailure(videoId, "INVALID_VIDEO_ID", 400, request);
+  }
+
+  if (
+    !fixedWindowAllows(
+      youtubeRatingReadIpBuckets,
+      ip,
+      YOUTUBE_RATING_READ_IP_WINDOW_MS,
+      YOUTUBE_RATING_READ_IP_MAX,
+      now
+    )
+  ) {
+    return youtubeRatingFailure(videoId, "RATE_LIMITED", 429, request);
+  }
+
+  const auth = await requireFirebaseUser(request, env);
+  if (!auth.ok) {
+    return youtubeRatingFailure(videoId, "UNAUTHENTICATED", 401, request);
+  }
+
+  if (
+    !fixedWindowAllows(
+      youtubeRatingReadUserBuckets,
+      auth.uid,
+      YOUTUBE_RATING_READ_USER_WINDOW_MS,
+      YOUTUBE_RATING_READ_USER_MAX,
+      now
+    )
+  ) {
+    return youtubeRatingFailure(videoId, "RATE_LIMITED", 429, request);
+  }
+
+  const config = await readOAuthConfig(env);
+  if (!config) {
+    return youtubeRatingFailure(videoId, "OAUTH_NOT_CONFIGURED", 503, request);
+  }
+
+  const db = oauthDb(env);
+  if (!db) {
+    return youtubeRatingFailure(videoId, "OAUTH_UNAVAILABLE", 503, request);
+  }
+
+  let accessToken;
+  try {
+    accessToken = await getAccessTokenForUser(auth.uid, env, {
+      config,
+      db,
+      requiredScope: GOOGLE_YOUTUBE_SCOPE,
+      revalidateGrant: true
+    });
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message === "GRANT_NOT_FOUND" || message === "INVALIDATED") {
+      return youtubeRatingFailure(videoId, "YOUTUBE_NOT_CONNECTED", 409, request);
+    }
+    if (message === "OAUTH_SCOPE_REQUIRED") {
+      return youtubeRatingFailure(videoId, "YOUTUBE_SCOPE_REQUIRED", 409, request);
+    }
+    if (message === "OAUTH_REAUTH_REQUIRED") {
+      return youtubeRatingFailure(videoId, "YOUTUBE_REAUTH_REQUIRED", 409, request);
+    }
+    if (message === "OAUTH_CONFIG_ERROR") {
+      return youtubeRatingFailure(videoId, "OAUTH_NOT_CONFIGURED", 503, request);
+    }
+    return youtubeRatingFailure(videoId, "TOKEN_EXCHANGE_FAILED", 502, request);
+  }
+
+  let upstream;
+  try {
+    upstream = await youtubeGetRatingRequest(videoId, accessToken);
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message === "UPSTREAM_TIMEOUT") {
+      return youtubeRatingFailure(videoId, "UPSTREAM_TIMEOUT", 504, request);
+    }
+    return youtubeRatingFailure(videoId, "UPSTREAM_ERROR", 502, request);
+  }
+
+  if (!upstream.response.ok) {
+    if (upstream.response.status === 401) {
+      invalidateAccessToken(auth.uid);
+    }
+    const mapped = mapYoutubeRatingReadUpstreamError(upstream.response.status, upstream.data);
+    return youtubeRatingFailure(videoId, mapped.code, mapped.status, request);
+  }
+
+  const item = Array.isArray(upstream.data?.items) ? upstream.data.items[0] : null;
+  if (!item) {
+    return youtubeRatingFailure(videoId, "UPSTREAM_ERROR", 404, request);
+  }
+
+  const rating = normalizeYoutubeRatingValue(item.rating);
+  return json(
+    {
+      ok: true,
+      available: true,
+      videoId,
+      rating,
+      source: "youtube"
+    },
+    200,
+    request
+  );
+}
+
+async function youtubePostRatingRequest(videoId, rating, accessToken) {
+  const endpoint = new URL("https://www.googleapis.com/youtube/v3/videos/rate");
+  endpoint.searchParams.set("id", videoId);
+  endpoint.searchParams.set("rating", rating);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), YOUTUBE_RATING_API_TIMEOUT_MS);
+  try {
+    const response = await fetch(endpoint.toString(), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json"
+      },
+      signal: controller.signal
+    });
+    let data = null;
+    // videos.rate typically returns 204 No Content on success.
+    try {
+      if (response.status !== 204) {
+        data = await response.json();
+      }
+    } catch {
+      data = null;
+    }
+    return { response, data };
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new Error("UPSTREAM_TIMEOUT");
+    throw new Error("UPSTREAM_ERROR");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function mapYoutubeRatingWriteUpstreamError(status, data) {
+  const reason = data?.error?.errors?.[0]?.reason || data?.error?.status || "";
+  if (status === 401) return { code: "YOUTUBE_REAUTH_REQUIRED", status: 409 };
+  if (status === 403) {
+    if (reason === "quotaExceeded" || reason === "dailyLimitExceeded") {
+      return { code: "QUOTA_EXCEEDED", status: 503 };
+    }
+    if (reason === "rateLimitExceeded" || reason === "userRateLimitExceeded") {
+      return { code: "CHAT_RATE_LIMITED", status: 429 };
+    }
+    // Ratings can be disabled/forbidden for specific videos/accounts.
+    return { code: "UPSTREAM_ERROR", status: 503 };
+  }
+  if (status === 404) return { code: "UPSTREAM_ERROR", status: 404 };
+  if (status === 429) return { code: "CHAT_RATE_LIMITED", status: 429 };
+  if (status >= 500) return { code: "UPSTREAM_ERROR", status: 502 };
+  return { code: "UPSTREAM_ERROR", status: 502 };
+}
+
+// POST /api/youtube/rating
+async function handlePostYoutubeRating(request, env) {
+  if (request.method !== "POST") {
+    return youtubeRatingFailure("", "METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  const ip = clientIp(request);
+  const now = Date.now();
+  pruneYoutubeRatingBuckets(now);
+
+  if (
+    !fixedWindowAllows(
+      youtubeRatingWriteIpBuckets,
+      ip,
+      YOUTUBE_RATING_WRITE_IP_WINDOW_MS,
+      YOUTUBE_RATING_WRITE_IP_MAX,
+      now
+    )
+  ) {
+    return youtubeRatingFailure("", "RATE_LIMITED", 429, request);
+  }
+
+  const contentType = String(request.headers.get("Content-Type") || "").trim().toLowerCase();
+  const mediaType = contentType.split(";")[0].trim();
+  if (mediaType !== "application/json") {
+    return youtubeRatingFailure("", "UNSUPPORTED_MEDIA_TYPE", 415, request);
+  }
+
+  const body = await readJsonBody(request, YOUTUBE_RATING_WRITE_BODY_MAX_BYTES);
+  if (!body.ok) {
+    const bodyCode = body.code || "INVALID_REQUEST";
+    const safeBodyCode = Object.prototype.hasOwnProperty.call(YOUTUBE_RATING_MESSAGES, bodyCode)
+      ? bodyCode
+      : "INVALID_REQUEST";
+    const status = safeBodyCode === "BODY_TOO_LARGE" ? 413 : safeBodyCode === "UNSUPPORTED_MEDIA_TYPE" ? 415 : 400;
+    return youtubeRatingFailure("", safeBodyCode, status, request);
+  }
+
+  const payload = body.payload || {};
+  const videoId = String(payload.videoId || "").trim();
+  const rating = String(payload.rating || "").trim().toLowerCase();
+
+  if (!isValidYoutubeRatingVideoId(videoId)) {
+    return youtubeRatingFailure(videoId, "INVALID_VIDEO_ID", 400, request);
+  }
+
+  if (!isValidYoutubeRatingValue(rating)) {
+    return youtubeRatingFailure(videoId, "INVALID_RATING", 400, request);
+  }
+
+  const auth = await requireFirebaseUser(request, env);
+  if (!auth.ok) {
+    return youtubeRatingFailure(videoId, "UNAUTHENTICATED", 401, request);
+  }
+
+  if (
+    !fixedWindowAllows(
+      youtubeRatingWriteUserBuckets,
+      auth.uid,
+      YOUTUBE_RATING_WRITE_USER_WINDOW_MS,
+      YOUTUBE_RATING_WRITE_USER_MAX,
+      now
+    )
+  ) {
+    return youtubeRatingFailure(videoId, "RATE_LIMITED", 429, request);
+  }
+
+  const expectedChannelId = String(payload.expectedChannelId || "").trim();
+  const expectedIdentityError = youtubeExpectedIdentityCode(payload, auth.uid);
+  if (expectedIdentityError) {
+    return youtubeRatingFailure(videoId, expectedIdentityError, 409, request);
+  }
+
+  const config = await readOAuthConfig(env);
+  if (!config) {
+    return youtubeRatingFailure(videoId, "OAUTH_NOT_CONFIGURED", 503, request);
+  }
+
+  const db = oauthDb(env);
+  if (!db) {
+    return youtubeRatingFailure(videoId, "OAUTH_UNAVAILABLE", 503, request);
+  }
+
+  let accessToken;
+  try {
+    accessToken = await getAccessTokenForUser(auth.uid, env, {
+      config,
+      db,
+      requiredScope: GOOGLE_YOUTUBE_SCOPE,
+      revalidateGrant: true
+    });
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message === "GRANT_NOT_FOUND" || message === "INVALIDATED") {
+      return youtubeRatingFailure(videoId, "YOUTUBE_NOT_CONNECTED", 409, request);
+    }
+    if (message === "OAUTH_SCOPE_REQUIRED") {
+      return youtubeRatingFailure(videoId, "YOUTUBE_SCOPE_REQUIRED", 409, request);
+    }
+    if (message === "OAUTH_REAUTH_REQUIRED") {
+      return youtubeRatingFailure(videoId, "YOUTUBE_REAUTH_REQUIRED", 409, request);
+    }
+    if (message === "OAUTH_CONFIG_ERROR") {
+      return youtubeRatingFailure(videoId, "OAUTH_NOT_CONFIGURED", 503, request);
+    }
+    return youtubeRatingFailure(videoId, "TOKEN_EXCHANGE_FAILED", 502, request);
+  }
+
+  let upstream;
+  try {
+    // Re-verify the acting channel against the current grant immediately before
+    // the write. The client-supplied expected channel must still match.
+    const identity = await verifyYoutubeActingChannel(accessToken, expectedChannelId);
+    if (!identity.ok) {
+      if (identity.code === "YOUTUBE_REAUTH_REQUIRED") {
+        invalidateAccessToken(auth.uid);
+      }
+      return youtubeRatingFailure(videoId, identity.code, identity.status, request);
+    }
+    upstream = await youtubePostRatingRequest(videoId, rating, accessToken);
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message === "UPSTREAM_TIMEOUT") {
+      return youtubeRatingFailure(videoId, "UPSTREAM_TIMEOUT", 504, request);
+    }
+    return youtubeRatingFailure(videoId, "UPSTREAM_ERROR", 502, request);
+  }
+
+  if (!upstream.response.ok) {
+    if (upstream.response.status === 401) {
+      invalidateAccessToken(auth.uid);
+    }
+    const mapped = mapYoutubeRatingWriteUpstreamError(upstream.response.status, upstream.data);
+    return youtubeRatingFailure(videoId, mapped.code, mapped.status, request);
+  }
+
+  return json(
+    {
+      ok: true,
+      applied: true,
+      videoId,
+      rating,
+      source: "youtube"
+    },
+    200,
+    request
+  );
+}
+
+// -----------------------------------------------------------------------------
+// YouTube subscription status (authenticated, read-only, general).
+// GET /api/youtube/subscription-status?channelId=...
+// Checks whether the connected YouTube account is subscribed to a channel.
+// Read-only: never subscribes/unsubscribes, never modifies local/MyTube state.
+// Separate from live-chat subscription endpoints.
+// -----------------------------------------------------------------------------
+const YOUTUBE_SUBSCRIPTION_STATUS_TIMEOUT_MS = 10_000;
+const YOUTUBE_SUBSCRIPTION_STATUS_CHANNEL_ID_MAX_LEN = 128;
+const YOUTUBE_SUBSCRIPTION_STATUS_IP_WINDOW_MS = 60 * 1000;
+const YOUTUBE_SUBSCRIPTION_STATUS_IP_MAX = 30;
+const YOUTUBE_SUBSCRIPTION_STATUS_USER_WINDOW_MS = 60 * 1000;
+const YOUTUBE_SUBSCRIPTION_STATUS_USER_MAX = 20;
+const youtubeSubscriptionStatusIpBuckets = new Map();
+const youtubeSubscriptionStatusUserBuckets = new Map();
+
+function pruneYoutubeSubscriptionStatusBuckets(now) {
+  for (const [map, maxAge] of [
+    [youtubeSubscriptionStatusIpBuckets, YOUTUBE_SUBSCRIPTION_STATUS_IP_WINDOW_MS * 3],
+    [youtubeSubscriptionStatusUserBuckets, YOUTUBE_SUBSCRIPTION_STATUS_USER_WINDOW_MS * 3]
+  ]) {
+    for (const [key, bucket] of map.entries()) {
+      if (!bucket || now - bucket.windowStart > maxAge) map.delete(key);
+    }
+  }
+}
+
+function isValidYoutubeChannelId(value) {
+  const channelId = String(value || "").trim();
+  if (!channelId) return false;
+  if (channelId.length > YOUTUBE_SUBSCRIPTION_STATUS_CHANNEL_ID_MAX_LEN) return false;
+  // Conservative safe charset for YouTube channel IDs (e.g. UC...).
+  return /^[A-Za-z0-9_-]+$/.test(channelId);
+}
+
+// Writes must name the Firebase user and acting channel the client displayed.
+// The token still supplies the authoritative uid; this is an additional check
+// that the client is not acting on a stale/other account view.
+function youtubeExpectedIdentityCode(payload, authUid) {
+  const expectedUid = String(payload?.expectedUid || "").trim();
+  const expectedChannelId = String(payload?.expectedChannelId || "").trim();
+  if (!expectedUid || expectedUid !== String(authUid || "")) {
+    return "YOUTUBE_IDENTITY_UNVERIFIED";
+  }
+  if (!isValidYoutubeChannelId(expectedChannelId)) {
+    return "YOUTUBE_IDENTITY_UNVERIFIED";
+  }
+  return "";
+}
+
+const YOUTUBE_SUBSCRIPTION_STATUS_MESSAGES = Object.freeze({
+  METHOD_NOT_ALLOWED: "Method not allowed.",
+  INVALID_REQUEST: "That request was not valid.",
+  INVALID_CHANNEL_ID: "That channel is not valid.",
+  UNAUTHENTICATED: "Sign in required.",
+  RATE_LIMITED: "You are making requests too quickly. Please wait a moment.",
+  YOUTUBE_NOT_CONNECTED: "Connect your YouTube account to check subscription status.",
+  YOUTUBE_SCOPE_REQUIRED: "Reconnect your YouTube account to allow reading subscriptions.",
+  YOUTUBE_REAUTH_REQUIRED: "Reconnect your YouTube account to continue.",
+  OAUTH_NOT_CONFIGURED: "YouTube connection is not available yet.",
+  OAUTH_UNAVAILABLE: "Subscription status is unavailable right now.",
+  QUOTA_EXCEEDED: "YouTube's daily limit has been reached. Please try again later.",
+  TOKEN_EXCHANGE_FAILED: "Could not reach YouTube right now. Please try again.",
+  UPSTREAM_TIMEOUT: "Could not reach YouTube right now. Please try again.",
+  UPSTREAM_ERROR: "Could not reach YouTube right now. Please try again.",
+  SUBSCRIPTIONS_FORBIDDEN: "YouTube subscriptions could not be accessed for this account.",
+  SUBSCRIPTIONS_NOT_FOUND: "YouTube subscriptions could not be found for this account."
+});
+
+function youtubeSubscriptionStatusFailure(channelId, code, status, request, extra = {}) {
+  const requestedCode = String(code || "");
+  const safeCode = Object.prototype.hasOwnProperty.call(YOUTUBE_SUBSCRIPTION_STATUS_MESSAGES, requestedCode)
+    ? requestedCode
+    : "UPSTREAM_ERROR";
+  const safeChannelId = isValidYoutubeChannelId(channelId) ? String(channelId).trim() : "";
+  return json(
+    {
+      ok: false,
+      available: false,
+      subscribed: false,
+      channelId: safeChannelId,
+      source: "youtube",
+      code: safeCode,
+      error: YOUTUBE_SUBSCRIPTION_STATUS_MESSAGES[safeCode],
+      ...extra
+    },
+    status,
+    request
+  );
+}
+
+function mapYoutubeSubscriptionStatusUpstreamError(status, data) {
+  const reason = data?.error?.errors?.[0]?.reason || data?.error?.status || "";
+  if (status === 401) return { code: "YOUTUBE_REAUTH_REQUIRED", status: 409 };
+  if (status === 400) return { code: "INVALID_REQUEST", status: 400 };
+  if (status === 403) {
+    if (reason === "quotaExceeded" || reason === "dailyLimitExceeded") {
+      return { code: "QUOTA_EXCEEDED", status: 503 };
+    }
+    if (reason === "rateLimitExceeded" || reason === "userRateLimitExceeded") {
+      return { code: "RATE_LIMITED", status: 429 };
+    }
+    if (reason === "accountClosed" || reason === "accountSuspended" || reason === "subscriptionForbidden") {
+      return { code: "SUBSCRIPTIONS_FORBIDDEN", status: 403 };
+    }
+    return { code: "UPSTREAM_ERROR", status: 502 };
+  }
+  if (status === 404) {
+    if (reason === "subscriberNotFound") {
+      return { code: "SUBSCRIPTIONS_NOT_FOUND", status: 404 };
+    }
+    return { code: "UPSTREAM_ERROR", status: 404 };
+  }
+  if (status === 429) return { code: "RATE_LIMITED", status: 429 };
+  if (status >= 500) return { code: "UPSTREAM_ERROR", status: 502 };
+  return { code: "UPSTREAM_ERROR", status: 502 };
+}
+
+async function youtubeGetSubscriptionStatusRequest(accessToken, channelId) {
+  const endpoint = new URL("https://www.googleapis.com/youtube/v3/subscriptions");
+  endpoint.searchParams.set("part", "id");
+  endpoint.searchParams.set("mine", "true");
+  endpoint.searchParams.set("forChannelId", channelId);
+  endpoint.searchParams.set("maxResults", "1");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), YOUTUBE_SUBSCRIPTION_STATUS_TIMEOUT_MS);
+  try {
+    const response = await fetch(endpoint.toString(), {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json"
+      },
+      signal: controller.signal
+    });
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+    return { response, data };
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new Error("UPSTREAM_TIMEOUT");
+    throw new Error("UPSTREAM_ERROR");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function handleGetYoutubeSubscriptionStatus(request, env) {
+  if (request.method !== "GET") {
+    return youtubeSubscriptionStatusFailure("", "METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  const url = new URL(request.url);
+  const rawChannelId = url.searchParams.has("channelId") ? url.searchParams.get("channelId") : "";
+  const channelId = String(rawChannelId || "").trim();
+
+  const ip = clientIp(request);
+  const now = Date.now();
+  pruneYoutubeSubscriptionStatusBuckets(now);
+
+  if (!isValidYoutubeChannelId(channelId)) {
+    return youtubeSubscriptionStatusFailure(channelId, "INVALID_CHANNEL_ID", 400, request);
+  }
+
+  if (
+    !fixedWindowAllows(
+      youtubeSubscriptionStatusIpBuckets,
+      ip,
+      YOUTUBE_SUBSCRIPTION_STATUS_IP_WINDOW_MS,
+      YOUTUBE_SUBSCRIPTION_STATUS_IP_MAX,
+      now
+    )
+  ) {
+    return youtubeSubscriptionStatusFailure(channelId, "RATE_LIMITED", 429, request);
+  }
+
+  const auth = await requireFirebaseUser(request, env);
+  if (!auth.ok) {
+    return auth.response;
+  }
+
+  if (
+    !fixedWindowAllows(
+      youtubeSubscriptionStatusUserBuckets,
+      auth.uid,
+      YOUTUBE_SUBSCRIPTION_STATUS_USER_WINDOW_MS,
+      YOUTUBE_SUBSCRIPTION_STATUS_USER_MAX,
+      now
+    )
+  ) {
+    return youtubeSubscriptionStatusFailure(channelId, "RATE_LIMITED", 429, request);
+  }
+
+  const config = await readOAuthConfig(env);
+  if (!config) {
+    return youtubeSubscriptionStatusFailure(channelId, "OAUTH_NOT_CONFIGURED", 503, request);
+  }
+
+  const db = oauthDb(env);
+  if (!db) {
+    return youtubeSubscriptionStatusFailure(channelId, "OAUTH_UNAVAILABLE", 503, request);
+  }
+
+  let accessToken;
+  try {
+    accessToken = await getAccessTokenForUser(auth.uid, env, {
+      config,
+      db,
+      requiredScope: GOOGLE_YOUTUBE_SCOPE,
+      revalidateGrant: true
+    });
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message === "GRANT_NOT_FOUND" || message === "INVALIDATED") {
+      return youtubeSubscriptionStatusFailure(channelId, "YOUTUBE_NOT_CONNECTED", 409, request);
+    }
+    if (message === "OAUTH_SCOPE_REQUIRED") {
+      return youtubeSubscriptionStatusFailure(channelId, "YOUTUBE_SCOPE_REQUIRED", 409, request);
+    }
+    if (message === "OAUTH_REAUTH_REQUIRED") {
+      return youtubeSubscriptionStatusFailure(channelId, "YOUTUBE_REAUTH_REQUIRED", 409, request);
+    }
+    if (message === "OAUTH_CONFIG_ERROR") {
+      return youtubeSubscriptionStatusFailure(channelId, "OAUTH_NOT_CONFIGURED", 503, request);
+    }
+    return youtubeSubscriptionStatusFailure(channelId, "TOKEN_EXCHANGE_FAILED", 502, request);
+  }
+
+  let upstream;
+  try {
+    upstream = await youtubeGetSubscriptionStatusRequest(accessToken, channelId);
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message === "UPSTREAM_TIMEOUT") {
+      return youtubeSubscriptionStatusFailure(channelId, "UPSTREAM_TIMEOUT", 504, request);
+    }
+    return youtubeSubscriptionStatusFailure(channelId, "UPSTREAM_ERROR", 502, request);
+  }
+
+  if (!upstream.response.ok) {
+    if (upstream.response.status === 401) {
+      invalidateAccessToken(auth.uid);
+    }
+    const mapped = mapYoutubeSubscriptionStatusUpstreamError(upstream.response.status, upstream.data);
+    return youtubeSubscriptionStatusFailure(channelId, mapped.code, mapped.status, request);
+  }
+
+  const data = upstream.data && typeof upstream.data === "object" ? upstream.data : {};
+  const items = Array.isArray(data.items) ? data.items : [];
+  return json(
+    {
+      ok: true,
+      available: true,
+      subscribed: items.length > 0,
+      channelId,
+      source: "youtube"
+    },
+    200,
+    request
+  );
+}
+
+// -----------------------------------------------------------------------------
+// YouTube connected account identity (authenticated, read-only).
+// GET /api/youtube/account
+// Resolves the channel(s) owned by the authenticated user's existing OAuth
+// grant via channels.list?mine=true. Returns only id/title/thumbnail. Never
+// selects an account or channel silently. Never stores identity in D1.
+// Separate from live-chat routes and rate limits.
+// -----------------------------------------------------------------------------
+const YOUTUBE_ACCOUNT_TIMEOUT_MS = 10_000;
+const YOUTUBE_ACCOUNT_IP_WINDOW_MS = 60 * 1000;
+const YOUTUBE_ACCOUNT_IP_MAX = 30;
+const YOUTUBE_ACCOUNT_USER_WINDOW_MS = 60 * 1000;
+const YOUTUBE_ACCOUNT_USER_MAX = 20;
+const youtubeAccountIpBuckets = new Map();
+const youtubeAccountUserBuckets = new Map();
+
+function pruneYoutubeAccountBuckets(now) {
+  for (const [map, maxAge] of [
+    [youtubeAccountIpBuckets, YOUTUBE_ACCOUNT_IP_WINDOW_MS * 3],
+    [youtubeAccountUserBuckets, YOUTUBE_ACCOUNT_USER_WINDOW_MS * 3]
+  ]) {
+    for (const [key, bucket] of map.entries()) {
+      if (!bucket || now - bucket.windowStart > maxAge) map.delete(key);
+    }
+  }
+}
+
+const YOUTUBE_ACCOUNT_MESSAGES = Object.freeze({
+  METHOD_NOT_ALLOWED: "Method not allowed.",
+  UNAUTHENTICATED: "Sign in required.",
+  RATE_LIMITED: "You are making requests too quickly. Please wait a moment.",
+  YOUTUBE_NOT_CONNECTED: "Connect your YouTube account to identify it.",
+  YOUTUBE_SCOPE_REQUIRED: "Reconnect your YouTube account to allow reading its identity.",
+  YOUTUBE_REAUTH_REQUIRED: "Reconnect your YouTube account to continue.",
+  OAUTH_NOT_CONFIGURED: "YouTube connection is not available yet.",
+  OAUTH_UNAVAILABLE: "YouTube account identity is unavailable right now.",
+  QUOTA_EXCEEDED: "YouTube's daily limit has been reached. Please try again later.",
+  TOKEN_EXCHANGE_FAILED: "Could not reach YouTube right now. Please try again.",
+  UPSTREAM_TIMEOUT: "Could not reach YouTube right now. Please try again.",
+  UPSTREAM_ERROR: "Could not reach YouTube right now. Please try again."
+});
+
+function youtubeAccountFailure(code, status, request, extra = {}) {
+  const requestedCode = String(code || "");
+  const safeCode = Object.prototype.hasOwnProperty.call(YOUTUBE_ACCOUNT_MESSAGES, requestedCode)
+    ? requestedCode
+    : "UPSTREAM_ERROR";
+  // `connected` is only known for grant-state errors. Quota, timeout, rate-limit
+  // and upstream failures leave the connection state unknown, so they must not
+  // claim the account is disconnected.
+  const connected =
+    safeCode === "YOUTUBE_NOT_CONNECTED"
+      ? false
+      : (safeCode === "YOUTUBE_SCOPE_REQUIRED" || safeCode === "YOUTUBE_REAUTH_REQUIRED")
+        ? true
+        : null;
+  return json(
+    {
+      ok: false,
+      connected,
+      channel: null,
+      channels: [],
+      multiple: false,
+      source: "youtube",
+      code: safeCode,
+      error: YOUTUBE_ACCOUNT_MESSAGES[safeCode],
+      ...extra
+    },
+    status,
+    request
+  );
+}
+
+function youtubeAccountNoChannel(request) {
+  return json(
+    {
+      ok: true,
+      connected: true,
+      channel: null,
+      channels: [],
+      multiple: false,
+      source: "youtube",
+      code: "NO_YOUTUBE_CHANNEL",
+      error: "This Google account has no YouTube channel."
+    },
+    200,
+    request
+  );
+}
+
+function mapYoutubeAccountUpstreamError(status, data) {
+  const reason = data?.error?.errors?.[0]?.reason || data?.error?.status || "";
+  if (status === 401) return { code: "YOUTUBE_REAUTH_REQUIRED", status: 409 };
+  if (status === 403) {
+    if (reason === "quotaExceeded" || reason === "dailyLimitExceeded") {
+      return { code: "QUOTA_EXCEEDED", status: 503 };
+    }
+    if (reason === "rateLimitExceeded" || reason === "userRateLimitExceeded") {
+      return { code: "RATE_LIMITED", status: 429 };
+    }
+    return { code: "UPSTREAM_ERROR", status: 502 };
+  }
+  if (status === 429) return { code: "RATE_LIMITED", status: 429 };
+  if (status >= 500) return { code: "UPSTREAM_ERROR", status: 502 };
+  return { code: "UPSTREAM_ERROR", status: 502 };
+}
+
+function normalizeYoutubeAccountChannel(item) {
+  if (!item || typeof item !== "object") return null;
+  const id = String(item.id || "").trim();
+  if (!isValidYoutubeChannelId(id)) return null;
+  const snippet = item.snippet && typeof item.snippet === "object" ? item.snippet : {};
+  const thumbnails = snippet.thumbnails && typeof snippet.thumbnails === "object" ? snippet.thumbnails : {};
+  const thumb =
+    (thumbnails.medium && typeof thumbnails.medium.url === "string" && thumbnails.medium.url) ||
+    (thumbnails.default && typeof thumbnails.default.url === "string" && thumbnails.default.url) ||
+    (thumbnails.high && typeof thumbnails.high.url === "string" && thumbnails.high.url) ||
+    "";
+  return {
+    id,
+    title: typeof snippet.title === "string" ? snippet.title : "",
+    thumbnail: String(thumb || "")
+  };
+}
+
+async function youtubeGetAccountRequest(accessToken) {
+  const endpoint = new URL("https://www.googleapis.com/youtube/v3/channels");
+  endpoint.searchParams.set("part", "snippet");
+  endpoint.searchParams.set("mine", "true");
+  // Keep the response to the identity fields this endpoint is allowed to expose.
+  endpoint.searchParams.set("fields", "items(id,snippet(title,thumbnails))");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), YOUTUBE_ACCOUNT_TIMEOUT_MS);
+  try {
+    const response = await fetch(endpoint.toString(), {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json"
+      },
+      signal: controller.signal
+    });
+    let data = null;
+    let parseError = false;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+      parseError = true;
+    }
+    return { response, data, parseError };
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new Error("UPSTREAM_TIMEOUT");
+    throw new Error("UPSTREAM_ERROR");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Re-verify the acting channel against the current grant immediately before a
+// write. This is deliberately separate from the frontend gate: a stale client
+// must not be able to mutate a different channel after an account switch.
+async function verifyYoutubeActingChannel(accessToken, expectedChannelId) {
+  let upstream;
+  try {
+    upstream = await youtubeGetAccountRequest(accessToken);
+  } catch (error) {
+    const message = String(error?.message || "");
+    return message === "UPSTREAM_TIMEOUT"
+      ? { ok: false, code: "UPSTREAM_TIMEOUT", status: 504 }
+      : { ok: false, code: "UPSTREAM_ERROR", status: 502 };
+  }
+
+  if (!upstream.response.ok) {
+    if (upstream.response.status === 404) {
+      return { ok: false, code: "YOUTUBE_NOT_CONNECTED", status: 409 };
+    }
+    const mapped = mapYoutubeAccountUpstreamError(upstream.response.status, upstream.data);
+    return { ok: false, code: mapped.code, status: mapped.status };
+  }
+
+  if (
+    upstream.parseError
+    || !upstream.data
+    || typeof upstream.data !== "object"
+    || !Array.isArray(upstream.data.items)
+  ) {
+    return { ok: false, code: "UPSTREAM_ERROR", status: 502 };
+  }
+
+  const channels = [];
+  for (const item of upstream.data.items) {
+    const normalized = normalizeYoutubeAccountChannel(item);
+    if (normalized) channels.push(normalized);
+  }
+
+  if (channels.length === 0) {
+    return { ok: false, code: "YOUTUBE_NOT_CONNECTED", status: 409 };
+  }
+  if (channels.length > 1) {
+    return { ok: false, code: "MULTIPLE_CHANNELS", status: 409 };
+  }
+  if (String(channels[0].id) !== String(expectedChannelId || "")) {
+    return { ok: false, code: "YOUTUBE_IDENTITY_CHANGED", status: 409 };
+  }
+  return { ok: true, channelId: channels[0].id };
+}
+
+async function handleGetYoutubeAccount(request, env) {
+  const ip = clientIp(request);
+  const now = Date.now();
+  pruneYoutubeAccountBuckets(now);
+
+  if (
+    !fixedWindowAllows(
+      youtubeAccountIpBuckets,
+      ip,
+      YOUTUBE_ACCOUNT_IP_WINDOW_MS,
+      YOUTUBE_ACCOUNT_IP_MAX,
+      now
+    )
+  ) {
+    return youtubeAccountFailure("RATE_LIMITED", 429, request);
+  }
+
+  const auth = await requireFirebaseUser(request, env);
+  if (!auth.ok) {
+    return auth.response;
+  }
+
+  if (
+    !fixedWindowAllows(
+      youtubeAccountUserBuckets,
+      auth.uid,
+      YOUTUBE_ACCOUNT_USER_WINDOW_MS,
+      YOUTUBE_ACCOUNT_USER_MAX,
+      now
+    )
+  ) {
+    return youtubeAccountFailure("RATE_LIMITED", 429, request);
+  }
+
+  const config = await readOAuthConfig(env);
+  if (!config) {
+    return youtubeAccountFailure("OAUTH_NOT_CONFIGURED", 503, request);
+  }
+
+  const db = oauthDb(env);
+  if (!db) {
+    return youtubeAccountFailure("OAUTH_UNAVAILABLE", 503, request);
+  }
+
+  let accessToken;
+  try {
+    accessToken = await getAccessTokenForUser(auth.uid, env, {
+      config,
+      db,
+      requiredScope: GOOGLE_YOUTUBE_SCOPE,
+      revalidateGrant: true
+    });
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message === "GRANT_NOT_FOUND" || message === "INVALIDATED") {
+      return youtubeAccountFailure("YOUTUBE_NOT_CONNECTED", 409, request);
+    }
+    if (message === "OAUTH_SCOPE_REQUIRED") {
+      return youtubeAccountFailure("YOUTUBE_SCOPE_REQUIRED", 409, request);
+    }
+    if (message === "OAUTH_REAUTH_REQUIRED" || message === "INVALID_GRANT") {
+      return youtubeAccountFailure("YOUTUBE_REAUTH_REQUIRED", 409, request);
+    }
+    if (message === "OAUTH_CONFIG_ERROR" || message === "INVALID_CLIENT") {
+      return youtubeAccountFailure("OAUTH_NOT_CONFIGURED", 503, request);
+    }
+    return youtubeAccountFailure("TOKEN_EXCHANGE_FAILED", 502, request);
+  }
+
+  let upstream;
+  try {
+    upstream = await youtubeGetAccountRequest(accessToken);
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message === "UPSTREAM_TIMEOUT") {
+      return youtubeAccountFailure("UPSTREAM_TIMEOUT", 504, request);
+    }
+    return youtubeAccountFailure("UPSTREAM_ERROR", 502, request);
+  }
+
+  if (!upstream.response.ok) {
+    if (upstream.response.status === 401) {
+      invalidateAccessToken(auth.uid);
+    }
+    // Some Google accounts with no YouTube channel answer 404 instead of an
+    // empty items array. Treat both as the same truthful "no channel" state.
+    if (upstream.response.status === 404) {
+      return youtubeAccountNoChannel(request);
+    }
+    const mapped = mapYoutubeAccountUpstreamError(upstream.response.status, upstream.data);
+    return youtubeAccountFailure(mapped.code, mapped.status, request);
+  }
+
+  // A successful channels.list response always carries an items array. A
+  // malformed/truncated 200 is an upstream failure, not proof of no channel.
+  if (
+    upstream.parseError
+    || !upstream.data
+    || typeof upstream.data !== "object"
+    || !Array.isArray(upstream.data.items)
+  ) {
+    return youtubeAccountFailure("UPSTREAM_ERROR", 502, request);
+  }
+
+  const rawItems = upstream.data.items;
+  const channels = [];
+  for (const item of rawItems) {
+    const normalized = normalizeYoutubeAccountChannel(item);
+    if (normalized) channels.push(normalized);
+  }
+
+  if (channels.length === 0) {
+    return youtubeAccountNoChannel(request);
+  }
+
+  if (channels.length > 1) {
+    return json(
+      {
+        ok: true,
+        connected: true,
+        channel: null,
+        channels,
+        multiple: true,
+        source: "youtube",
+        code: "MULTIPLE_CHANNELS",
+        error: "Multiple YouTube channels are available for this account. Reconnect using the intended channel before using YouTube actions."
+      },
+      200,
+      request
+    );
+  }
+
+  return json(
+    {
+      ok: true,
+      connected: true,
+      channel: channels[0],
+      channels,
+      multiple: false,
+      source: "youtube"
+    },
+    200,
+    request
+  );
+}
+
+// -----------------------------------------------------------------------------
+// YouTube subscription subscribe (authenticated, explicit user action).
+// POST /api/youtube/subscribe { channelId }
+// Subscribes the connected YouTube account to a channel via subscriptions.insert.
+// No automatic retries. No auto-subscribe. Never called during implementation.
+// -----------------------------------------------------------------------------
+const YOUTUBE_SUBSCRIBE_TIMEOUT_MS = 10_000;
+const YOUTUBE_SUBSCRIBE_BODY_MAX_BYTES = 1024;
+const YOUTUBE_SUBSCRIBE_IP_WINDOW_MS = 60 * 1000;
+const YOUTUBE_SUBSCRIBE_IP_MAX = 10;
+const YOUTUBE_SUBSCRIBE_USER_WINDOW_MS = 60 * 1000;
+const YOUTUBE_SUBSCRIBE_USER_MAX = 6;
+const youtubeSubscribeIpBuckets = new Map();
+const youtubeSubscribeUserBuckets = new Map();
+
+function pruneYoutubeSubscribeBuckets(now) {
+  for (const [map, maxAge] of [
+    [youtubeSubscribeIpBuckets, YOUTUBE_SUBSCRIBE_IP_WINDOW_MS * 3],
+    [youtubeSubscribeUserBuckets, YOUTUBE_SUBSCRIBE_USER_WINDOW_MS * 3]
+  ]) {
+    for (const [key, bucket] of map.entries()) {
+      if (!bucket || now - bucket.windowStart > maxAge) map.delete(key);
+    }
+  }
+}
+
+const YOUTUBE_SUBSCRIBE_MESSAGES = Object.freeze({
+  METHOD_NOT_ALLOWED: "Method not allowed.",
+  UNSUPPORTED_MEDIA_TYPE: "Expected a JSON request.",
+  BODY_TOO_LARGE: "That request was too large.",
+  INVALID_REQUEST: "That request was not valid.",
+  INVALID_CHANNEL_ID: "That channel is not valid.",
+  UNAUTHENTICATED: "Sign in required.",
+  RATE_LIMITED: "You are making requests too quickly. Please wait a moment.",
+  YOUTUBE_NOT_CONNECTED: "Connect your YouTube account to subscribe.",
+  YOUTUBE_SCOPE_REQUIRED: "Reconnect your YouTube account to allow subscriptions.",
+  YOUTUBE_REAUTH_REQUIRED: "Reconnect your YouTube account to continue.",
+  MULTIPLE_CHANNELS: "Multiple YouTube channels are available for this Google account. Reconnect using the intended channel before managing subscriptions.",
+  YOUTUBE_IDENTITY_CHANGED: "Your connected YouTube channel changed. Reconnect your YouTube account and try again.",
+  YOUTUBE_IDENTITY_UNVERIFIED: "Could not verify your connected YouTube channel. Reload the page and try again.",
+  OAUTH_NOT_CONFIGURED: "YouTube connection is not available yet.",
+  OAUTH_UNAVAILABLE: "Subscription is unavailable right now.",
+  QUOTA_EXCEEDED: "YouTube's daily limit has been reached. Please try again later.",
+  TOKEN_EXCHANGE_FAILED: "Could not reach YouTube right now. Please try again.",
+  UPSTREAM_TIMEOUT: "Could not reach YouTube right now. Please try again.",
+  UPSTREAM_ERROR: "Could not reach YouTube right now. Please try again.",
+  SUBSCRIPTIONS_FORBIDDEN: "YouTube could not complete the subscription for this account.",
+  SUBSCRIPTIONS_NOT_FOUND: "That channel could not be found."
+});
+
+function youtubeSubscribeFailure(channelId, code, status, request, extra = {}) {
+  const requestedCode = String(code || "");
+  const safeCode = Object.prototype.hasOwnProperty.call(YOUTUBE_SUBSCRIBE_MESSAGES, requestedCode)
+    ? requestedCode
+    : "UPSTREAM_ERROR";
+  const safeChannelId = isValidYoutubeChannelId(channelId) ? String(channelId).trim() : "";
+  return json(
+    {
+      ok: false,
+      available: false,
+      subscribed: false,
+      channelId: safeChannelId,
+      source: "youtube",
+      code: safeCode,
+      error: YOUTUBE_SUBSCRIBE_MESSAGES[safeCode],
+      ...extra
+    },
+    status,
+    request
+  );
+}
+
+function mapYoutubeSubscribeUpstreamError(status, data) {
+  const reason = data?.error?.errors?.[0]?.reason || data?.error?.status || "";
+  if (status === 401) return { code: "YOUTUBE_REAUTH_REQUIRED", status: 409 };
+  if (status === 400) {
+    if (reason === "subscriptionDuplicate") return { code: "ALREADY_SUBSCRIBED", status: 200 };
+    if (reason === "publisherNotFound" || reason === "subscriberNotFound") {
+      return { code: "SUBSCRIPTIONS_NOT_FOUND", status: 404 };
+    }
+    if (reason === "subscriptionForbidden" || reason === "publisherRequired") {
+      return { code: "SUBSCRIPTIONS_FORBIDDEN", status: 403 };
+    }
+    return { code: "INVALID_REQUEST", status: 400 };
+  }
+  if (status === 403) {
+    if (reason === "quotaExceeded" || reason === "dailyLimitExceeded") {
+      return { code: "QUOTA_EXCEEDED", status: 503 };
+    }
+    if (reason === "rateLimitExceeded" || reason === "userRateLimitExceeded") {
+      return { code: "RATE_LIMITED", status: 429 };
+    }
+    if (reason === "subscriptionForbidden" || reason === "accountClosed" || reason === "accountSuspended") {
+      return { code: "SUBSCRIPTIONS_FORBIDDEN", status: 403 };
+    }
+    return { code: "UPSTREAM_ERROR", status: 502 };
+  }
+  if (status === 404) {
+    if (reason === "publisherNotFound" || reason === "subscriberNotFound") {
+      return { code: "SUBSCRIPTIONS_NOT_FOUND", status: 404 };
+    }
+    return { code: "UPSTREAM_ERROR", status: 404 };
+  }
+  if (status === 429) return { code: "RATE_LIMITED", status: 429 };
+  if (status >= 500) return { code: "UPSTREAM_ERROR", status: 502 };
+  return { code: "UPSTREAM_ERROR", status: 502 };
+}
+
+async function youtubeSubscribeInsertRequest(accessToken, channelId) {
+  const endpoint = new URL("https://www.googleapis.com/youtube/v3/subscriptions");
+  endpoint.searchParams.set("part", "snippet");
+  const body = JSON.stringify({
+    snippet: {
+      resourceId: {
+        kind: "youtube#channel",
+        channelId
+      }
+    }
+  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), YOUTUBE_SUBSCRIBE_TIMEOUT_MS);
+  try {
+    const response = await fetch(endpoint.toString(), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      },
+      body,
+      signal: controller.signal
+    });
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+    return { response, data };
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new Error("UPSTREAM_TIMEOUT");
+    throw new Error("UPSTREAM_ERROR");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function handlePostYoutubeSubscribe(request, env) {
+  if (request.method !== "POST") {
+    return youtubeSubscribeFailure("", "METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  const ip = clientIp(request);
+  const now = Date.now();
+  pruneYoutubeSubscribeBuckets(now);
+
+  if (
+    !fixedWindowAllows(
+      youtubeSubscribeIpBuckets,
+      ip,
+      YOUTUBE_SUBSCRIBE_IP_WINDOW_MS,
+      YOUTUBE_SUBSCRIBE_IP_MAX,
+      now
+    )
+  ) {
+    return youtubeSubscribeFailure("", "RATE_LIMITED", 429, request);
+  }
+
+  const contentType = String(request.headers.get("Content-Type") || "").toLowerCase();
+  if (!contentType.startsWith("application/json")) {
+    return youtubeSubscribeFailure("", "UNSUPPORTED_MEDIA_TYPE", 415, request);
+  }
+
+  const bodyResult = await readJsonBody(request, YOUTUBE_SUBSCRIBE_BODY_MAX_BYTES);
+  if (!bodyResult.ok) {
+    if (bodyResult.code === "BODY_TOO_LARGE") {
+      return youtubeSubscribeFailure("", "BODY_TOO_LARGE", 413, request);
+    }
+    if (bodyResult.code === "UNSUPPORTED_MEDIA_TYPE") {
+      return youtubeSubscribeFailure("", "UNSUPPORTED_MEDIA_TYPE", 415, request);
+    }
+    return youtubeSubscribeFailure("", "INVALID_REQUEST", 400, request);
+  }
+
+  const payload = bodyResult.payload && typeof bodyResult.payload === "object" ? bodyResult.payload : {};
+  const channelId = String(payload.channelId || "").trim();
+  if (!isValidYoutubeChannelId(channelId)) {
+    return youtubeSubscribeFailure(channelId, "INVALID_CHANNEL_ID", 400, request);
+  }
+
+  const auth = await requireFirebaseUser(request, env);
+  if (!auth.ok) {
+    return auth.response;
+  }
+
+  if (
+    !fixedWindowAllows(
+      youtubeSubscribeUserBuckets,
+      auth.uid,
+      YOUTUBE_SUBSCRIBE_USER_WINDOW_MS,
+      YOUTUBE_SUBSCRIBE_USER_MAX,
+      now
+    )
+  ) {
+    return youtubeSubscribeFailure(channelId, "RATE_LIMITED", 429, request);
+  }
+
+  const expectedChannelId = String(payload.expectedChannelId || "").trim();
+  const expectedIdentityError = youtubeExpectedIdentityCode(payload, auth.uid);
+  if (expectedIdentityError) {
+    return youtubeSubscribeFailure(channelId, expectedIdentityError, 409, request);
+  }
+
+  const config = await readOAuthConfig(env);
+  if (!config) {
+    return youtubeSubscribeFailure(channelId, "OAUTH_NOT_CONFIGURED", 503, request);
+  }
+
+  const db = oauthDb(env);
+  if (!db) {
+    return youtubeSubscribeFailure(channelId, "OAUTH_UNAVAILABLE", 503, request);
+  }
+
+  let accessToken;
+  try {
+    accessToken = await getAccessTokenForUser(auth.uid, env, {
+      config,
+      db,
+      requiredScope: GOOGLE_YOUTUBE_SCOPE,
+      revalidateGrant: true
+    });
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message === "GRANT_NOT_FOUND" || message === "INVALIDATED") {
+      return youtubeSubscribeFailure(channelId, "YOUTUBE_NOT_CONNECTED", 409, request);
+    }
+    if (message === "OAUTH_SCOPE_REQUIRED") {
+      return youtubeSubscribeFailure(channelId, "YOUTUBE_SCOPE_REQUIRED", 409, request);
+    }
+    if (message === "OAUTH_REAUTH_REQUIRED") {
+      return youtubeSubscribeFailure(channelId, "YOUTUBE_REAUTH_REQUIRED", 409, request);
+    }
+    if (message === "OAUTH_CONFIG_ERROR") {
+      return youtubeSubscribeFailure(channelId, "OAUTH_NOT_CONFIGURED", 503, request);
+    }
+    return youtubeSubscribeFailure(channelId, "TOKEN_EXCHANGE_FAILED", 502, request);
+  }
+
+  let upstream;
+  try {
+    // Explicit user action only (frontend confirmation required in later phase).
+    // Never retry subscription writes automatically.
+    // Re-verify the acting channel against the current grant immediately before
+    // the write so an account switch cannot silently mutate another channel.
+    const identity = await verifyYoutubeActingChannel(accessToken, expectedChannelId);
+    if (!identity.ok) {
+      if (identity.code === "YOUTUBE_REAUTH_REQUIRED") {
+        invalidateAccessToken(auth.uid);
+      }
+      return youtubeSubscribeFailure(channelId, identity.code, identity.status, request);
+    }
+    upstream = await youtubeSubscribeInsertRequest(accessToken, channelId);
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message === "UPSTREAM_TIMEOUT") {
+      return youtubeSubscribeFailure(channelId, "UPSTREAM_TIMEOUT", 504, request);
+    }
+    return youtubeSubscribeFailure(channelId, "UPSTREAM_ERROR", 502, request);
+  }
+
+  if (upstream.response.ok) {
+    return json(
+      {
+        ok: true,
+        available: true,
+        subscribed: true,
+        channelId,
+        source: "youtube"
+      },
+      200,
+      request
+    );
+  }
+
+  if (upstream.response.status === 401) {
+    invalidateAccessToken(auth.uid);
+  }
+
+  const mapped = mapYoutubeSubscribeUpstreamError(upstream.response.status, upstream.data);
+  if (mapped.code === "ALREADY_SUBSCRIBED") {
+    return json(
+      {
+        ok: true,
+        available: true,
+        subscribed: true,
+        alreadySubscribed: true,
+        channelId,
+        source: "youtube"
+      },
+      200,
+      request
+    );
+  }
+
+  return youtubeSubscribeFailure(channelId, mapped.code, mapped.status, request);
+}
+
+// -----------------------------------------------------------------------------
+// YouTube subscription unsubscribe (authenticated, explicit user action).
+// POST /api/youtube/unsubscribe { channelId }
+// Resolves subscription resource ID via subscriptions.list (mine=true, forChannelId),
+// then deletes via subscriptions.delete?id=<subscriptionResourceId>.
+// Never uses channelId as delete ID. No automatic retries. No auto-unsubscribe.
+// -----------------------------------------------------------------------------
+const YOUTUBE_UNSUBSCRIBE_TIMEOUT_MS = 10_000;
+const YOUTUBE_UNSUBSCRIBE_BODY_MAX_BYTES = 1024;
+const YOUTUBE_UNSUBSCRIBE_IP_WINDOW_MS = 60 * 1000;
+const YOUTUBE_UNSUBSCRIBE_IP_MAX = 10;
+const YOUTUBE_UNSUBSCRIBE_USER_WINDOW_MS = 60 * 1000;
+const YOUTUBE_UNSUBSCRIBE_USER_MAX = 6;
+const youtubeUnsubscribeIpBuckets = new Map();
+const youtubeUnsubscribeUserBuckets = new Map();
+
+function pruneYoutubeUnsubscribeBuckets(now) {
+  for (const [map, maxAge] of [
+    [youtubeUnsubscribeIpBuckets, YOUTUBE_UNSUBSCRIBE_IP_WINDOW_MS * 3],
+    [youtubeUnsubscribeUserBuckets, YOUTUBE_UNSUBSCRIBE_USER_WINDOW_MS * 3]
+  ]) {
+    for (const [key, bucket] of map.entries()) {
+      if (!bucket || now - bucket.windowStart > maxAge) map.delete(key);
+    }
+  }
+}
+
+const YOUTUBE_UNSUBSCRIBE_MESSAGES = Object.freeze({
+  METHOD_NOT_ALLOWED: "Method not allowed.",
+  UNSUPPORTED_MEDIA_TYPE: "Expected a JSON request.",
+  BODY_TOO_LARGE: "That request was too large.",
+  INVALID_REQUEST: "That request was not valid.",
+  INVALID_CHANNEL_ID: "That channel is not valid.",
+  UNAUTHENTICATED: "Sign in required.",
+  RATE_LIMITED: "You are making requests too quickly. Please wait a moment.",
+  YOUTUBE_NOT_CONNECTED: "Connect your YouTube account to unsubscribe.",
+  YOUTUBE_SCOPE_REQUIRED: "Reconnect your YouTube account to allow subscriptions.",
+  YOUTUBE_REAUTH_REQUIRED: "Reconnect your YouTube account to continue.",
+  MULTIPLE_CHANNELS: "Multiple YouTube channels are available for this Google account. Reconnect using the intended channel before managing subscriptions.",
+  YOUTUBE_IDENTITY_CHANGED: "Your connected YouTube channel changed. Reconnect your YouTube account and try again.",
+  YOUTUBE_IDENTITY_UNVERIFIED: "Could not verify your connected YouTube channel. Reload the page and try again.",
+  OAUTH_NOT_CONFIGURED: "YouTube connection is not available yet.",
+  OAUTH_UNAVAILABLE: "Unsubscribe is unavailable right now.",
+  QUOTA_EXCEEDED: "YouTube's daily limit has been reached. Please try again later.",
+  TOKEN_EXCHANGE_FAILED: "Could not reach YouTube right now. Please try again.",
+  UPSTREAM_TIMEOUT: "Could not confirm the unsubscribe. Please check your YouTube subscription status and try again.",
+  UPSTREAM_ERROR: "Could not confirm the unsubscribe. Please check your YouTube subscription status and try again.",
+  SUBSCRIPTIONS_FORBIDDEN: "YouTube could not complete the unsubscribe for this account.",
+  SUBSCRIPTIONS_NOT_FOUND: "YouTube subscriptions could not be found for this account."
+});
+
+function youtubeUnsubscribeFailure(channelId, code, status, request, extra = {}) {
+  const requestedCode = String(code || "");
+  const safeCode = Object.prototype.hasOwnProperty.call(YOUTUBE_UNSUBSCRIBE_MESSAGES, requestedCode)
+    ? requestedCode
+    : "UPSTREAM_ERROR";
+  const safeChannelId = isValidYoutubeChannelId(channelId) ? String(channelId).trim() : "";
+  return json(
+    {
+      ok: false,
+      available: false,
+      subscribed: false,
+      channelId: safeChannelId,
+      source: "youtube",
+      code: safeCode,
+      error: YOUTUBE_UNSUBSCRIBE_MESSAGES[safeCode],
+      ...extra
+    },
+    status,
+    request
+  );
+}
+
+function mapYoutubeUnsubscribeLookupUpstreamError(status, data) {
+  const reason = data?.error?.errors?.[0]?.reason || data?.error?.status || "";
+  if (status === 401) return { code: "YOUTUBE_REAUTH_REQUIRED", status: 409 };
+  if (status === 400) return { code: "INVALID_REQUEST", status: 400 };
+  if (status === 403) {
+    if (reason === "quotaExceeded" || reason === "dailyLimitExceeded") {
+      return { code: "QUOTA_EXCEEDED", status: 503 };
+    }
+    if (reason === "rateLimitExceeded" || reason === "userRateLimitExceeded") {
+      return { code: "RATE_LIMITED", status: 429 };
+    }
+    if (reason === "accountClosed" || reason === "accountSuspended" || reason === "subscriptionForbidden") {
+      return { code: "SUBSCRIPTIONS_FORBIDDEN", status: 403 };
+    }
+    return { code: "UPSTREAM_ERROR", status: 502 };
+  }
+  if (status === 404) {
+    if (reason === "subscriberNotFound") {
+      return { code: "SUBSCRIPTIONS_NOT_FOUND", status: 404 };
+    }
+    return { code: "UPSTREAM_ERROR", status: 404 };
+  }
+  if (status === 429) return { code: "RATE_LIMITED", status: 429 };
+  if (status >= 500) return { code: "UPSTREAM_ERROR", status: 502 };
+  return { code: "UPSTREAM_ERROR", status: 502 };
+}
+
+function mapYoutubeUnsubscribeDeleteUpstreamError(status, data) {
+  const reason = data?.error?.errors?.[0]?.reason || data?.error?.status || "";
+  if (status === 401) return { code: "YOUTUBE_REAUTH_REQUIRED", status: 409 };
+  if (status === 403) {
+    if (reason === "quotaExceeded" || reason === "dailyLimitExceeded") {
+      return { code: "QUOTA_EXCEEDED", status: 503 };
+    }
+    if (reason === "rateLimitExceeded" || reason === "userRateLimitExceeded") {
+      return { code: "RATE_LIMITED", status: 429 };
+    }
+    if (reason === "subscriptionForbidden" || reason === "accountClosed" || reason === "accountSuspended") {
+      return { code: "SUBSCRIPTIONS_FORBIDDEN", status: 403 };
+    }
+    return { code: "UPSTREAM_ERROR", status: 502 };
+  }
+  if (status === 404) {
+    // subscriptionNotFound: treat as already unsubscribed/stale state (safe).
+    if (reason === "subscriptionNotFound") {
+      return { code: "ALREADY_UNSUBSCRIBED", status: 200 };
+    }
+    return { code: "UPSTREAM_ERROR", status: 404 };
+  }
+  if (status === 429) return { code: "RATE_LIMITED", status: 429 };
+  if (status >= 500) return { code: "UPSTREAM_ERROR", status: 502 };
+  return { code: "UPSTREAM_ERROR", status: 502 };
+}
+
+async function youtubeUnsubscribeLookupRequest(accessToken, channelId) {
+  const endpoint = new URL("https://www.googleapis.com/youtube/v3/subscriptions");
+  endpoint.searchParams.set("part", "id");
+  endpoint.searchParams.set("mine", "true");
+  endpoint.searchParams.set("forChannelId", channelId);
+  endpoint.searchParams.set("maxResults", "1");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), YOUTUBE_UNSUBSCRIBE_TIMEOUT_MS);
+  try {
+    const response = await fetch(endpoint.toString(), {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json"
+      },
+      signal: controller.signal
+    });
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+    return { response, data };
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new Error("UPSTREAM_TIMEOUT");
+    throw new Error("UPSTREAM_ERROR");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function youtubeUnsubscribeDeleteRequest(accessToken, subscriptionId) {
+  const endpoint = new URL("https://www.googleapis.com/youtube/v3/subscriptions");
+  endpoint.searchParams.set("id", subscriptionId);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), YOUTUBE_UNSUBSCRIBE_TIMEOUT_MS);
+  try {
+    const response = await fetch(endpoint.toString(), {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json"
+      },
+      signal: controller.signal
+    });
+    let data = null;
+    // DELETE returns 204 No Content on success; avoid parsing empty body.
+    if (response.status !== 204) {
+      try {
+        data = await response.json();
+      } catch {
+        data = null;
+      }
+    }
+    return { response, data };
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new Error("UPSTREAM_TIMEOUT");
+    throw new Error("UPSTREAM_ERROR");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function handlePostYoutubeUnsubscribe(request, env) {
+  if (request.method !== "POST") {
+    return youtubeUnsubscribeFailure("", "METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  const ip = clientIp(request);
+  const now = Date.now();
+  pruneYoutubeUnsubscribeBuckets(now);
+
+  if (
+    !fixedWindowAllows(
+      youtubeUnsubscribeIpBuckets,
+      ip,
+      YOUTUBE_UNSUBSCRIBE_IP_WINDOW_MS,
+      YOUTUBE_UNSUBSCRIBE_IP_MAX,
+      now
+    )
+  ) {
+    return youtubeUnsubscribeFailure("", "RATE_LIMITED", 429, request);
+  }
+
+  const contentType = String(request.headers.get("Content-Type") || "").toLowerCase();
+  if (!contentType.startsWith("application/json")) {
+    return youtubeUnsubscribeFailure("", "UNSUPPORTED_MEDIA_TYPE", 415, request);
+  }
+
+  const bodyResult = await readJsonBody(request, YOUTUBE_UNSUBSCRIBE_BODY_MAX_BYTES);
+  if (!bodyResult.ok) {
+    if (bodyResult.code === "BODY_TOO_LARGE") {
+      return youtubeUnsubscribeFailure("", "BODY_TOO_LARGE", 413, request);
+    }
+    if (bodyResult.code === "UNSUPPORTED_MEDIA_TYPE") {
+      return youtubeUnsubscribeFailure("", "UNSUPPORTED_MEDIA_TYPE", 415, request);
+    }
+    return youtubeUnsubscribeFailure("", "INVALID_REQUEST", 400, request);
+  }
+
+  const payload = bodyResult.payload && typeof bodyResult.payload === "object" ? bodyResult.payload : {};
+  const channelId = String(payload.channelId || "").trim();
+  if (!isValidYoutubeChannelId(channelId)) {
+    return youtubeUnsubscribeFailure(channelId, "INVALID_CHANNEL_ID", 400, request);
+  }
+
+  const auth = await requireFirebaseUser(request, env);
+  if (!auth.ok) {
+    return auth.response;
+  }
+
+  if (
+    !fixedWindowAllows(
+      youtubeUnsubscribeUserBuckets,
+      auth.uid,
+      YOUTUBE_UNSUBSCRIBE_USER_WINDOW_MS,
+      YOUTUBE_UNSUBSCRIBE_USER_MAX,
+      now
+    )
+  ) {
+    return youtubeUnsubscribeFailure(channelId, "RATE_LIMITED", 429, request);
+  }
+
+  const expectedChannelId = String(payload.expectedChannelId || "").trim();
+  const expectedIdentityError = youtubeExpectedIdentityCode(payload, auth.uid);
+  if (expectedIdentityError) {
+    return youtubeUnsubscribeFailure(channelId, expectedIdentityError, 409, request);
+  }
+
+  const config = await readOAuthConfig(env);
+  if (!config) {
+    return youtubeUnsubscribeFailure(channelId, "OAUTH_NOT_CONFIGURED", 503, request);
+  }
+
+  const db = oauthDb(env);
+  if (!db) {
+    return youtubeUnsubscribeFailure(channelId, "OAUTH_UNAVAILABLE", 503, request);
+  }
+
+  let accessToken;
+  try {
+    accessToken = await getAccessTokenForUser(auth.uid, env, {
+      config,
+      db,
+      requiredScope: GOOGLE_YOUTUBE_SCOPE,
+      revalidateGrant: true
+    });
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message === "GRANT_NOT_FOUND" || message === "INVALIDATED") {
+      return youtubeUnsubscribeFailure(channelId, "YOUTUBE_NOT_CONNECTED", 409, request);
+    }
+    if (message === "OAUTH_SCOPE_REQUIRED") {
+      return youtubeUnsubscribeFailure(channelId, "YOUTUBE_SCOPE_REQUIRED", 409, request);
+    }
+    if (message === "OAUTH_REAUTH_REQUIRED") {
+      return youtubeUnsubscribeFailure(channelId, "YOUTUBE_REAUTH_REQUIRED", 409, request);
+    }
+    if (message === "OAUTH_CONFIG_ERROR") {
+      return youtubeUnsubscribeFailure(channelId, "OAUTH_NOT_CONFIGURED", 503, request);
+    }
+    return youtubeUnsubscribeFailure(channelId, "TOKEN_EXCHANGE_FAILED", 502, request);
+  }
+
+  let lookup;
+  try {
+    // Explicit user action only (frontend confirmation required in later phase).
+    // Resolve actual subscription resource ID; never use channelId as delete ID.
+    // Re-verify the acting channel against the current grant immediately before
+    // the write so an account switch cannot silently mutate another channel.
+    const identity = await verifyYoutubeActingChannel(accessToken, expectedChannelId);
+    if (!identity.ok) {
+      if (identity.code === "YOUTUBE_REAUTH_REQUIRED") {
+        invalidateAccessToken(auth.uid);
+      }
+      return youtubeUnsubscribeFailure(channelId, identity.code, identity.status, request);
+    }
+    lookup = await youtubeUnsubscribeLookupRequest(accessToken, channelId);
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message === "UPSTREAM_TIMEOUT") {
+      return youtubeUnsubscribeFailure(channelId, "UPSTREAM_TIMEOUT", 504, request);
+    }
+    return youtubeUnsubscribeFailure(channelId, "UPSTREAM_ERROR", 502, request);
+  }
+
+  if (!lookup.response.ok) {
+    if (lookup.response.status === 401) {
+      invalidateAccessToken(auth.uid);
+    }
+    const mapped = mapYoutubeUnsubscribeLookupUpstreamError(lookup.response.status, lookup.data);
+    return youtubeUnsubscribeFailure(channelId, mapped.code, mapped.status, request);
+  }
+
+  const lookupData = lookup.data && typeof lookup.data === "object" ? lookup.data : {};
+  const items = Array.isArray(lookupData.items) ? lookupData.items : [];
+  const subscriptionId = items[0] && typeof items[0].id === "string" ? items[0].id.trim() : "";
+  if (!subscriptionId) {
+    return json(
+      {
+        ok: true,
+        available: true,
+        subscribed: false,
+        alreadyUnsubscribed: true,
+        channelId,
+        source: "youtube"
+      },
+      200,
+      request
+    );
+  }
+
+  let deleted;
+  try {
+    // Never retry DELETE automatically.
+    deleted = await youtubeUnsubscribeDeleteRequest(accessToken, subscriptionId);
+  } catch (error) {
+    const message = String(error?.message || "");
+    // Uncertain outcome: lookup found a subscription but delete did not complete.
+    if (message === "UPSTREAM_TIMEOUT") {
+      return youtubeUnsubscribeFailure(channelId, "UPSTREAM_TIMEOUT", 504, request);
+    }
+    return youtubeUnsubscribeFailure(channelId, "UPSTREAM_ERROR", 502, request);
+  }
+
+  if (deleted.response.ok || deleted.response.status === 204) {
+    return json(
+      {
+        ok: true,
+        available: true,
+        subscribed: false,
+        channelId,
+        source: "youtube"
+      },
+      200,
+      request
+    );
+  }
+
+  if (deleted.response.status === 401) {
+    invalidateAccessToken(auth.uid);
+  }
+
+  const mappedDelete = mapYoutubeUnsubscribeDeleteUpstreamError(deleted.response.status, deleted.data);
+  if (mappedDelete.code === "ALREADY_UNSUBSCRIBED") {
+    return json(
+      {
+        ok: true,
+        available: true,
+        subscribed: false,
+        alreadyUnsubscribed: true,
+        channelId,
+        source: "youtube"
+      },
+      200,
+      request
+    );
+  }
+
+  return youtubeUnsubscribeFailure(channelId, mappedDelete.code, mappedDelete.status, request);
+}
+
+// -----------------------------------------------------------------------------
+// YouTube subscriptions list sync (authenticated, read-only).
+// GET /api/youtube/subscriptions?pageToken=...
+// Retrieves the connected YouTube account's actual subscriptions (mine=true).
+// Read-only: never subscribes/unsubscribes, never modifies local/MyTube state.
+// -----------------------------------------------------------------------------
+const YOUTUBE_SUBSCRIPTIONS_LIST_TIMEOUT_MS = 10_000;
+const YOUTUBE_SUBSCRIPTIONS_LIST_MAX_RESULTS = 50;
+const YOUTUBE_SUBSCRIPTIONS_LIST_PAGE_TOKEN_MAX_LEN = 512;
+const YOUTUBE_SUBSCRIPTIONS_LIST_IP_WINDOW_MS = 60 * 1000;
+const YOUTUBE_SUBSCRIPTIONS_LIST_IP_MAX = 30;
+const YOUTUBE_SUBSCRIPTIONS_LIST_USER_WINDOW_MS = 60 * 1000;
+const YOUTUBE_SUBSCRIPTIONS_LIST_USER_MAX = 20;
+const youtubeSubscriptionsListIpBuckets = new Map();
+const youtubeSubscriptionsListUserBuckets = new Map();
+
+function pruneYoutubeSubscriptionsListBuckets(now) {
+  for (const [map, maxAge] of [
+    [youtubeSubscriptionsListIpBuckets, YOUTUBE_SUBSCRIPTIONS_LIST_IP_WINDOW_MS * 3],
+    [youtubeSubscriptionsListUserBuckets, YOUTUBE_SUBSCRIPTIONS_LIST_USER_WINDOW_MS * 3]
+  ]) {
+    for (const [key, bucket] of map.entries()) {
+      if (!bucket || now - bucket.windowStart > maxAge) map.delete(key);
+    }
+  }
+}
+
+function normalizeYoutubeSubscriptionsPageToken(value) {
+  if (value == null || value === "") return "";
+  if (typeof value !== "string") return null;
+  const token = value.trim();
+  if (!token) return "";
+  if (token.length > YOUTUBE_SUBSCRIPTIONS_LIST_PAGE_TOKEN_MAX_LEN) return null;
+  // Reject control characters/newlines; pageToken is an opaque upstream token.
+  if (/[\u0000-\u001F\u007F]/.test(token)) return null;
+  return token;
+}
+
+const YOUTUBE_SUBSCRIPTIONS_LIST_MESSAGES = Object.freeze({
+  METHOD_NOT_ALLOWED: "Method not allowed.",
+  INVALID_REQUEST: "That request was not valid.",
+  INVALID_PAGE_TOKEN: "That page token is not valid.",
+  UNAUTHENTICATED: "Sign in required.",
+  RATE_LIMITED: "You are making requests too quickly. Please wait a moment.",
+  YOUTUBE_NOT_CONNECTED: "Connect your YouTube account to view YouTube subscriptions.",
+  YOUTUBE_SCOPE_REQUIRED: "Reconnect your YouTube account to allow reading subscriptions.",
+  YOUTUBE_REAUTH_REQUIRED: "Reconnect your YouTube account to continue.",
+  OAUTH_NOT_CONFIGURED: "YouTube connection is not available yet.",
+  OAUTH_UNAVAILABLE: "YouTube subscriptions are unavailable right now.",
+  QUOTA_EXCEEDED: "YouTube's daily limit has been reached. Please try again later.",
+  TOKEN_EXCHANGE_FAILED: "Could not reach YouTube right now. Please try again.",
+  UPSTREAM_TIMEOUT: "Could not reach YouTube right now. Please try again.",
+  UPSTREAM_ERROR: "Could not reach YouTube right now. Please try again.",
+  SUBSCRIPTIONS_FORBIDDEN: "YouTube subscriptions could not be accessed for this account.",
+  SUBSCRIPTIONS_NOT_FOUND: "YouTube subscriptions could not be found for this account."
+});
+
+function youtubeSubscriptionsListFailure(code, status, request, extra = {}) {
+  const requestedCode = String(code || "");
+  const safeCode = Object.prototype.hasOwnProperty.call(YOUTUBE_SUBSCRIPTIONS_LIST_MESSAGES, requestedCode)
+    ? requestedCode
+    : "UPSTREAM_ERROR";
+  return json(
+    {
+      ok: false,
+      available: false,
+      source: "youtube",
+      code: safeCode,
+      error: YOUTUBE_SUBSCRIPTIONS_LIST_MESSAGES[safeCode],
+      items: [],
+      nextPageToken: null,
+      prevPageToken: null,
+      pageInfo: { totalResults: 0, resultsPerPage: 0 },
+      ...extra
+    },
+    status,
+    request
+  );
+}
+
+function mapYoutubeSubscriptionsListUpstreamError(status, data) {
+  const reason = data?.error?.errors?.[0]?.reason || data?.error?.status || "";
+  if (status === 401) return { code: "YOUTUBE_REAUTH_REQUIRED", status: 409 };
+  if (status === 400) {
+    // Invalid pageToken or bad request from upstream; return safe client error.
+    return { code: "INVALID_PAGE_TOKEN", status: 400 };
+  }
+  if (status === 403) {
+    if (reason === "quotaExceeded" || reason === "dailyLimitExceeded") {
+      return { code: "QUOTA_EXCEEDED", status: 503 };
+    }
+    if (reason === "rateLimitExceeded" || reason === "userRateLimitExceeded") {
+      return { code: "RATE_LIMITED", status: 429 };
+    }
+    if (reason === "accountClosed" || reason === "accountSuspended" || reason === "subscriptionForbidden") {
+      return { code: "SUBSCRIPTIONS_FORBIDDEN", status: 403 };
+    }
+    return { code: "UPSTREAM_ERROR", status: 502 };
+  }
+  if (status === 404) {
+    if (reason === "subscriberNotFound") {
+      return { code: "SUBSCRIPTIONS_NOT_FOUND", status: 404 };
+    }
+    return { code: "UPSTREAM_ERROR", status: 404 };
+  }
+  if (status === 429) return { code: "RATE_LIMITED", status: 429 };
+  if (status >= 500) return { code: "UPSTREAM_ERROR", status: 502 };
+  return { code: "UPSTREAM_ERROR", status: 502 };
+}
+
+function normalizeYoutubeSubscriptionListItem(item) {
+  if (!item || typeof item !== "object") return null;
+  const snippet = item.snippet && typeof item.snippet === "object" ? item.snippet : {};
+  const resourceId = snippet.resourceId && typeof snippet.resourceId === "object" ? snippet.resourceId : {};
+  // Subscribed-to channel ID is snippet.resourceId.channelId (NOT snippet.channelId).
+  const channelId = typeof resourceId.channelId === "string" ? resourceId.channelId.trim() : "";
+  if (!channelId) return null;
+  const subscriptionId = typeof item.id === "string" ? item.id.trim() : "";
+  return {
+    subscriptionId,
+    channelId,
+    title: typeof snippet.title === "string" ? snippet.title : "",
+    description: typeof snippet.description === "string" ? snippet.description : "",
+    thumbnails: snippet.thumbnails && typeof snippet.thumbnails === "object" ? snippet.thumbnails : {},
+    publishedAt: typeof snippet.publishedAt === "string" ? snippet.publishedAt : ""
+  };
+}
+
+async function youtubeGetSubscriptionsListRequest(accessToken, pageToken) {
+  const endpoint = new URL("https://www.googleapis.com/youtube/v3/subscriptions");
+  endpoint.searchParams.set("part", "snippet");
+  endpoint.searchParams.set("mine", "true");
+  endpoint.searchParams.set("maxResults", String(YOUTUBE_SUBSCRIPTIONS_LIST_MAX_RESULTS));
+  if (pageToken) {
+    endpoint.searchParams.set("pageToken", pageToken);
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), YOUTUBE_SUBSCRIPTIONS_LIST_TIMEOUT_MS);
+  try {
+    const response = await fetch(endpoint.toString(), {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json"
+      },
+      signal: controller.signal
+    });
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+    return { response, data };
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new Error("UPSTREAM_TIMEOUT");
+    throw new Error("UPSTREAM_ERROR");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function handleGetYoutubeSubscriptions(request, env) {
+  if (request.method !== "GET") {
+    return youtubeSubscriptionsListFailure("METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  const url = new URL(request.url);
+  const rawPageToken = url.searchParams.has("pageToken") ? url.searchParams.get("pageToken") : "";
+  const pageToken = normalizeYoutubeSubscriptionsPageToken(rawPageToken);
+  if (pageToken === null) {
+    return youtubeSubscriptionsListFailure("INVALID_PAGE_TOKEN", 400, request);
+  }
+
+  const ip = clientIp(request);
+  const now = Date.now();
+  pruneYoutubeSubscriptionsListBuckets(now);
+
+  if (
+    !fixedWindowAllows(
+      youtubeSubscriptionsListIpBuckets,
+      ip,
+      YOUTUBE_SUBSCRIPTIONS_LIST_IP_WINDOW_MS,
+      YOUTUBE_SUBSCRIPTIONS_LIST_IP_MAX,
+      now
+    )
+  ) {
+    return youtubeSubscriptionsListFailure("RATE_LIMITED", 429, request);
+  }
+
+  const auth = await requireFirebaseUser(request, env);
+  if (!auth.ok) {
+    // Preserve the standard auth response shape/behavior used by requireFirebaseUser.
+    return auth.response;
+  }
+
+  if (
+    !fixedWindowAllows(
+      youtubeSubscriptionsListUserBuckets,
+      auth.uid,
+      YOUTUBE_SUBSCRIPTIONS_LIST_USER_WINDOW_MS,
+      YOUTUBE_SUBSCRIPTIONS_LIST_USER_MAX,
+      now
+    )
+  ) {
+    return youtubeSubscriptionsListFailure("RATE_LIMITED", 429, request);
+  }
+
+  const config = await readOAuthConfig(env);
+  if (!config) {
+    return youtubeSubscriptionsListFailure("OAUTH_NOT_CONFIGURED", 503, request);
+  }
+
+  const db = oauthDb(env);
+  if (!db) {
+    return youtubeSubscriptionsListFailure("OAUTH_UNAVAILABLE", 503, request);
+  }
+
+  let accessToken;
+  try {
+    accessToken = await getAccessTokenForUser(auth.uid, env, {
+      config,
+      db,
+      requiredScope: GOOGLE_YOUTUBE_SCOPE,
+      revalidateGrant: true
+    });
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message === "GRANT_NOT_FOUND" || message === "INVALIDATED") {
+      return youtubeSubscriptionsListFailure("YOUTUBE_NOT_CONNECTED", 409, request);
+    }
+    if (message === "OAUTH_SCOPE_REQUIRED") {
+      return youtubeSubscriptionsListFailure("YOUTUBE_SCOPE_REQUIRED", 409, request);
+    }
+    if (message === "OAUTH_REAUTH_REQUIRED") {
+      return youtubeSubscriptionsListFailure("YOUTUBE_REAUTH_REQUIRED", 409, request);
+    }
+    if (message === "OAUTH_CONFIG_ERROR") {
+      return youtubeSubscriptionsListFailure("OAUTH_NOT_CONFIGURED", 503, request);
+    }
+    return youtubeSubscriptionsListFailure("TOKEN_EXCHANGE_FAILED", 502, request);
+  }
+
+  let upstream;
+  try {
+    upstream = await youtubeGetSubscriptionsListRequest(accessToken, pageToken);
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message === "UPSTREAM_TIMEOUT") {
+      return youtubeSubscriptionsListFailure("UPSTREAM_TIMEOUT", 504, request);
+    }
+    return youtubeSubscriptionsListFailure("UPSTREAM_ERROR", 502, request);
+  }
+
+  if (!upstream.response.ok) {
+    if (upstream.response.status === 401) {
+      invalidateAccessToken(auth.uid);
+    }
+    const mapped = mapYoutubeSubscriptionsListUpstreamError(upstream.response.status, upstream.data);
+    return youtubeSubscriptionsListFailure(mapped.code, mapped.status, request);
+  }
+
+  const data = upstream.data && typeof upstream.data === "object" ? upstream.data : {};
+  const rawItems = Array.isArray(data.items) ? data.items : [];
+  const items = [];
+  for (const item of rawItems) {
+    const normalized = normalizeYoutubeSubscriptionListItem(item);
+    if (normalized) items.push(normalized);
+  }
+  const pageInfo = data.pageInfo && typeof data.pageInfo === "object" ? data.pageInfo : {};
+  return json(
+    {
+      ok: true,
+      available: true,
+      source: "youtube",
+      items,
+      nextPageToken: typeof data.nextPageToken === "string" ? data.nextPageToken : null,
+      prevPageToken: typeof data.prevPageToken === "string" ? data.prevPageToken : null,
+      pageInfo: {
+        totalResults: Number.isFinite(pageInfo.totalResults) ? pageInfo.totalResults : 0,
+        resultsPerPage: Number.isFinite(pageInfo.resultsPerPage) ? pageInfo.resultsPerPage : items.length
+      }
+    },
+    200,
+    request
+  );
+}
+
+// GET /api/liveChat/subscriptionStatus?videoId=...
+async function handleLiveChatSubscriptionStatus(request, env) {
+  if (request.method !== "GET") {
+    return subscriptionFailure("METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  const url = new URL(request.url);
+  const videoId = String(url.searchParams.get("videoId") || "").trim();
+  const ip = clientIp(request);
+  const now = Date.now();
+  pruneSubscriptionBuckets(now);
+
+  if (!fixedWindowAllows(subscriptionStatusIpBuckets, ip, SUBSCRIPTION_STATUS_IP_WINDOW_MS, SUBSCRIPTION_STATUS_IP_MAX, now)) {
+    return subscriptionFailure("RATE_LIMITED", 429, request);
+  }
+
+  const tokenResult = await getSubscriptionAccessToken(request, env);
+  if (!tokenResult.ok) return tokenResult.response;
+
+  if (!fixedWindowAllows(subscriptionStatusUserBuckets, tokenResult.uid, SUBSCRIPTION_STATUS_USER_WINDOW_MS, SUBSCRIPTION_STATUS_USER_MAX, now)) {
+    return subscriptionFailure("RATE_LIMITED", 429, request);
+  }
+
+  const apiKey = env.YOUTUBE_API_KEY || "";
+  const resolved = await resolveLiveStreamChannel(videoId, apiKey);
+  if (!resolved.ok) return subscriptionFailure(resolved.code, resolved.status, request);
+
+  const query = new URLSearchParams({
+    part: "id",
+    mine: "true",
+    forChannelId: resolved.channelId,
+    maxResults: "1"
+  });
+
+  try {
+    const { response, data } = await youtubeSubscriptionRequest(
+      `https://www.googleapis.com/youtube/v3/subscriptions?${query.toString()}`,
+      tokenResult.accessToken
+    );
+    if (!response.ok) {
+      if (response.status === 401) invalidateAccessToken(tokenResult.uid);
+      const mapped = mapSubscriptionUpstreamError(response.status, data);
+      return subscriptionFailure(mapped.code, mapped.status, request);
+    }
+    const items = Array.isArray(data?.items) ? data.items : [];
+    return json({
+      ok: true,
+      subscribed: items.length > 0,
+      available: true,
+      code: ""
+    }, 200, request);
+  } catch (e) {
+    const msg = e && e.message ? e.message : "";
+    return subscriptionFailure(msg === "UPSTREAM_TIMEOUT" ? "UPSTREAM_TIMEOUT" : "UPSTREAM_ERROR", msg === "UPSTREAM_TIMEOUT" ? 504 : 502, request);
+  }
+}
+
+// POST /api/liveChat/subscribe { videoId }
+async function handleLiveChatSubscribe(request, env) {
+  if (request.method !== "POST") {
+    return subscriptionFailure("METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  const contentType = String(request.headers.get("Content-Type") || "").toLowerCase();
+  if (!contentType.startsWith("application/json")) {
+    return subscriptionFailure("UNSUPPORTED_MEDIA_TYPE", 400, request);
+  }
+
+  const bodyResult = await readJsonBody(request, LIVE_CHAT_SEND_MAX_BODY_BYTES);
+  if (!bodyResult.ok) {
+    return subscriptionFailure(bodyResult.code === "BODY_TOO_LARGE" ? "BODY_TOO_LARGE" : "INVALID_REQUEST", 400, request);
+  }
+
+  const videoId = String(bodyResult.payload.videoId || "").trim();
+  if (!isValidYouTubeSourceId(videoId)) {
+    return subscriptionFailure("INVALID_VIDEO_ID", 400, request);
+  }
+
+  const ip = clientIp(request);
+  const now = Date.now();
+  pruneSubscriptionBuckets(now);
+
+  if (!fixedWindowAllows(subscriptionSubscribeIpBuckets, ip, SUBSCRIPTION_SUBSCRIBE_IP_WINDOW_MS, SUBSCRIPTION_SUBSCRIBE_IP_MAX, now)) {
+    return subscriptionFailure("RATE_LIMITED", 429, request);
+  }
+
+  const tokenResult = await getSubscriptionAccessToken(request, env);
+  if (!tokenResult.ok) return tokenResult.response;
+
+  if (!fixedWindowAllows(subscriptionSubscribeUserBuckets, tokenResult.uid, SUBSCRIPTION_SUBSCRIBE_USER_WINDOW_MS, SUBSCRIPTION_SUBSCRIBE_USER_MAX, now)) {
+    return subscriptionFailure("RATE_LIMITED", 429, request);
+  }
+
+  const apiKey = env.YOUTUBE_API_KEY || "";
+  const resolved = await resolveLiveStreamChannel(videoId, apiKey);
+  if (!resolved.ok) return subscriptionFailure(resolved.code, resolved.status, request);
+
+  // Server-resolved channelId only. Never trust client channel IDs.
+  const insertBody = JSON.stringify({
+    snippet: {
+      resourceId: {
+        kind: "youtube#channel",
+        channelId: resolved.channelId
+      }
+    }
+  });
+
+  try {
+    const { response, data } = await youtubeSubscriptionRequest(
+      "https://www.googleapis.com/youtube/v3/subscriptions?part=snippet",
+      tokenResult.accessToken,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: insertBody
+      }
+    );
+
+    if (response.ok) {
+      return json({
+        ok: true,
+        subscribed: true,
+        available: true,
+        code: ""
+      }, 200, request);
+    }
+
+    if (response.status === 401) invalidateAccessToken(tokenResult.uid);
+
+    const reason = data?.error?.errors?.[0]?.reason || data?.error?.status || "";
+    if (response.status === 400 && reason === "subscriptionDuplicate") {
+      return json({ ok: true, subscribed: true, available: true, code: "ALREADY_SUBSCRIBED" }, 200, request);
+    }
+
+    const mapped = mapSubscriptionUpstreamError(response.status, data);
+    return subscriptionFailure(mapped.code, mapped.status, request);
+  } catch (e) {
+    const msg = e && e.message ? e.message : "";
+    return subscriptionFailure(msg === "UPSTREAM_TIMEOUT" ? "UPSTREAM_TIMEOUT" : "UPSTREAM_ERROR", msg === "UPSTREAM_TIMEOUT" ? 504 : 502, request);
+  }
+}
+
+// Count Unicode code points, not UTF-16 units, so an emoji counts as one
+// character. This is stricter than Array#length and matches what a user sees.
+function codePointLength(value) {
+  return Array.from(String(value)).length;
+}
+
+// Read the JSON body without allowing an attacker to make us buffer an
+// arbitrarily large payload. Content-Length is a cheap early reject when the
+// runtime supplies it, but the streaming byte counter is authoritative because
+// chunked requests need not carry a trustworthy length header.
+async function readLiveChatBody(request, maxBytes) {
+  const lengthHeader = request.headers.get("Content-Length");
+
+  if (lengthHeader !== null) {
+    const declaredLength = Number(lengthHeader);
+
+    if (!Number.isInteger(declaredLength) || declaredLength < 0) {
+      return { ok: false, code: "INVALID_REQUEST" };
+    }
+
+    if (declaredLength > maxBytes) {
+      return { ok: false, code: "BODY_TOO_LARGE" };
+    }
+  }
+
+  if (!request.body) {
+    return { ok: true, text: "" };
+  }
+
+  let reader;
+
+  try {
+    reader = request.body.getReader();
+  } catch {
+    return { ok: false, code: "INVALID_REQUEST" };
+  }
+
+  const decoder = new TextDecoder();
+  let bytesRead = 0;
+  let text = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+
+      if (done) break;
+
+      bytesRead += value.byteLength;
+
+      if (bytesRead > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return { ok: false, code: "BODY_TOO_LARGE" };
+      }
+
+      text += decoder.decode(value, { stream: true });
+    }
+
+    text += decoder.decode();
+    return { ok: true, text };
+  } catch {
+    return { ok: false, code: "INVALID_REQUEST" };
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // The reader may already be released after a cancel.
+    }
+  }
+}
+
+// A fixed-window counter. Returns true while the key is inside its allowance.
+// The window is reset lazily on the first request after it expires.
+function fixedWindowAllows(buckets, key, windowMs, max, now) {
+  let bucket = buckets.get(key);
+
+  if (!bucket || now - bucket.windowStart >= windowMs) {
+    bucket = { windowStart: now, count: 0 };
+    buckets.set(key, bucket);
+  }
+
+  bucket.count++;
+
+  if (buckets.size > LIVE_CHAT_SEND_MAX_BUCKETS) {
+    for (const [entryKey, entry] of buckets) {
+      if (now - entry.windowStart >= windowMs) {
+        buckets.delete(entryKey);
+      }
+    }
+
+    while (buckets.size > LIVE_CHAT_SEND_MAX_BUCKETS) {
+      const oldest = buckets.keys().next().value;
+
+      if (oldest === undefined) break;
+
+      buckets.delete(oldest);
+    }
+  }
+
+  return bucket.count <= max;
+}
+
+function pruneLiveChatSendState(now) {
+  for (const [key, entry] of liveChatSendIdempotency) {
+    if (now - entry.atMs >= LIVE_CHAT_SEND_IDEMPOTENCY_TTL_MS) {
+      liveChatSendIdempotency.delete(key);
+    }
+  }
+
+  for (const [uid, entry] of liveChatSendInFlight) {
+    if (now - entry.atMs >= LIVE_CHAT_SEND_INFLIGHT_TTL_MS) {
+      liveChatSendInFlight.delete(uid);
+    }
+  }
+}
+
+function rememberLiveChatSend(key, body) {
+  liveChatSendIdempotency.set(key, { atMs: Date.now(), body });
+
+  while (liveChatSendIdempotency.size > LIVE_CHAT_SEND_MAX_IDEMPOTENCY) {
+    const oldest = liveChatSendIdempotency.keys().next().value;
+
+    if (oldest === undefined) break;
+
+    liveChatSendIdempotency.delete(oldest);
+  }
+}
+
+// Map YouTube's insert failure onto MyTube's closed code set. `reason` comes
+// from error.errors[0].reason, which is the stable part of the payload.
+function mapLiveChatSendUpstreamError(status, data) {
+  const reason =
+    data?.error?.errors?.[0]?.reason ||
+    data?.error?.status ||
+    "";
+
+  if (status === 401) {
+    return { code: "YOUTUBE_REAUTH_REQUIRED", status: 409 };
+  }
+
+  if (status === 403) {
+    if (reason === "liveChatEnded") {
+      return { code: "LIVE_CHAT_ENDED", status: 409 };
+    }
+
+    if (reason === "liveChatDisabled") {
+      return { code: "CHAT_DISABLED", status: 409 };
+    }
+
+    if (reason === "quotaExceeded" || reason === "dailyLimitExceeded") {
+      return { code: "QUOTA_EXCEEDED", status: 503 };
+    }
+
+    if (reason === "rateLimitExceeded") {
+      return { code: "CHAT_RATE_LIMITED", status: 429 };
+    }
+
+    // forbidden / insufficientPermissions / members-only / banned / slow mode.
+    return { code: "CHAT_FORBIDDEN", status: 403 };
+  }
+
+  if (status === 404) {
+    return { code: "LIVE_CHAT_NOT_FOUND", status: 409 };
+  }
+
+  if (status === 429) {
+    return { code: "CHAT_RATE_LIMITED", status: 429 };
+  }
+
+  if (status === 400) {
+    return { code: "INVALID_MESSAGE", status: 400 };
+  }
+
+  return { code: "UPSTREAM_ERROR", status: 502 };
+}
+
+// ONE insert attempt. No retry, no cache, no API key: the OAuth bearer token is
+// the authorization and it must never appear in a URL or a response.
+async function insertLiveChatMessage(liveChatId, text, accessToken, fetchFn = fetch) {
+  const controller =
+    typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timeoutId = controller
+    ? setTimeout(() => controller.abort(), LIVE_CHAT_SEND_TIMEOUT_MS)
+    : null;
+
+  let response;
+
+  try {
+    response = await fetchFn(LIVE_CHAT_SEND_INSERT_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "User-Agent": "MyTube/1.0"
+      },
+      body: JSON.stringify({
+        snippet: {
+          liveChatId,
+          type: "textMessageEvent",
+          textMessageDetails: { messageText: text }
+        }
+      }),
+      signal: controller ? controller.signal : undefined
+    });
+  } catch {
+    // Network error, abort, or a non-Response fetch failure. Never retried.
+    return { ok: false, code: "UPSTREAM_ERROR", status: 502 };
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+
+  let data = null;
+
+  try {
+    data = await response.json();
+  } catch {
+    data = null;
+  }
+
+  if (response.ok) {
+    const message = normalizeLiveChatMessage(data);
+
+    // A 2xx is not enough: the response must contain the inserted message we
+    // can safely return. Treat an empty or malformed payload as an upstream
+    // failure rather than reporting a success that never existed.
+    if (!message) {
+      return { ok: false, code: "UPSTREAM_ERROR", status: 502 };
+    }
+
+    return {
+      ok: true,
+      message,
+      status: 200
+    };
+  }
+
+  return { ok: false, ...mapLiveChatSendUpstreamError(response.status, data) };
+}
+
+// POST /api/liveChat/send
+async function handleLiveChatSend(request, env) {
+  // 1) Kill switch. Nothing else may happen when this is off.
+  if (!chatSendEnabled(env)) {
+    return liveChatSendFailure("CHAT_SEND_DISABLED", 503, request);
+  }
+
+  if (request.method !== "POST") {
+    return liveChatSendFailure("METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  const contentType = String(request.headers.get("Content-Type") || "")
+    .toLowerCase();
+
+  if (!contentType.startsWith("application/json")) {
+    return liveChatSendFailure("UNSUPPORTED_MEDIA_TYPE", 400, request);
+  }
+
+  const bodyResult = await readLiveChatBody(
+    request,
+    LIVE_CHAT_SEND_MAX_BODY_BYTES
+  );
+
+  if (!bodyResult.ok) {
+    return liveChatSendFailure(bodyResult.code, 400, request);
+  }
+
+  const raw = bodyResult.text;
+
+  let payload;
+
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    return liveChatSendFailure("INVALID_REQUEST", 400, request);
+  }
+
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return liveChatSendFailure("INVALID_REQUEST", 400, request);
+  }
+
+  const videoId = typeof payload.videoId === "string" ? payload.videoId.trim() : "";
+  const text = typeof payload.text === "string" ? payload.text : "";
+  const requestId =
+    typeof payload.requestId === "string" ? payload.requestId.trim() : "";
+
+  // Strict 11-char YouTube id. The client already has the bare id; `yt:` forms
+  // are normalized on the watch page, never trusted here.
+  if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) {
+    return liveChatSendFailure("INVALID_VIDEO_ID", 400, request);
+  }
+
+  // Reject empty/whitespace-only, over-long, and control-character text. The
+  // text itself is preserved exactly as typed (no trimming) for the message.
+  if (
+    text === "" ||
+    text.trim() === "" ||
+    codePointLength(text) > LIVE_CHAT_SEND_MAX_CODE_POINTS ||
+    /[\u0000-\u001F\u007F]/.test(text)
+  ) {
+    return liveChatSendFailure("INVALID_MESSAGE", 400, request);
+  }
+
+  if (requestId && !/^[A-Za-z0-9_-]{8,64}$/.test(requestId)) {
+    return liveChatSendFailure("INVALID_REQUEST", 400, request);
+  }
+
+  const now = Date.now();
+
+  pruneLiveChatSendState(now);
+
+  // Cheap pre-auth flood guard so invalid tokens cannot force JWKS work at will.
+  if (
+    !fixedWindowAllows(
+      liveChatSendIpBuckets,
+      clientIp(request),
+      LIVE_CHAT_SEND_IP_WINDOW_MS,
+      LIVE_CHAT_SEND_IP_MAX,
+      now
+    )
+  ) {
+    return liveChatSendFailure("RATE_LIMITED", 429, request);
+  }
+
+  let auth;
+
+  try {
+    auth = await requireFirebaseUser(request, env);
+  } catch {
+    return liveChatSendFailure("INTERNAL", 500, request);
+  }
+
+  if (!auth.ok) {
+    return auth.response;
+  }
+
+  const uid = auth.uid;
+
+  // Per-user limits. Both windows are checked, and both count the attempt, so a
+  // burst can never buy extra headroom in the longer window.
+  const shortOk = fixedWindowAllows(
+    liveChatSendShortBuckets,
+    uid,
+    LIVE_CHAT_SEND_USER_SHORT_WINDOW_MS,
+    LIVE_CHAT_SEND_USER_SHORT_MAX,
+    now
+  );
+  const longOk = fixedWindowAllows(
+    liveChatSendLongBuckets,
+    uid,
+    LIVE_CHAT_SEND_USER_LONG_WINDOW_MS,
+    LIVE_CHAT_SEND_USER_LONG_MAX,
+    now
+  );
+
+  if (!shortOk || !longOk) {
+    return liveChatSendFailure("RATE_LIMITED", 429, request);
+  }
+
+  // A repeated requestId returns the original outcome without a second insert.
+  if (requestId) {
+    const cached = liveChatSendIdempotency.get(uid + ":" + requestId);
+
+    if (cached) {
+      return json(cached.body, 200, request);
+    }
+  }
+
+  // One send at a time per user. A duplicate click cannot reach YouTube twice.
+  const existing = liveChatSendInFlight.get(uid);
+
+  if (existing && now - existing.atMs < LIVE_CHAT_SEND_INFLIGHT_TTL_MS) {
+    return liveChatSendFailure("SEND_IN_PROGRESS", 409, request);
+  }
+
+  const lockToken = `${now}:${Math.random()}`;
+
+  liveChatSendInFlight.set(uid, { atMs: now, token: lockToken });
+
+  try {
+    const config = await readOAuthConfig(env);
+
+    if (!config) {
+      return liveChatSendFailure("OAUTH_NOT_CONFIGURED", 503, request);
+    }
+
+    const db = oauthDb(env);
+
+    if (!db) {
+      return liveChatSendFailure("OAUTH_UNAVAILABLE", 503, request);
+    }
+
+    const apiKey = env.YOUTUBE_API_KEY || "";
+
+    if (!apiKey) {
+      return liveChatSendFailure("YOUTUBE_NOT_CONFIGURED", 503, request);
+    }
+
+    // Resolve the ACTIVE chat from the video id, server-side. Never accept a
+    // liveChatId from the request body.
+    let live;
+
+    try {
+      live = await probeVideoLive(videoId, apiKey);
+    } catch {
+      return liveChatSendFailure("UPSTREAM_ERROR", 502, request);
+    }
+
+    if (!live.isLive) {
+      return liveChatSendFailure("NOT_LIVE", 409, request);
+    }
+
+    if (!live.liveChatId || live.liveChatDisabled) {
+      return liveChatSendFailure("CHAT_DISABLED", 409, request);
+    }
+
+    let accessToken;
+
+    try {
+      accessToken = await getAccessTokenForUser(uid, env, {
+        config,
+        db,
+        requiredScope: GOOGLE_YOUTUBE_SCOPE,
+        revalidateGrant: true
+      });
+    } catch (error) {
+      const message = String(error?.message || "");
+
+      if (message === "GRANT_NOT_FOUND" || message === "INVALIDATED") {
+        return liveChatSendFailure("YOUTUBE_NOT_CONNECTED", 409, request);
+      }
+
+      if (message === "OAUTH_SCOPE_REQUIRED") {
+        return liveChatSendFailure("YOUTUBE_SCOPE_REQUIRED", 409, request);
+      }
+
+      if (message === "OAUTH_REAUTH_REQUIRED") {
+        return liveChatSendFailure("YOUTUBE_REAUTH_REQUIRED", 409, request);
+      }
+
+      if (message === "OAUTH_CONFIG_ERROR") {
+        return liveChatSendFailure("OAUTH_NOT_CONFIGURED", 503, request);
+      }
+
+      return liveChatSendFailure("TOKEN_EXCHANGE_FAILED", 502, request);
+    }
+
+    const insert = await insertLiveChatMessage(
+      live.liveChatId,
+      text,
+      accessToken
+    );
+
+    if (!insert.ok) {
+      if (insert.code === "YOUTUBE_REAUTH_REQUIRED") {
+        // The cached access token is dead; drop it so the next attempt
+        // refreshes. The grant row itself is preserved.
+        invalidateAccessToken(uid);
+      }
+
+      return liveChatSendFailure(insert.code, insert.status, request);
+    }
+
+    const body = { ok: true, message: insert.message };
+
+    if (requestId) {
+      rememberLiveChatSend(uid + ":" + requestId, body);
+    }
+
+    return json(body, 200, request);
+  } catch {
+    return liveChatSendFailure("INTERNAL", 500, request);
+  } finally {
+    const current = liveChatSendInFlight.get(uid);
+
+    if (current && current.token === lockToken) {
+      liveChatSendInFlight.delete(uid);
+    }
+  }
+}
+
 // Dispatch one OAuth route. `route` is the path after "/api/".
 async function handleOAuthRoute(request, env, url, route) {
   if (route === "oauth/start") {
@@ -2820,6 +5954,80 @@ async function handleAPI(request, env, ctx) {
     });
   }
 
+  // Live chat sending is a POST. It owns its kill switch, authentication,
+  // rate limits and error handling, so it is dispatched before the generic
+  // GET-only guard below. OPTIONS was already answered above.
+  if (route === "liveChat/send") {
+    return handleLiveChatSend(request, env);
+  }
+
+  // Explicit, user-confirmed subscription action (POST). Auth/rate limits inside.
+  if (route === "liveChat/subscribe") {
+    return handleLiveChatSubscribe(request, env);
+  }
+
+  // Authenticated YouTube rating sync (own auth/rate limits/error handling).
+  // GET reads actual rating; POST applies explicit rating write (like/dislike/none).
+  if (route === "youtube/rating") {
+    if (request.method === "GET") {
+      return handleGetYoutubeRating(request, env);
+    }
+    if (request.method === "POST") {
+      return handlePostYoutubeRating(request, env);
+    }
+    return youtubeRatingFailure("", "METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  // Authenticated, read-only general YouTube subscription status (actual connected account).
+  // GET /api/youtube/subscription-status?channelId=...
+  // Separate from live-chat subscription endpoints; no mutations.
+  if (route === "youtube/subscription-status") {
+    if (request.method === "GET") {
+      return handleGetYoutubeSubscriptionStatus(request, env);
+    }
+    return youtubeSubscriptionStatusFailure("", "METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  // Authenticated YouTube subscribe (explicit user action; own auth/rate limits/error handling).
+  // POST /api/youtube/subscribe { channelId }
+  // Calls subscriptions.insert for the connected account. No automatic retries.
+  if (route === "youtube/subscribe") {
+    if (request.method === "POST") {
+      return handlePostYoutubeSubscribe(request, env);
+    }
+    return youtubeSubscribeFailure("", "METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  // Authenticated YouTube unsubscribe (explicit user action; own auth/rate limits/error handling).
+  // POST /api/youtube/unsubscribe { channelId }
+  // Resolves subscription resource ID via subscriptions.list, then deletes by subscription ID.
+  // Never uses channelId as delete ID. No automatic retries.
+  if (route === "youtube/unsubscribe") {
+    if (request.method === "POST") {
+      return handlePostYoutubeUnsubscribe(request, env);
+    }
+    return youtubeUnsubscribeFailure("", "METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  // Authenticated, read-only YouTube subscriptions list (actual connected account).
+  // GET /api/youtube/subscriptions?pageToken=...
+  if (route === "youtube/subscriptions") {
+    if (request.method === "GET") {
+      return handleGetYoutubeSubscriptions(request, env);
+    }
+    return youtubeSubscriptionsListFailure("METHOD_NOT_ALLOWED", 405, request);
+  }
+
+  // Authenticated, read-only connected YouTube account identity.
+  // GET /api/youtube/account — returns only the grant's own channel id/title/thumbnail.
+  // Never selects among multiple channels and never stores identity.
+  if (route === "youtube/account") {
+    if (request.method === "GET") {
+      return handleGetYoutubeAccount(request, env);
+    }
+    return youtubeAccountFailure("METHOD_NOT_ALLOWED", 405, request);
+  }
+
   if (request.method !== "GET") {
     return json(
       {
@@ -2833,8 +6041,16 @@ async function handleAPI(request, env, ctx) {
   // Live chat polling is periodic by design, so it is metered by its own
   // dedicated limiter (see liveChatRateLimitAllowed) and must NOT spend the
   // shared general budget — otherwise simply watching a live stream would start
-  // returning 429 for search / trending / comments.
-  if (route !== "liveChat" && !rateLimitAllowed(request)) {
+  // returning 429 for search / trending / comments. Subscription status checks
+  // are authenticated and have their own endpoint limits.
+  if (
+    route !== "liveChat" &&
+    route !== "liveChat/subscriptionStatus" &&
+    route !== "youtube/subscription-status" &&
+    route !== "youtube/subscribe" &&
+    route !== "youtube/unsubscribe" &&
+    !rateLimitAllowed(request)
+  ) {
     return json(
       {
         error: "Too many requests. Please slow down and try again shortly.",
@@ -3048,6 +6264,10 @@ async function handleAPI(request, env, ctx) {
       return json(result, 200, request);
     }
 
+    if (route === "liveChat/subscriptionStatus") {
+      return handleLiveChatSubscriptionStatus(request, env);
+    }
+
     if (route === "liveChat") {
       const id = url.searchParams.get("id")?.trim();
 
@@ -3080,7 +6300,8 @@ async function handleAPI(request, env, ctx) {
 
       const result = await getLiveChat(id, apiKey, {
         pageToken: url.searchParams.get("pageToken") || "",
-        initial: url.searchParams.get("initial") === "1"
+        initial: url.searchParams.get("initial") === "1",
+        chatSendEnabled: chatSendEnabled(env)
       });
 
       return json(result, 200, request);
@@ -4567,6 +7788,15 @@ export async function scheduled(event, env, ctx) {
   if (!index) {
     return;
   }
+
+  // OAuth flow state is short-lived (see OAUTH_STATE_TTL_MS) and single-use.
+  // The start route used to prune it as a side effect, but new connections are
+  // hard-disabled (OAUTH_CONNECT_ENABLED), so the scheduled handler is the only
+  // place that can still clean the table up. The cutoff is the one the
+  // callback already uses to reject an expired state: expires_at_ms <= now.
+  // No schema change is involved: the table and its expires_at_ms index are
+  // the ones created by migrations/0004_oauth.sql.
+  await pruneOauthStates(oauthDb(env), Date.now());
 
   let summary;
 

@@ -66,7 +66,7 @@ Home
 
 <div class="profile-section">
 <h1>Privacy Policy</h1>
-<p class="profile-empty">Last updated: 20 October 2026</p>
+<p class="profile-empty">Last updated: 23 October 2026</p>
 <p>
 MyTube is a video browsing and playback website. This page explains, in plain
 language, what information MyTube handles and how. It describes only the
@@ -102,7 +102,7 @@ so they are available across your sessions and devices:
 <div class="profile-video"><div class="profile-video-info"><h4>Subscriptions</h4><p>The channels you subscribe to inside MyTube.</p></div></div>
 <div class="profile-video"><div class="profile-video-info"><h4>Watch history</h4><p>The videos you have watched through MyTube.</p></div></div>
 <div class="profile-video"><div class="profile-video-info"><h4>Saved / Watch Later</h4><p>The videos you have saved.</p></div></div>
-<div class="profile-video"><div class="profile-video-info"><h4>Liked videos</h4><p>The videos you have liked.</p></div></div>
+<div class="profile-video"><div class="profile-video-info"><h4>Liked videos (MyTube library)</h4><p>Videos saved to your MyTube Liked Library. This is separate from your actual YouTube rating; when you explicitly like a YouTube video, MyTube may add it to this library, but removing a YouTube like/dislike does not automatically remove it from the library.</p></div></div>
 <div class="profile-video"><div class="profile-video-info"><h4>Playlists</h4><p>Playlists you create and the videos added to them.</p></div></div>
 </div>
 <p>
@@ -110,6 +110,16 @@ Firestore security rules restrict each of these records so that it can only be
 read or written by the signed-in account that owns it. MyTube comments are
 stored in a shared collection so they can be shown publicly, and only the
 account that created a comment can change or delete it.
+</p>
+<p>
+Separately from your MyTube account data, if you choose to connect a Google
+account for YouTube features, MyTube stores an encrypted OAuth refresh token in
+its own server-side database (Cloudflare D1), keyed to your MyTube user ID. That
+token is only used to obtain short-lived access tokens so MyTube can act on
+YouTube when you explicitly ask it to, such as sending a live-chat message you
+submit. MyTube never receives or stores your Google password. The connection
+remains until you disconnect it on your profile page or revoke MyTube's access
+from your Google Account.
 </p>
 </div>
 
@@ -130,6 +140,21 @@ MyTube's servers. Clearing your browser storage removes them.
 </div>
 
 <div class="profile-section">
+<h3>Short-lived OAuth security cookie</h3>
+<p>
+When you start connecting a YouTube account, MyTube sets a short-lived security
+cookie named <strong>mytube_oauth_state</strong>. It contains only the random
+OAuth state value used to match the connection attempt to the same browser; it
+does not contain a token, password or account identifier. The cookie is marked
+HttpOnly, Secure and SameSite=Lax, is sent only to the OAuth callback path, and
+expires after about 10 minutes or when the connection attempt completes or
+fails. The random state value is recorded briefly in MyTube's server-side OAuth
+state table so the callback can verify it. The cookie is not used for analytics
+or advertising.
+</p>
+</div>
+
+<div class="profile-section">
 <h3>Video content and third-party services</h3>
 <p>
 MyTube does not host video files. Videos are discovered through the YouTube
@@ -139,6 +164,7 @@ third parties are involved when you use the site:
 <div class="profile-list">
 <div class="profile-video"><div class="profile-video-info"><h4>YouTube Data API</h4><p>Video searches, trending lists, related videos and video details are requested from Google's YouTube Data API through MyTube's own server, using a server-side key that is not exposed to your browser.</p></div></div>
 <div class="profile-video"><div class="profile-video-info"><h4>YouTube embedded player</h4><p>Videos are played through YouTube's embedded player, and live streams use YouTube's privacy-enhanced embed domain. When a video or its chat is shown, Google/YouTube may receive technical information such as your IP address and may apply its own policies.</p></div></div>
+<div class="profile-video"><div class="profile-video-info"><h4>YouTube actions you request</h4><p>When you send a message to a YouTube live chat from MyTube, the text you typed and your YouTube authorization are sent to Google's YouTube Data API so the message can be posted by your own YouTube account. MyTube does not store the message. If you use live-chat restriction help, MyTube may check your connected YouTube account's subscription status for the stream's channel through the YouTube Data API, and only if you explicitly confirm it, MyTube may create a subscription to that channel using your connected YouTube account. On supported MyTube pages, when you explicitly confirm a YouTube account subscription action, MyTube may check your connected YouTube account's subscription status for that channel and create or remove that subscription through the YouTube Data API for your connected YouTube account. MyTube does not auto-subscribe and does not auto-unsubscribe. When you open the YouTube Account Subscriptions section on the Subscriptions page, MyTube may read your connected YouTube account's subscription list from the YouTube Data API to display it to you; this is read-only and does not modify your YouTube subscriptions. MyTube does not store your full YouTube subscription list on its server as part of this feature. When you explicitly click Like or Dislike on a YouTube video and your YouTube account is connected, MyTube sends that rating request (like, dislike, or remove rating) to Google's YouTube Data API for your connected YouTube account, and it may also read your actual rating for that video to display it. MyTube does not silently rate videos on your behalf. YouTube's terms, Community Guidelines and the channel's chat/settings (for example slow mode, subscriber-only, members-only or other restrictions) apply, and YouTube may reject, delay, remove or moderate actions.</p></div></div>
 <div class="profile-video"><div class="profile-video-info"><h4>Firebase</h4><p>Sign-in and account data storage are provided by Firebase, a Google service (Firebase Authentication and Cloud Firestore). Only email/password sign-in is enabled.</p></div></div>
 </div>
 <p>
@@ -154,6 +180,8 @@ tracking performed by MyTube's own code.</p>
 <h3>What MyTube does not do</h3>
 <div class="profile-list">
 <div class="profile-video"><div class="profile-video-info"><h4>No passwords</h4><p>MyTube never stores your account password.</p></div></div>
+<div class="profile-video"><div class="profile-video-info"><h4>No stored chat messages</h4><p>Messages you send to a YouTube live chat are not stored by MyTube.</p></div></div>
+<div class="profile-video"><div class="profile-video-info"><h4>No full subscription lists stored</h4><p>When you use YouTube live-chat restriction help, MyTube does not store your full YouTube subscription list. Subscription checks and user-confirmed subscription actions are sent to Google/YouTube APIs as you request them.</p></div></div>
 <div class="profile-video"><div class="profile-video-info"><h4>No selling of personal information</h4><p>MyTube does not sell users' personal information. This is a policy commitment by the site owner; it is not a technical feature enforced by the site's code.</p></div></div>
 </div>
 </div>
