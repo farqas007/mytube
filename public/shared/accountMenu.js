@@ -26,6 +26,7 @@
 import { auth } from "../firebase.js";
 import { onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 import { getSubscriptions } from "../data.js";
+import { createYoutubeAccountIdentity, onYoutubeGrantChange } from "../youtube-account.js";
 
 // -----------------------------------------------------------------------------
 // Constants — shared with subscriptions.js so the cache contract cannot drift.
@@ -361,6 +362,33 @@ function isSafeAvatarDataUrl(value){
         && /^data:image\/(png|jpe?g|webp|gif|bmp);base64,[A-Za-z0-9+/=]+$/i.test(value);
 }
 
+// Connected YouTube channel thumbnails are HTTPS URLs returned by the backend
+// from the grant's own channels.list entry. Only the known YouTube image hosts
+// are accepted; anything else falls back to the existing safe avatar.
+const CHANNEL_THUMB_HOSTS = Object.freeze([
+    "yt3.ggpht.com",
+    "yt3.googleusercontent.com",
+    "i.ytimg.com"
+]);
+
+function isSafeChannelThumbnailUrl(value){
+    const raw = typeof value === "string" ? value.trim() : "";
+    if(!raw){
+        return false;
+    }
+    let parsed;
+    try{
+        parsed = new URL(raw);
+    }
+    catch(e){
+        return false;
+    }
+    if(parsed.protocol !== "https:" || parsed.username || parsed.password){
+        return false;
+    }
+    return CHANNEL_THUMB_HOSTS.indexOf(parsed.hostname.toLowerCase()) !== -1;
+}
+
 // -----------------------------------------------------------------------------
 // Avatar storage — IndexedDB, per uid, error-tolerant
 // -----------------------------------------------------------------------------
@@ -500,10 +528,28 @@ const state = {
     wired: false,
     built: false,
     avatarUrl: "",
+    channelAvatarUrl: "",
+    channelAvatarUid: "",
     avatarBusy: false,
     avatarMessage: "",
     avatarMessageError: false
 };
+
+// Connected YouTube channel identity. This reuses the same read-only
+// /api/youtube/account flow as the profile/watch/channel/subscriptions pages;
+// nothing is persisted and the channel thumbnail is only painted while the
+// identity is verified for the current Firebase user.
+const ytIdentity = createYoutubeAccountIdentity({
+    getUid: () => state.currentUid || (auth && auth.currentUser ? auth.currentUser.uid : "") || "",
+    getToken: async () => {
+        const user = auth && auth.currentUser;
+        if(!user || typeof user.getIdToken !== "function"){
+            return null;
+        }
+        return user.getIdToken();
+    },
+    onChange: applyIdentityAvatar
+});
 
 // -----------------------------------------------------------------------------
 // Avatar pipeline (browser only — needs createImageBitmap/canvas)
@@ -799,25 +845,34 @@ function leaveToLogin(){
     fallback();
 }
 
-// Show EITHER the picture or the initials on the avatar button. `url` must be a
-// previously validated data URL; anything else silently falls back to initials,
-// which is the safe default and also the signed-out state.
-function renderAvatar(url, initials){
+// Show EITHER a picture or the initials on the avatar button. Local pictures
+// must be a previously validated data URL; a connected channel thumbnail is
+// accepted only from the known YouTube image hosts. Anything else silently
+// falls back to initials, which is the safe default and the signed-out state.
+function renderAvatar(url, initials, options){
     const cells = state.cells;
     if(!cells){
         return;
     }
-    const safe = isSafeAvatarDataUrl(url) ? url : "";
-    state.avatarUrl = safe;
+    const remote = Boolean(options && options.remote === true);
+    const safeRemote = remote && isSafeChannelThumbnailUrl(url)
+        ? String(url).trim()
+        : "";
+    const safe = safeRemote || (!remote && isSafeAvatarDataUrl(url) ? url : "");
+    if(!remote){
+        state.avatarUrl = safe;
+    }
     if(cells.avatarInitials){
         cells.avatarInitials.textContent = initials || "?";
     }
     if(cells.avatarImg){
         if(safe){
+            cells.avatarImg.onerror = safeRemote ? onChannelAvatarError : null;
             cells.avatarImg.src = safe;
             cells.avatarImg.hidden = false;
         }
         else{
+            cells.avatarImg.onerror = null;
             cells.avatarImg.removeAttribute("src");
             cells.avatarImg.hidden = true;
         }
@@ -825,6 +880,54 @@ function renderAvatar(url, initials){
     if(cells.avatarBtn){
         cells.avatarBtn.classList.toggle("mytube-has-avatar", !!safe);
     }
+}
+
+// The connected channel thumbnail wins over the locally stored picture while it
+// is verified for the current Firebase user; otherwise the existing safe
+// picture/initials fallback is used.
+function paintAvatar(){
+    const remote = state.channelAvatarUid
+        && state.channelAvatarUid === state.currentUid
+        && isSafeChannelThumbnailUrl(state.channelAvatarUrl)
+        ? String(state.channelAvatarUrl).trim()
+        : "";
+    if(remote){
+        renderAvatar(remote, currentInitials(), { remote: true });
+        return;
+    }
+    renderAvatar(state.avatarUrl, currentInitials(), { remote: false });
+}
+
+// A broken/unavailable channel thumbnail must never leave an empty avatar:
+// drop it and repaint the stored picture or initials instead.
+function onChannelAvatarError(){
+    state.channelAvatarUrl = "";
+    state.channelAvatarUid = "";
+    paintAvatar();
+}
+
+// Apply the shared identity helper's state to the account-menu avatar. Only a
+// ready, verified channel owned by the CURRENT uid may contribute a thumbnail.
+function applyIdentityAvatar(identityState){
+    const uid = state.currentUid;
+    const s = identityState || {};
+    const ready = Boolean(
+        uid
+        && s.status === "ready"
+        && s.uid === uid
+        && s.channel
+        && s.channel.id
+        && isSafeChannelThumbnailUrl(s.channel.thumbnail)
+    );
+    if(ready){
+        state.channelAvatarUrl = String(s.channel.thumbnail).trim();
+        state.channelAvatarUid = uid;
+    }
+    else{
+        state.channelAvatarUrl = "";
+        state.channelAvatarUid = "";
+    }
+    paintAvatar();
 }
 
 // Load whatever this uid previously stored and paint it. Never throws; a miss or
@@ -852,6 +955,9 @@ async function applyAvatar(user){
         return;
     }
     renderAvatar(url, initials);
+    // A verified channel thumbnail takes precedence over the stored picture;
+    // repaint so a late IDB read cannot clobber it.
+    paintAvatar();
     // The stored picture is now known, so the menu's Add/Remove entry is correct.
     renderAccountMenu(auth && auth.currentUser);
 }
@@ -936,6 +1042,7 @@ async function handlePickedAvatar(file){
         // Paint regardless so the user sees the picture this session; warn when
         // it could not be persisted for next time.
         renderAvatar(result.dataUrl, currentInitials());
+        paintAvatar();
         avatarFeedback(saved ? "Profile picture updated." : AVATAR_MSG.store, !saved);
         // Keep the menu's Add/Remove entry in step with the new state.
         renderAccountMenu(auth && auth.currentUser);
@@ -963,6 +1070,7 @@ async function removeAvatar(){
         return;
     }
     renderAvatar("", currentInitials());
+    paintAvatar();
     avatarFeedback(removed ? "Profile picture removed." : AVATAR_MSG.store, !removed);
     renderAccountMenu(auth && auth.currentUser);
 }
@@ -1158,9 +1266,11 @@ async function loadNotifications(){
 function applyUser(user){
     state.currentUid = user ? (user.uid || "") : "";
     // A new (or absent) account starts with a clean slate: no feedback from the
-    // previous account and, crucially, no leftover picture.
+    // previous account and, crucially, no leftover picture or channel avatar.
     state.avatarMessage = "";
     state.avatarMessageError = false;
+    state.channelAvatarUrl = "";
+    state.channelAvatarUid = "";
     buildCells();
     // Clear any avatar immediately on account change so one account's picture can
     // never linger into another's session.
@@ -1169,6 +1279,14 @@ function applyUser(user){
     loadNotifications();
     // applyAvatar() repaints the menu itself once the stored picture is known.
     applyAvatar(user);
+    // Re-read the connected YouTube channel identity for this user. The helper
+    // clears the avatar immediately when the grant is gone or not verifiable.
+    if(state.currentUid){
+        void ytIdentity.load({ force: true });
+    }
+    else{
+        ytIdentity.clear("signed_out");
+    }
 }
 
 function init(){
@@ -1182,6 +1300,15 @@ function init(){
         return;
     }
     onAuthStateChanged(auth, applyUser);
+    // Connect/disconnect and cross-tab grant changes re-read the identity so the
+    // account-menu avatar always reflects the current channel (or falls back).
+    onYoutubeGrantChange(() => {
+        if(!state.currentUid){
+            ytIdentity.clear("signed_out");
+            return;
+        }
+        void ytIdentity.load({ force: true });
+    });
 }
 
 // Exported for the tests (pure helpers only); the side effects stay in init().

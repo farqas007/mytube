@@ -6,7 +6,7 @@ import { getVideo, related, channel, comments, liveChat } from "./youtube.js";
 
 // ================= FIRESTORE DATA LAYER =================
 import {
-    getSubscriptions, addSubscription, removeSubscription, isSubscribedByChannel,
+    getSubscriptions, addSubscription, isSubscribedByChannel,
     addToHistory,
     getSaved as fsGetSaved, addToSaved, removeFromSaved, isSavedVideo,
     getLiked as fsGetLiked, addToLiked, removeFromLiked, isLikedVideo,
@@ -742,10 +742,10 @@ function renderYtSubViews(v){
     }
 
     renderSave();
-    renderSubscribe();
-    // Recompute saved/subscribed state for the now-current YouTube video.
+    // The watch-page local Subscribe button was removed; the connected YouTube
+    // account subscription control is the only Subscribe control in this area.
+    // Recompute saved state for the now-current YouTube video.
     isSaved = localStorage.getItem(saveKey()) === "1";
-    refreshSubscribeState();
     // Read-only: fetch actual YouTube account subscription status for this channel.
     // Never auto-subscribes/unsubscribes; mutations require explicit confirmation.
     syncYtAccountSubscriptionForCurrentVideo(true);
@@ -3539,7 +3539,6 @@ const likeBtn = document.getElementById("likeBtn");
 const dislikeBtn = document.getElementById("dislikeBtn");
 const shareBtn = document.getElementById("shareBtn");
 const saveBtn = document.getElementById("saveBtn");
-const subscribeBtn = document.getElementById("subscribeBtn");
 const actionMsg = document.getElementById("actionMsg");
 
 
@@ -4417,7 +4416,11 @@ function ensureYtAccountSubUi(){
     if(ytAccountSubUi && ytAccountSubUi.root && ytAccountSubUi.root.isConnected){
         return ytAccountSubUi;
     }
-    if(!subscribeBtn || !subscribeBtn.parentElement){
+    // The MyTube-local Subscribe button was removed from the watch page; the
+    // connected YouTube account control is the only subscription control here.
+    // Anchor it to the channel row itself.
+    const channelBox = document.querySelector(".channel");
+    if(!channelBox){
         return null;
     }
     let root = document.getElementById("ytAccountSubRoot");
@@ -4426,6 +4429,7 @@ function ensureYtAccountSubUi(){
         root.id = "ytAccountSubRoot";
         root.className = "yt-account-sub-watch";
         root.style.marginTop = "8px";
+        root.style.marginLeft = "auto";
         root.style.display = "none";
         root.style.maxWidth = "360px";
 
@@ -4459,7 +4463,7 @@ function ensureYtAccountSubUi(){
         row.appendChild(btn);
         root.appendChild(label);
         root.appendChild(row);
-        subscribeBtn.parentElement.insertBefore(root, subscribeBtn.nextSibling);
+        channelBox.appendChild(root);
     }
     ytAccountSubUi = {
         root,
@@ -4919,57 +4923,8 @@ function subscribedChannel(){
     return v ? (v.channel || "") : "";
 }
 
-// Recompute subscription state for the currently active video/channel.
-function refreshSubscribeState(){
-    isSubscribed = localStorage.getItem("mytube_subscribed_" + subscribedChannel()) === "1";
-    renderSubscribe();
-}
-
 const subscribeKey = () => "mytube_subscribed_" + subscribedChannel();
 isSubscribed = localStorage.getItem(subscribeKey()) === "1";
-
-
-function renderSubscribe(){
-    if(!subscribeBtn) return;
-    subscribeBtn.classList.toggle("active", isSubscribed);
-    subscribeBtn.textContent = isSubscribed ? "Subscribed" : "Subscribe";
-    subscribeBtn.setAttribute("aria-pressed", isSubscribed ? "true" : "false");
-}
-
-
-if(subscribeBtn){
-    subscribeBtn.onclick = function(){
-        const v = active || current;
-        if(!v){
-            return;
-        }
-        const uid = uidOrNull();
-        if(!uid){
-            setActionMsg("Please log in to subscribe.");
-            return;
-        }
-        isSubscribed = !isSubscribed;
-        if(isSubscribed){
-            localStorage.setItem(subscribeKey(), "1");
-        }
-        else{
-            localStorage.removeItem(subscribeKey());
-        }
-        renderSubscribe();
-        // Persist to Firestore.
-        if(isSubscribed){
-            addSubscription(uid, {
-                channelId: v.channelId || "",
-                channelName: v.channel || "",
-                channelThumb: v.channelThumb || "",
-                subscriberCount: v.subscribers || ""
-            });
-        }
-        else{
-            removeSubscription(uid, v.channelId || "", v.channel || "");
-        }
-    };
-}
 
 
 // ================= PLAYLISTS (ADD TO PLAYLIST) =================
@@ -5259,7 +5214,6 @@ window.addEventListener("DOMContentLoaded", () => {
     restoreVoteState();
     setupVoteButtons();
     renderSave();
-    renderSubscribe();
     setupYtAccountSubUi();
     renderYtAccountSub();
     setupPlaylistUI();
@@ -5422,7 +5376,6 @@ async function syncStateFromFirestore(){
         else if(subscribed !== null){
             isSubscribed = localSub;
         }
-        renderSubscribe();
     }
     catch(e){
         console.warn("Failed to sync state from Firestore:", e);

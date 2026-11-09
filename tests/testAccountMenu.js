@@ -94,6 +94,31 @@ function extractFunction(source, name) {
   throw new Error(`unbalanced braces while extracting ${name}()`);
 }
 
+// Extract the argument text of every `callee(...)` call using balanced
+// parentheses, so nested calls such as JSON.stringify(all) stay intact.
+function extractCallArgs(source, callee) {
+  const calls = [];
+  const pattern = new RegExp(`\\b${callee}\\s*\\(`, "g");
+  let match;
+
+  while ((match = pattern.exec(source))) {
+    const start = pattern.lastIndex;
+    let depth = 1;
+    let i = start;
+
+    for (; i < source.length && depth > 0; i++) {
+      if (source[i] === "(") depth++;
+      else if (source[i] === ")") depth--;
+    }
+
+    assert.equal(depth, 0, `${callee}() must have balanced parentheses`);
+    calls.push(source.slice(start, i - 1).trim());
+    pattern.lastIndex = i;
+  }
+
+  return calls;
+}
+
 // Evaluate a set of functions together with injected free variables.
 function sandbox(names, scope) {
   const bodies = names.map(n => extractFunction(MENU_JS, n)).join("\n");
@@ -434,16 +459,31 @@ test("D4 an unreadable store degrades to a first visit", () => {
 });
 
 test("D5 nothing sensitive is ever written to localStorage", () => {
-  // Scan only executable text; the module's comments name these words on purpose.
+  // Strip comments so prose that names these words is not counted as code.
   const code = MENU_JS.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
-  assert.ok(
-    !/setItem\([^)]*(password|token|credential|idToken|refreshToken)/i.test(code),
-    "no password/token/credential may be persisted"
-  );
-  assert.ok(
-    !/localStorage/i.test(code) || !/password|idToken|refreshToken/i.test(code),
-    "localStorage use is limited to the non-sensitive seen marker"
-  );
+
+  // Inspect the actual persistence calls, not every identifier in the module:
+  // `getIdToken` is an auth method and `parsed.password` is a URL property, so
+  // neither is a localStorage value. Only the seen-marker helper may write.
+  const writes = extractCallArgs(code, "setItem");
+  assert.ok(writes.length > 0, "the seen-marker helper must still persist");
+  for (const args of writes) {
+    assert.ok(
+      !/password|token|credential|idToken|refreshToken/i.test(args),
+      "no password/token/credential may be passed to a persistence call"
+    );
+    assert.match(
+      args,
+      /^NOTIF_SEEN_KEY\s*,\s*JSON\.stringify\(all\)$/,
+      "localStorage use is limited to the non-sensitive seen marker"
+    );
+  }
+
+  // Runtime proof: the actual write path stores only a namespaced timestamp.
+  const store = makeStore();
+  assert.equal(pure.advanceNotificationsSeen(store, "uid-1", 999), true);
+  assert.deepEqual(store.writes, ["mytube_notifications_seen_v1"]);
+  assert.deepEqual(JSON.parse(store.getItem("mytube_notifications_seen_v1")), { "uid-1": 999 });
 });
 
 // =============================================================================
